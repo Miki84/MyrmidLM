@@ -137,13 +137,19 @@ int main(int argc, char** argv) {
         ggml_backend_dev_memory(dev, &free_mem, &total_mem);
         const double gbps = bench ? measure_bandwidth(dev, mb << 20) : 0.0;
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        // PCI bus ID: the same card seen by two backends (CUDA and Vulkan,
+        // ROCm and Vulkan) has the same one; llama.cpp keeps the first.
+        ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(dev, &props);
         printf("%s\n    {\"name\": \"%s\", \"description\": \"%s\", \"backend\": \"%s\", "
-               "\"type\": \"%s\", \"free_mb\": %zu, \"total_mb\": %zu, \"bandwidth_gbps\": %.1f}",
+               "\"type\": \"%s\", \"device_id\": \"%s\", \"free_mb\": %zu, \"total_mb\": %zu, "
+               "\"bandwidth_gbps\": %.1f}",
                first ? "" : ",",
                json_escape(ggml_backend_dev_name(dev)).c_str(),
                json_escape(ggml_backend_dev_description(dev)).c_str(),
                json_escape(reg ? ggml_backend_reg_name(reg) : "").c_str(),
-               type_name(type), free_mem >> 20, total_mem >> 20, gbps);
+               type_name(type), json_escape(props.device_id).c_str(),
+               free_mem >> 20, total_mem >> 20, gbps);
         fflush(stdout);
         first = false;
     }

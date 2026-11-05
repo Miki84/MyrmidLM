@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 # Adjust the path if you installed elsewhere (build.sh --install DIR).
-ExecStart=/opt/privatelm-node/bin/privatelm-node worker --cache
+ExecStart=/opt/privatelm-node/bin/privatelm-node worker --cache --ram
 # Listen on one interface only, e.g. the LAN or VPN address:
 #ExecStart=/opt/privatelm-node/bin/privatelm-node worker --cache --host 192.168.1.10
 DynamicUser=yes

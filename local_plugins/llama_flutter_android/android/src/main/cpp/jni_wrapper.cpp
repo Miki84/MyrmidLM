@@ -307,10 +307,22 @@ static std::string planCluster(const char* model_path, ClusterPlan& plan) {
             ggml_backend_register(reg);
             g_registered_endpoints.push_back(endpoints[i]);
         }
+        // A worker may serve several devices (a PC with two GPUs). Share its
+        // weight by each device's free memory, so a 4 GB card next to a
+        // 12 GB one isn't asked to hold as much; evenly if none reports any.
         const size_t n_dev = ggml_backend_reg_dev_count(reg);
+        std::vector<double> dev_free(n_dev, 0.0);
+        double free_sum = 0.0;
+        for (size_t d = 0; d < n_dev; d++) {
+            size_t free_mem = 0, total_mem = 0;
+            ggml_backend_dev_memory(ggml_backend_reg_dev_get(reg, d), &free_mem, &total_mem);
+            dev_free[d] = (double)free_mem;
+            free_sum += dev_free[d];
+        }
         for (size_t d = 0; d < n_dev; d++) {
             plan.devices.push_back(ggml_backend_reg_dev_get(reg, d));
-            device_weights.push_back(std::max(weights[i], 0.01f) / n_dev);
+            const double share = free_sum > 0 ? dev_free[d] / free_sum : 1.0 / n_dev;
+            device_weights.push_back((float)(std::max(weights[i], 0.01f) * share));
         }
         remote_weight += std::max(weights[i], 0.01f);
     }

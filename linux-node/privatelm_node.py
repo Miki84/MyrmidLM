@@ -87,10 +87,29 @@ class Device:
     free_mb: int
     total_mb: int
     bandwidth: float
+    device_id: str = ""
 
     @property
     def is_gpu(self) -> bool:
         return self.type in ("gpu", "igpu")
+
+
+def usable_gpus(devices: list[Device]) -> list[Device]:
+    """The GPUs llama.cpp would use, the same way it picks them: each card
+    once (a card seen by CUDA and Vulkan, or ROCm and Vulkan, has one PCI ID;
+    the first backend wins), and integrated GPUs only without a dedicated
+    one."""
+    gpus: list[Device] = []
+    for d in devices:
+        if d.type != "gpu":
+            continue
+        if d.device_id and any(g.device_id == d.device_id for g in gpus):
+            continue
+        gpus.append(d)
+    if gpus:
+        return gpus
+    igpus = [d for d in devices if d.type == "igpu"]
+    return [d for d in igpus if d.backend == igpus[0].backend] if igpus else []
 
 
 def probe(bench: bool = True, refresh: bool = False) -> list[Device]:
@@ -116,7 +135,7 @@ def probe(bench: bool = True, refresh: bool = False) -> list[Device]:
     for d in data["devices"]:
         bw = d["bandwidth_gbps"] if need_bench else cached.get(d["name"], d["bandwidth_gbps"])
         devices.append(Device(d["name"], d["description"], d["backend"], d["type"],
-                              d["free_mb"], d["total_mb"], bw))
+                              d["free_mb"], d["total_mb"], bw, d.get("device_id", "")))
     return devices
 
 
@@ -446,8 +465,7 @@ def pick_worker_devices(devices: list[Device], wanted: Optional[str]) -> list[De
         if missing:
             die(f"Unknown device(s) {', '.join(missing)}. Have: {', '.join(by_name)}")
         return [by_name[n] for n in names]
-    gpus = [d for d in devices if d.type == "gpu"] or [d for d in devices if d.type == "igpu"]
-    return gpus or [d for d in devices if d.type == "cpu"][:1]
+    return usable_gpus(devices) or [d for d in devices if d.type == "cpu"][:1]
 
 
 def cmd_worker(args) -> None:
@@ -457,7 +475,7 @@ def cmd_worker(args) -> None:
         die("No usable device found")
     gpu = any(d.is_gpu for d in chosen)
     # What the master may fill: free VRAM, or free RAM for a CPU worker.
-    ram_mb = sum(d.free_mb for d in chosen) if gpu else host_available_mb()
+    ram_mb = sum(d.free_mb for d in chosen) if gpu else _offered_ram(args)
     # Layers on one worker run one after another on its devices, so the
     # slowest device sets the pace.
     bw = min((d.bandwidth for d in chosen if d.bandwidth > 0), default=0.0)
@@ -466,26 +484,61 @@ def cmd_worker(args) -> None:
     host = socket.gethostname()
     wid = machine_id()
 
-    log(f"Serving {', '.join(f'{d.name} ({d.description})' for d in chosen)}")
+    log(f"Serving {', '.join(f'{d.name} ({d.description}, {d.free_mb} MB free)' for d in chosen)}")
     log(f"Offering {ram_mb} MB at {bw:.1f} GB/s on {address}:{args.port}")
-    cmd = [find_bin("ggml-rpc-server"), "-H", args.host, "-p", str(args.port),
-           "-d", ",".join(d.name for d in chosen)]
+    procs = [_rpc_server(args, args.port, [d.name for d in chosen])]
+    advs: list[Advertiser] = []
+    txt = {"ram": str(ram_mb), "bw": f"{bw:.1f}", "model": f"{host} · {label}", "v": RPC_VERSION,
+           "id": wid, "kind": "gpu" if gpu else "cpu",
+           "backend": ",".join(sorted({d.backend for d in chosen}))}
+    _advertise(args, advs, f"PrivateLM {host}", args.port, txt, address)
+    show_qr(worker_qr(address, args.port, f"{host} · {label}", ram_mb, bw, wid, txt["kind"]))
+
+    # The PC's RAM as a second, separate worker: masters weigh each worker
+    # by its own speed, so slow RAM never drags down the GPU's share, and
+    # phones (which split a worker evenly across its devices) see it as one
+    # more device of its own.
+    if args.ram:
+        cpu = next((d for d in devices if d.type == "cpu"), None)
+        if not gpu or cpu is None:
+            log("--ram: this worker already serves its CPU/RAM, skipping the second worker")
+        else:
+            ram_port = args.ram_port or args.port + 1
+            offered = _offered_ram(args)
+            log(f"Offering {offered} MB RAM at {cpu.bandwidth:.1f} GB/s on {address}:{ram_port}")
+            procs.append(_rpc_server(args, ram_port, ["CPU"]))
+            rtxt = {"ram": str(offered), "bw": f"{cpu.bandwidth:.1f}", "model": f"{host} · RAM",
+                    "v": RPC_VERSION, "id": f"{wid}-ram", "kind": "cpu", "backend": "CPU"}
+            _advertise(args, advs, f"PrivateLM {host} RAM", ram_port, rtxt, address)
+            show_qr(worker_qr(address, ram_port, f"{host} · RAM", offered, cpu.bandwidth,
+                              f"{wid}-ram", "cpu"))
+    _wait(procs, advs)
+
+
+def _offered_ram(args) -> int:
+    """Free RAM this PC lends, minus what it keeps for itself."""
+    mb = max(0, host_available_mb() - int(args.ram_reserve * 1024))
+    if args.ram_limit:
+        mb = min(mb, int(args.ram_limit * 1024))
+    return mb
+
+
+def _rpc_server(args, port: int, devices: list[str]) -> subprocess.Popen:
+    cmd = [find_bin("ggml-rpc-server"), "-H", args.host, "-p", str(port), "-d", ",".join(devices)]
     if args.cache:
         cmd.append("-c")
     if args.threads:
         cmd += ["-t", str(args.threads)]
-    proc = subprocess.Popen(cmd)
+    return subprocess.Popen(cmd)
 
-    adv = None
-    if not args.no_advertise:
-        txt = {"ram": str(ram_mb), "bw": f"{bw:.1f}", "model": f"{host} · {label}", "v": RPC_VERSION,
-               "id": wid, "kind": "gpu" if gpu else "cpu",
-               "backend": ",".join(sorted({d.backend for d in chosen}))}
-        adv = Advertiser(WORKER_TYPE, f"PrivateLM {host}", args.port, txt, address)
-        if adv.start():
-            log("Advertised on the LAN: phones find this PC under Phone cluster > Scan nearby")
-    show_qr(worker_qr(address, args.port, f"{host} · {label}", ram_mb, bw, wid, "gpu" if gpu else "cpu"))
-    _wait(proc, adv)
+
+def _advertise(args, advs: list, name: str, port: int, txt: dict, address: str) -> None:
+    if args.no_advertise:
+        return
+    adv = Advertiser(WORKER_TYPE, name, port, txt, address)
+    if adv.start():
+        advs.append(adv)
+        log(f"Advertised {name} on the LAN (phones: Phone cluster > Find nearby)")
 
 
 def cmd_serve(args) -> None:
@@ -497,7 +550,7 @@ def cmd_serve(args) -> None:
     n_layer = gguf_block_count(model)
 
     devices = probe(bench=True)
-    local_gpus = [d for d in devices if d.type == "gpu"] or [d for d in devices if d.type == "igpu"]
+    local_gpus = usable_gpus(devices)
     cpu = next((d for d in devices if d.type == "cpu"), None)
     units = [Unit(f"{d.name} {d.description}", d.free_mb * GPU_SHARE, d.bandwidth or 100.0, [d.name])
              for d in local_gpus]
@@ -506,9 +559,16 @@ def cmd_serve(args) -> None:
 
     workers: list[Peer] = []
     if args.workers not in ("off", "auto", "all"):
+        # Workers by address; their speed and kind still come from mDNS
+        # when they advertise (a GPU worker is far faster than the default).
+        known = {p.endpoint: p for p in scan(min(args.scan_timeout, 3.0)) if p.kind == "worker"}
         for ep in args.workers.split(","):
             h, _, p = ep.strip().rpartition(":")
-            workers.append(Peer("worker", ep, h or ep, int(p) if h else DEFAULT_RPC_PORT))
+            peer = Peer("worker", ep.strip(), h or ep.strip(), int(p) if h else DEFAULT_RPC_PORT)
+            if peer.endpoint in known:
+                peer.txt = dict(known[peer.endpoint].txt)
+                peer.name = known[peer.endpoint].name
+            workers.append(peer)
     elif args.workers != "off":
         log("Looking for workers on the LAN...")
         me = machine_id()
@@ -561,13 +621,25 @@ def cmd_serve(args) -> None:
         u.devices = [n for n, d, _ in devs if _on_worker(n, d, u.endpoint)]
         if not u.devices:
             die(f"Worker {u.endpoint} reported no devices (is it running {RPC_VERSION}?)")
+    # llama.cpp's device list, minus the cards it skips as duplicates.
+    local_names = {d.name for d in local_gpus}
+    devs = [d for d in devs if d[0].startswith("RPC") or d[0] in local_names]
     split = []
-    for name, desc, _ in devs:
+    for name, desc, free in devs:
         if name.startswith("RPC"):
             owner = next((u for u in used_remote if _on_worker(name, desc, u.endpoint)), None)
         else:
             owner = next((u for u in units if name in u.devices), None)
-        split.append(owner.assigned_mb / len(owner.devices) if owner else 0.0)
+        if owner is None:
+            split.append(0.0)
+            continue
+        # A worker with several GPUs: share by each card's free memory, so a
+        # 4 GB card next to a 12 GB one gets a third of the 12 GB card's part.
+        mine = [f for n, d, f in devs if (n in owner.devices) and
+                (not n.startswith("RPC") or _on_worker(n, d, owner.endpoint))]
+        total_free = sum(mine)
+        split.append(owner.assigned_mb * free / total_free if total_free else
+                     owner.assigned_mb / len(owner.devices))
 
     offloaded = sum(split)
     local_layers = round(n_layer * host.assigned_mb / need_mb) if need_mb else 0
@@ -635,18 +707,42 @@ def _api_key() -> str:
     return path.read_text().strip()
 
 
-def _wait(proc: subprocess.Popen, adv: Optional[Advertiser]) -> None:
+def _wait(procs, advs) -> None:
+    """Runs until a child exits or we're stopped, then stops everything."""
+    if isinstance(procs, subprocess.Popen):
+        procs = [procs]
+    if advs is None:
+        advs = []
+    elif isinstance(advs, Advertiser):
+        advs = [advs]
+    stopping = False
+
     def stop(*_):
-        proc.terminate()
+        nonlocal stopping
+        stopping = True
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    code = 0
     try:
-        code = proc.wait()
+        while not stopping:
+            done = [p for p in procs if p.poll() is not None]
+            if done:
+                code = done[0].returncode or 1
+                break
+            time.sleep(0.5)
     finally:
-        if adv:
-            adv.stop()
-    sys.exit(code)
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()
+        for p in procs:
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        for a in advs:
+            a.stop()
+    sys.exit(0 if stopping else code)
 
 
 def main() -> None:
@@ -664,6 +760,12 @@ def main() -> None:
     w.add_argument("--advertise-ip", help="address announced via mDNS/QR (e.g. the VPN address)")
     w.add_argument("--no-advertise", action="store_true")
     w.add_argument("--no-bench", action="store_true", help="skip the bandwidth test")
+    w.add_argument("--ram", action="store_true",
+                   help="also lend this PC's RAM, as a second worker on port+1")
+    w.add_argument("--ram-port", type=int, help="port of the RAM worker (default: port+1)")
+    w.add_argument("--ram-reserve", type=float, default=4.0,
+                   help="GB of RAM kept free for this PC (default 4)")
+    w.add_argument("--ram-limit", type=float, help="lend at most this many GB of RAM")
     w.set_defaults(fn=cmd_worker)
 
     s = sub.add_parser("serve", help="run a model here and serve an OpenAI-compatible API")

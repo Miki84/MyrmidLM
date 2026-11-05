@@ -278,7 +278,8 @@ class _ClusterViewState extends State<ClusterView> {
       const SectionFootnote(
         'A Linux PC can be a worker too: run privatelm-node worker on it '
         '(see linux-node/ in the source). Its GPU (NVIDIA, AMD or Intel) then '
-        'takes the biggest share, since its memory is many times faster.',
+        'takes the biggest share, since its memory is many times faster. With '
+        '--ram it also lends its RAM, listed as a second worker.',
       ),
       ..._pcServerSection(),
     ];
@@ -291,7 +292,7 @@ class _ClusterViewState extends State<ClusterView> {
           : Icons.smartphone_rounded;
 
   String _pcLabel(ClusterWorker w) =>
-      w.isGpu ? 'PC GPU${w.backend != null ? ' (${w.backend})' : ''}' : 'PC CPU';
+      w.isGpu ? 'PC GPU${w.backend != null ? ' (${w.backend})' : ''}' : 'PC RAM';
 
   // ── PC servers ─────────────────────────────────────────────────────────
 

@@ -4,7 +4,7 @@
 # llama.cpp commit the app vendors, so phones and PC speak the same RPC
 # protocol.
 #
-#   ./build.sh                       auto-detect GPU backends
+#   ./build.sh                       auto-detect (NVIDIA: CUDA, AMD/Intel: Vulkan)
 #   ./build.sh --backends cuda,vulkan
 #   ./build.sh --backends rocm --rocm-targets gfx1100
 #   ./build.sh --backends sycl       (needs Intel oneAPI)
@@ -34,19 +34,51 @@ done
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# GPU vendors on the PCI bus: 0x10de NVIDIA, 0x1002 AMD, 0x8086 Intel.
+gpu_vendors() {
+    local v
+    for f in /sys/class/drm/card[0-9]*/device/vendor; do
+        [[ -r "$f" ]] || continue
+        v="$(cat "$f")"
+        case "$v" in
+            0x10de) echo nvidia ;;
+            0x1002) echo amd ;;
+            0x8086) echo intel ;;
+        esac
+    done | sort -u
+}
+
+need_vulkan_dev() {
+    if ! have glslc || ! { pkg-config --exists vulkan 2>/dev/null || [[ -f /usr/include/vulkan/vulkan.h ]]; }; then
+        echo "Vulkan backend needs: sudo apt install libvulkan-dev glslc mesa-vulkan-drivers" >&2
+        echo "(Fedora: vulkan-loader-devel glslc mesa-vulkan-drivers)" >&2
+        exit 1
+    fi
+}
+
 if [[ "$BACKENDS" == "auto" ]]; then
     found=()
-    if have nvcc || [[ -x /usr/local/cuda/bin/nvcc ]]; then found+=(cuda); fi
-    if have hipcc || [[ -x /opt/rocm/bin/hipcc ]]; then found+=(rocm); fi
-    if have glslc && { pkg-config --exists vulkan 2>/dev/null || [[ -f /usr/include/vulkan/vulkan.h ]]; }; then
+    vendors="$(gpu_vendors)"
+    echo "==> GPUs found: ${vendors:-none}" | tr '\n' ' '; echo
+    if grep -q nvidia <<< "$vendors"; then
+        if have nvcc || [[ -x /usr/local/cuda/bin/nvcc ]]; then
+            found+=(cuda)
+        else
+            echo "NVIDIA GPU without CUDA toolkit: using Vulkan (install CUDA for the best speed)."
+            found+=(vulkan)
+        fi
+    fi
+    # AMD: Vulkan by default. It runs on every AMD card with a Mesa driver,
+    # including older ones ROCm dropped (Polaris RX 470/480/570/580, gfx803),
+    # and is close to ROCm for token generation. --backends rocm to force it.
+    if grep -qE 'amd|intel' <<< "$vendors"; then
         found+=(vulkan)
     fi
     if [[ ${#found[@]} -eq 0 ]]; then
-        echo "No GPU toolkit found (nvcc, hipcc, or Vulkan headers + glslc): building CPU only."
-        echo "Intel GPUs: install Vulkan dev packages (libvulkan-dev glslc) or use --backends sycl."
+        echo "No GPU found: building CPU only."
         found=(cpu)
     fi
-    BACKENDS="$(IFS=,; echo "${found[*]}")"
+    BACKENDS="$(printf '%s\n' "${found[@]}" | awk '!seen[$0]++' | paste -sd,)"
 fi
 echo "==> Backends: $BACKENDS"
 
@@ -57,9 +89,19 @@ for b in "${wanted[@]}"; do
         cuda)
             [[ -x /usr/local/cuda/bin/nvcc ]] && export PATH="/usr/local/cuda/bin:$PATH"
             # Native arches of every GPU in the box, else a broad default set.
+            # Architectures of the GPUs in this PC (8.6 -> 86), else a broad set.
+            if [[ -z "${CUDA_ARCHS:-}" ]] && have nvidia-smi; then
+                CUDA_ARCHS="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+                    | tr -d '. ' | sort -u | paste -sd';')"
+            fi
+            echo "==> CUDA architectures: ${CUDA_ARCHS:-75;80;86;89}"
             flags+=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS:-75;80;86;89}") ;;
         rocm|hip)
             export PATH="/opt/rocm/bin:$PATH"
+            if have rocminfo && rocminfo 2>/dev/null | grep -q 'gfx8'; then
+                echo "Warning: this PC has a gfx8 (Polaris) GPU, which ROCm no longer supports." >&2
+                echo "         Use --backends vulkan for it." >&2
+            fi
             export HIPCXX="${HIPCXX:-$(hipconfig -l 2>/dev/null)/clang}"
             export HIP_PATH="${HIP_PATH:-$(hipconfig -R 2>/dev/null || echo /opt/rocm)}"
             if [[ -z "$ROCM_TARGETS" ]] && have rocminfo; then
@@ -68,6 +110,7 @@ for b in "${wanted[@]}"; do
             flags+=(-DGGML_HIP=ON)
             [[ -n "$ROCM_TARGETS" ]] && flags+=(-DGPU_TARGETS="$ROCM_TARGETS") ;;
         vulkan)
+            need_vulkan_dev
             flags+=(-DGGML_VULKAN=ON) ;;
         sycl)
             if [[ -z "${ONEAPI_ROOT:-}" ]]; then
