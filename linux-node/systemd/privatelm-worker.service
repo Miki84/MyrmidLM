@@ -1,0 +1,22 @@
+[Unit]
+Description=PrivateLM GPU worker (lends this PC's GPU to phone masters)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+# Adjust the path if you installed elsewhere (build.sh --install DIR).
+ExecStart=/opt/privatelm-node/bin/privatelm-node worker --cache
+# Listen on one interface only, e.g. the LAN or VPN address:
+#ExecStart=/opt/privatelm-node/bin/privatelm-node worker --cache --host 192.168.1.10
+DynamicUser=yes
+CacheDirectory=privatelm-node
+Environment=XDG_CACHE_HOME=/var/cache/privatelm-node
+StateDirectory=privatelm-node
+Environment=XDG_CONFIG_HOME=/var/lib/privatelm-node
+# GPU access (NVIDIA /dev/nvidia*, AMD/Intel /dev/dri, /dev/kfd).
+SupplementaryGroups=video render
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

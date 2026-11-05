@@ -92,6 +92,7 @@ class _ClusterViewState extends State<ClusterView> {
                   'from that phone.',
           icon: Icons.hub_outlined,
         ),
+        ..._pcServerSection(),
       ];
 
   // ── Worker ─────────────────────────────────────────────────────────────
@@ -219,10 +220,11 @@ class _ClusterViewState extends State<ClusterView> {
         AppGroup(dividerIndent: 60, children: [
           for (final w in cluster.workers)
             AppRow(
-              icon: Icons.smartphone_rounded,
+              icon: _workerIcon(w),
               title: w.model ?? w.name,
               subtitle: [
                 w.endpoint,
+                if (w.isPc) _pcLabel(w),
                 if (w.ramMb != null) '${_gb(w.ramMb!)} free',
                 if (w.bandwidth != null) '${w.bandwidth!.toStringAsFixed(1)} GB/s',
               ].join(' · '),
@@ -258,13 +260,80 @@ class _ClusterViewState extends State<ClusterView> {
         AppGroup(dividerIndent: 60, children: [
           for (final w in cluster.found)
             AppRow(
-              icon: Icons.smartphone_rounded,
+              icon: _workerIcon(w),
               title: w.model ?? w.name,
-              subtitle: w.endpoint,
+              subtitle: [
+                w.endpoint,
+                if (w.isPc) _pcLabel(w),
+                if (!w.isCompatible) 'needs update (${w.version})',
+              ].join(' · '),
               trailing: PillButton(
                 label: 'Add',
                 primary: true,
-                onPressed: () => _report(cluster.addFound(w)),
+                onPressed: w.isCompatible ? () => _report(cluster.addFound(w)) : null,
+              ),
+            ),
+        ]),
+      ],
+      const SectionFootnote(
+        'A Linux PC can be a worker too: run privatelm-node worker on it '
+        '(see linux-node/ in the source). Its GPU (NVIDIA, AMD or Intel) then '
+        'takes the biggest share, since its memory is many times faster.',
+      ),
+      ..._pcServerSection(),
+    ];
+  }
+
+  IconData _workerIcon(ClusterWorker w) => w.isGpu
+      ? Icons.memory_rounded
+      : w.isPc
+          ? Icons.computer_rounded
+          : Icons.smartphone_rounded;
+
+  String _pcLabel(ClusterWorker w) =>
+      w.isGpu ? 'PC GPU${w.backend != null ? ' (${w.backend})' : ''}' : 'PC CPU';
+
+  // ── PC servers ─────────────────────────────────────────────────────────
+
+  /// Chat with a model running on a PC (privatelm-node serve), which may
+  /// itself use phones as workers.
+  List<Widget> _pcServerSection() {
+    final t = AppTokens.of(context);
+    return [
+      const SectionHeader('Use a PC\'s model'),
+      Text(
+        'Run privatelm-node serve on a Linux PC with a GPU, then scan the QR '
+        'code it prints. Chat then uses the model on the PC.',
+        style: t.caption,
+      ),
+      const SizedBox(height: 12),
+      Row(children: [
+        PillButton(
+          label: 'Scan PC QR code',
+          icon: Icons.qr_code_scanner_rounded,
+          onPressed: _scanQr,
+        ),
+        if (ClusterService.canBeMaster) ...[
+          const SizedBox(width: 10),
+          PillButton(
+            label: cluster.isScanningServers.value ? 'Searching…' : 'Find PCs',
+            icon: Icons.computer_rounded,
+            onPressed: cluster.isScanningServers.value ? null : cluster.scanServers,
+          ),
+        ],
+      ]),
+      if (cluster.servers.isNotEmpty) ...[
+        const SizedBox(height: 12),
+        AppGroup(dividerIndent: 60, children: [
+          for (final srv in cluster.servers)
+            AppRow(
+              icon: Icons.dns_rounded,
+              title: srv.name,
+              subtitle: [srv.baseUrl, if (srv.model != null) srv.model!].join(' · '),
+              trailing: PillButton(
+                label: 'Use',
+                primary: true,
+                onPressed: () => _useServer(srv),
               ),
             ),
         ]),
@@ -272,9 +341,61 @@ class _ClusterViewState extends State<ClusterView> {
     ];
   }
 
+  Future<void> _useServer(ClusterServer srv) async {
+    var key = '';
+    if (srv.needsKey) {
+      final ctrl = TextEditingController();
+      final input = await showAppSheet<String>(
+        context,
+        title: 'API key for ${srv.name}',
+        subtitle: 'privatelm-node prints it when it starts '
+            '(~/.config/privatelm-node/api_key). The QR code includes it.',
+        builder: (ctx) => Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              obscureText: true,
+              decoration: appInputDecoration(ctx, hint: 'API key'),
+              onSubmitted: (v) => Navigator.pop(ctx, v),
+            ),
+            const SizedBox(height: 16),
+            PrimaryButton(label: 'Connect', onPressed: () => Navigator.pop(ctx, ctrl.text)),
+          ],
+        ),
+      );
+      ctrl.dispose();
+      if (input == null) return;
+      key = input.trim();
+    }
+    await _reportServer(cluster.connectServer(
+      name: srv.name.replaceFirst('PrivateLM ', ''),
+      baseUrl: srv.baseUrl,
+      apiKey: key,
+      model: srv.model ?? 'default',
+    ));
+  }
+
+  Future<void> _reportServer(Future<String?> connecting) async {
+    final error = await connecting;
+    if (error != null) {
+      showToast('Couldn\'t connect', error, tone: ToastTone.error);
+    } else {
+      showToast('Connected to PC', 'Chat now runs on the PC\'s model.',
+          tone: ToastTone.success);
+    }
+  }
+
   Future<void> _scanQr() async {
     final code = await Get.to<String>(() => const _QrScanPage());
-    if (code != null) await _report(cluster.addFromQr(code));
+    if (code == null) return;
+    final uri = Uri.tryParse(code.trim());
+    if (uri != null && uri.scheme == 'privatelm' && uri.host == 'server') {
+      await _reportServer(cluster.connectServerFromQr(uri));
+    } else {
+      await _report(cluster.addFromQr(code));
+    }
   }
 
   Future<void> _enterIp(BuildContext context) async {
@@ -474,7 +595,7 @@ class _QrScanPageState extends State<_QrScanPage> {
       appBar: AppBar(
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
-        title: const Text('Scan worker QR code'),
+        title: const Text('Scan PrivateLM QR code'),
       ),
       body: Stack(children: [
         MobileScanner(controller: _controller, onDetect: _onDetect),
@@ -493,7 +614,7 @@ class _QrScanPageState extends State<_QrScanPage> {
           right: 24,
           bottom: 48,
           child: Text(
-            'Point at the QR code on the worker phone',
+            'Point at the QR code on the worker phone or PC',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.white, fontSize: 15),
           ),

@@ -42,6 +42,9 @@ class ClusterChannel(
 
     companion object {
         private const val TAG = "ClusterChannel"
+
+        /** PCs running `privatelm-node serve` (linux-node/). */
+        const val SERVER_SERVICE_TYPE = "_privatelm-api._tcp."
     }
 
     /**
@@ -143,8 +146,15 @@ class ClusterChannel(
                 result.success(buffers)
             }
             "discover" -> scope.launch {
+                // "worker": phones and PCs lending memory (llama.cpp RPC).
+                // "server": PCs serving a model over an OpenAI-compatible API.
+                val serviceType = if (call.argument<String>("type") == "server") {
+                    SERVER_SERVICE_TYPE
+                } else {
+                    ClusterWorkerService.SERVICE_TYPE
+                }
                 val found = try {
-                    discover(call.argument<Int>("timeoutMs")?.toLong() ?: 4000L)
+                    discover(serviceType, call.argument<Int>("timeoutMs")?.toLong() ?: 4000L)
                 } catch (e: Exception) {
                     Log.e(TAG, "Discovery failed", e)
                     withContext(Dispatchers.Main) { result.error("DISCOVERY_FAILED", e.message, null) }
@@ -232,8 +242,13 @@ class ClusterChannel(
         }
     }
 
-    /** Browses for workers for [timeoutMs], then resolves each one in turn. */
-    private suspend fun discover(timeoutMs: Long): List<Map<String, Any?>> {
+    /**
+     * Browses for [serviceType] for [timeoutMs], then resolves each one in
+     * turn. Worker TXT keys: ram, bw, model, id, v, and from PC workers also
+     * kind (gpu/cpu) and backend (CUDA, ROCm, Vulkan, SYCL). Server TXT keys:
+     * path, model, auth.
+     */
+    private suspend fun discover(serviceType: String, timeoutMs: Long): List<Map<String, Any?>> {
         val nsd = context.getSystemService(Context.NSD_SERVICE) as NsdManager
         val seen = mutableMapOf<String, NsdServiceInfo>()
         val listener = object : NsdManager.DiscoveryListener {
@@ -250,7 +265,7 @@ class ClusterChannel(
             }
             override fun onStopDiscoveryFailed(serviceType: String, code: Int) {}
         }
-        nsd.discoverServices(ClusterWorkerService.SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
+        nsd.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
         try {
             delay(timeoutMs)
         } finally {
@@ -269,6 +284,10 @@ class ClusterChannel(
                 "model" to attrs["model"],
                 "id" to attrs["id"],
                 "version" to attrs["v"],
+                "kind" to attrs["kind"],
+                "backend" to attrs["backend"],
+                "path" to attrs["path"],
+                "auth" to attrs["auth"],
             )
         }.filter { it["host"] != null }
     }

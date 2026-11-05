@@ -1,0 +1,20 @@
+[Unit]
+Description=PrivateLM model server (OpenAI-compatible API, optional phone workers)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+# Set the model path. --workers auto uses phones only if the model doesn't fit
+# on this PC; "all" always includes them; "off" never.
+ExecStart=/opt/privatelm-node/bin/privatelm-node serve -m /srv/models/model.gguf --workers auto
+DynamicUser=yes
+CacheDirectory=privatelm-node
+Environment=XDG_CACHE_HOME=/var/cache/privatelm-node
+StateDirectory=privatelm-node
+Environment=XDG_CONFIG_HOME=/var/lib/privatelm-node
+SupplementaryGroups=video render
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

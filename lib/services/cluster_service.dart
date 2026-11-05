@@ -9,6 +9,8 @@ import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:llama_flutter_android/llama_flutter_android.dart';
 
+import '../controllers/cloud_model_controller.dart';
+import '../controllers/settings_controller.dart';
 import '../core/constants.dart';
 import '../core/ui.dart';
 import 'app_log_service.dart';
@@ -62,6 +64,12 @@ class ClusterService extends GetxService {
   /// Speed assumed for workers paired before they reported one (GB/s).
   static const _unknownSpeed = 4.0;
 
+  /// Share of a worker's free memory the master fills. Phones need room for
+  /// Android and the worker's buffers; a PC GPU worker reports free VRAM and
+  /// only needs headroom for compute buffers.
+  static const _phoneShare = 0.75;
+  static const _gpuShare = 0.9;
+
   /// Workers the master can use on its next GGUF load.
   final workers = <ClusterWorker>[].obs;
 
@@ -70,6 +78,10 @@ class ClusterService extends GetxService {
 
   final found = <ClusterWorker>[].obs;
   final isScanning = false.obs;
+
+  /// PCs serving a model over the network (`privatelm-node serve`).
+  final servers = <ClusterServer>[].obs;
+  final isScanningServers = false.obs;
 
   /// This phone's worker service.
   final worker = const ClusterWorkerStatus(state: 'stopped').obs;
@@ -241,6 +253,9 @@ class ClusterService extends GetxService {
     final params = uri?.queryParameters ?? const {};
     final host = params['host'];
     final port = int.tryParse(params['port'] ?? '');
+    if (uri != null && uri.scheme == _qrScheme && uri.host == 'server') {
+      return connectServerFromQr(uri);
+    }
     if (uri == null || uri.scheme != _qrScheme || host == null || port == null) {
       return 'That isn\'t a PrivateLM worker code';
     }
@@ -252,6 +267,7 @@ class ClusterService extends GetxService {
       bandwidth: double.tryParse(params['bw'] ?? ''),
       model: params['name'],
       id: params['id'],
+      kind: params['kind'],
     ));
   }
 
@@ -300,6 +316,11 @@ class ClusterService extends GetxService {
   }
 
   Future<String?> _add(ClusterWorker worker) async {
+    if (!worker.isCompatible) {
+      return '${worker.model ?? worker.name} speaks ${worker.version}, this app '
+          '${LlamaCluster.rpcVersion}. Update PrivateLM on it, or rebuild the PC '
+          'node with linux-node/build.sh.';
+    }
     if (!await LlamaCluster.probe(worker.endpoint)) {
       return 'Can\'t reach ${worker.endpoint}. Check that the phone is a worker '
           'and on the same Wi-Fi.';
@@ -376,7 +397,8 @@ class ClusterService extends GetxService {
     final phones = [
       master,
       for (final w in available)
-        _Phone(w, (w.ramMb ?? 2000) * 0.75, w.bandwidth ?? _unknownSpeed),
+        _Phone(w, (w.ramMb ?? 2000) * (w.isGpu ? _gpuShare : _phoneShare),
+          w.bandwidth ?? _unknownSpeed),
     ];
     final totalMb = phones.fold<double>(0, (a, p) => a + p.capacityMb);
     if (needMb > totalMb) {
@@ -541,6 +563,76 @@ class ClusterService extends GetxService {
   }
 
   void clearSplit() => split.clear();
+
+  // ── PC servers ─────────────────────────────────────────────────────────
+
+  /// Looks for PCs serving a model on the Wi-Fi (Android only; iOS pairs by
+  /// QR code).
+  Future<void> scanServers() async {
+    if (isScanningServers.value) return;
+    isScanningServers.value = true;
+    try {
+      servers.assignAll(await LlamaCluster.discoverServers());
+    } catch (e) {
+      Get.find<AppLogService>().error('PC server discovery failed', details: e);
+    } finally {
+      isScanningServers.value = false;
+    }
+  }
+
+  /// Pairs from a PC's QR code: privatelm://server?url=…&key=…&model=…
+  Future<String?> connectServerFromQr(Uri uri) {
+    final p = uri.queryParameters;
+    final url = p['url'];
+    if (url == null || Uri.tryParse(url)?.host.isEmpty != false) {
+      return Future.value('That PC code has no server address');
+    }
+    return connectServer(
+      name: p['name'] ?? Uri.parse(url).host,
+      baseUrl: url,
+      apiKey: p['key'] ?? '',
+      model: p['model'] ?? 'default',
+    );
+  }
+
+  /// Uses a PC's model for chat: saves it as a custom OpenAI-compatible
+  /// provider (one profile per PC) and switches chat to it. Returns an
+  /// error message, or null on success.
+  Future<String?> connectServer({
+    required String name,
+    required String baseUrl,
+    required String apiKey,
+    required String model,
+  }) async {
+    final url = baseUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    final uri = Uri.tryParse(url);
+    if (uri == null || uri.host.isEmpty) return 'Invalid server address';
+    final port = uri.hasPort ? uri.port : (uri.scheme == 'https' ? 443 : 80);
+    if (!await LlamaCluster.probe('${uri.host}:$port')) {
+      return 'Can\'t reach $url. Check that privatelm-node serve is running '
+          'and the PC is on the same network.';
+    }
+    final settings = Get.find<SettingsController>();
+    final cloud = Get.find<CloudModelController>();
+    final existing = settings.customCloudProfiles.indexWhere((p) => p['baseUrl'] == url);
+    if (existing >= 0) {
+      await settings.selectCustomCloudProfile(existing);
+    } else {
+      settings.beginNewCustomCloudProfile();
+    }
+    // llama-server accepts any key when started without one, but the app
+    // requires a key for custom providers.
+    await settings.setCustomCloudConfig(
+      name: 'PC · $name',
+      baseUrl: url,
+      apiKey: apiKey.isEmpty ? 'none' : apiKey,
+      model: model,
+    );
+    await cloud.selectCustomProfile(settings.customCloudProfileIndex.value);
+    await cloud.selectModel('custom', model, showSnackbar: false);
+    Get.find<AppLogService>().info('Chat now uses the PC server at $url ($model)');
+    return null;
+  }
 
   static String _gb(double mb) => '${(mb / 1024).toStringAsFixed(1)} GB';
 }

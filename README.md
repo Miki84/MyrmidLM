@@ -106,6 +106,15 @@ The `InferenceService` exposes `supportsLocalInference` so the UI can hide local
 | iOS      | ✅ Yes          | ✅ Yes     | Metal GPU acceleration          |
 | Web      | ❌ No           | ✅ Yes     | Cloud-only (local coming soon)  |
 
+### Linux PCs with GPUs (cluster node)
+
+A Linux PC with an NVIDIA (CUDA), AMD (ROCm), Intel (SYCL) or any Vulkan GPU can join the phone cluster:
+
+- **GPU worker:** `privatelm-node worker` lends the PC's GPU(s) to a phone master. Phones find it under *Phone cluster → Find nearby* or by QR code, and it takes the biggest share of the layers.
+- **Master / server:** `privatelm-node serve -m model.gguf` runs the model on the PC (optionally with phones as extra memory) behind an OpenAI-compatible API. Phones connect via *Phone cluster → Scan PC QR code* or *Find PCs*.
+
+The node is built from the same llama.cpp commit the app vendors, so the RPC protocol matches. See [`linux-node/README.md`](linux-node/README.md).
+
 ### iOS / iPad (Installation via AltServer)
 The iOS/iPad release is distributed as a sideloadable IPA file. Due to the RAM requirements for local models, iPad is the recommended iOS target, but it can be installed on iPhones.
 
