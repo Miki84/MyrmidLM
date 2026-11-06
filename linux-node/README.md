@@ -68,6 +68,8 @@ So plant `serve`:
 - **Platz für KV-Cache und Puffer.** Pro Layer zählen Gewichte plus KV-Cache für die gewählte Kontextlänge (`--ctx`), dazu 400 MB Rechenpuffer pro GPU. Eine bis zum Rand gefüllte Karte wird sonst langsamer oder lädt gar nicht.
 - **Zeitmodell bei `--workers auto`:** Die Netzwerk-Latenz zu jedem Worker wird gemessen; ein Worker wird weggelassen, wenn das Modell ohne ihn passt und die geschätzte Zeit pro Token ohne ihn kürzer ist. `--workers all` nimmt jeden Worker mit Platz, füllt aber ebenfalls die schnellsten zuerst.
 - **Ausgabeschicht bleibt lokal.** Sie berechnet pro Token einen Wert für jedes Wort des Vokabulars (z. B. 152.000 × 4 Byte ≈ 600 KB). Liegt sie auf einem Worker, kommt dieser Vektor bei jedem Token übers Netz. `serve` hält sie per `-ot` auf der schnellsten lokalen GPU oder im RAM (llama.cpp würde sie sonst mit den letzten Layern auf das letzte Gerät legen).
+- **MoE-Modelle** (z. B. Qwen3-30B-A3B): Pro Token rechnen nur wenige Experten, Experten im RAM kosten daher wenig. Passt das Modell auf den Master, legt `serve` bei `auto` Attention, KV-Cache und so viele Experten wie möglich auf die GPU, den Rest der Experten in den RAM (`--n-cpu-moe`), ohne Worker. Gemessene Setups zeigen MoE über RPC bei der Generierung ungefähr gleichauf, der Verbund lohnt dort vor allem für lange Prompts. Mit `--workers all` werden Worker trotzdem genutzt; der Plan zeigt beide Schätzungen.
+- **MTP** (Multi-Token-Prediction, Modelle mit eingebauten Draft-Layern): `--mtp N` rät N Tokens voraus und prüft sie gemeinsam. Die Draft-Layer sitzen am Ende des Modells und bleiben wie die Ausgabeschicht auf dem Master; für den zweiten Kontext werden 1,3 GB reserviert. Die beste Tiefe hängt von der Temperatur ab (bei Temperatur 1 werden weniger Vorhersagen angenommen, Tiefe 1 kann dann schneller sein als 3). `privatelm-node tune-mtp -m modell.gguf --temp 0.7` probiert die Tiefen 0 bis 3 bei Ihrer Temperatur durch; vorher den laufenden Server stoppen, die Worker bedienen nur einen Master.
 - `--ram-limit GB` begrenzt den RAM, den der Master selbst für das Modell hergibt.
 
 Der Plan wird vor dem Start mit geschätzten Token/s, Anzahl Netzwerk-Hops und erwartetem Verkehr pro Token angezeigt.
@@ -75,10 +77,11 @@ Der Plan wird vor dem Start mit geschätzten Token/s, Anzahl Netzwerk-Hops und e
 **Messen:** Auf dem Master, während `serve` läuft:
 
 ```bash
-privatelm-node bench            # Token/s und KB pro Token (Ein- und Ausgang)
+privatelm-node bench                          # Token/s und KB pro Token (Ein- und Ausgang)
+privatelm-node bench --temp 1.0 --context 8000  # bei Ihrer Temperatur und mit gefülltem Kontext
 ```
 
-Gezählt werden beide Richtungen; ein Zähler nur für den Ausgang würde die zurückkommenden Ausgabe-Vektoren übersehen. Richtwerte: ein paar bis einige zehn KB pro Token und Worker sind normal. Etwa Vokabular × 4 Byte heißt, die Ausgabeschicht liegt auf einem Worker. Megabytes heißen, die Layer sind zwischen den Rechnern verschachtelt. Der API-Key wird beim ersten Start erzeugt (`~/.config/privatelm-node/api_key`) und steckt im QR-Code. In der App: *Phone cluster → Scan PC QR code* (oder *Find PCs*, dann Key eingeben). Der Chat läuft danach als eigenes Custom-Provider-Profil „PC · <hostname>“.
+Messen Sie mit Ihrer echten Temperatur und einem gefüllten Kontext: Ein kurzer Test mit leerem Kontext unterschätzt den Nutzen der Worker, deren Hauptbeitrag oft der Platz für den KV-Cache ist. Bei MTP zeigt `bench` die Annahmequote der Vorhersagen. Gezählt werden beide Richtungen; ein Zähler nur für den Ausgang würde die zurückkommenden Ausgabe-Vektoren übersehen. Richtwerte: ein paar bis einige zehn KB pro Token und Worker sind normal. Etwa Vokabular × 4 Byte heißt, die Ausgabeschicht liegt auf einem Worker. Megabytes heißen, die Layer sind zwischen den Rechnern verschachtelt. Der API-Key wird beim ersten Start erzeugt (`~/.config/privatelm-node/api_key`) und steckt im QR-Code. In der App: *Phone cluster → Scan PC QR code* (oder *Find PCs*, dann Key eingeben). Der Chat läuft danach als eigenes Custom-Provider-Profil „PC · <hostname>“.
 
 **Als Dienst:** `systemd/privatelm-worker.service` bzw. `privatelm-server.service` nach `/etc/systemd/system/` kopieren, Pfade anpassen, `systemctl enable --now …`.
 

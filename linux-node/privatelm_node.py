@@ -345,9 +345,26 @@ class ModelInfo:
     size_mb: float
     embd_mb: float = 0.0  # token embedding: always in this PC's RAM
     tied: bool = False  # output head shares the token embedding
+    n_expert: int = 0  # MoE: experts per layer
+    n_expert_used: int = 0  # MoE: experts that run per token
+    expert_mb: float = 0.0  # MoE: all experts of one layer
+    n_nextn: int = 0  # MTP: draft layers at the end of the model
 
     def per_layer_mb(self) -> float:
+        """Memory per layer: all weights plus KV cache."""
         return self.layer_mb + self.kv_layer_mb
+
+    @property
+    def is_moe(self) -> bool:
+        return self.n_expert > 1 and self.expert_mb > 0
+
+    def read_mb(self) -> float:
+        """Weights read per layer and token: an MoE layer only reads the
+        experts that run, which is why experts in RAM are cheap."""
+        if not self.is_moe:
+            return self.layer_mb
+        used = max(1, self.n_expert_used) / self.n_expert
+        return self.layer_mb - self.expert_mb + self.expert_mb * used
 
 
 def gguf_info(path: str, ctx: int) -> ModelInfo:
@@ -422,9 +439,16 @@ def gguf_info(path: str, ctx: int) -> ModelInfo:
     vocab = kv.get("tokenizer.ggml.tokens")
     n_vocab = vocab[1] if isinstance(vocab, tuple) else a("vocab_size", 0) or 0
     kv_layer = ctx * n_head_kv * (k_dim + v_dim) * 2  # f16 K and V
+    exps = sum(v for k, v in sizes.items() if re.match(r"^blk\.\d+\.ffn_(up|down|gate|gate_up)_(ch|)exps", k))
+    n_expert = a("expert_count", 0)
+    n_used = a("expert_used_count", 0)
+    nextn = a("nextn_predict_layers", 0)
     return ModelInfo(n_layer, n_embd, n_vocab, blk / n_layer / 2**20, kv_layer / 2**20,
                      out / 2**20, file_size / 2**20,
-                     sizes.get("token_embd.weight", 0) / 2**20, "output.weight" not in sizes)
+                     sizes.get("token_embd.weight", 0) / 2**20, "output.weight" not in sizes,
+                     n_expert if isinstance(n_expert, int) else 0,
+                     n_used if isinstance(n_used, int) else 0,
+                     exps / n_layer / 2**20, nextn if isinstance(nextn, int) else 0)
 
 
 # ── Planning ─────────────────────────────────────────────────────────────────
@@ -441,6 +465,7 @@ def gguf_info(path: str, ctx: int) -> ModelInfo:
 #     shipping the scores is cheaper, so they don't cross the wire.
 
 GPU_RESERVE_MB = 400  # compute buffers per GPU, beyond weights and KV
+MTP_RESERVE_MB = 1300  # MTP: second context and draft buffers, on the output device
 HOST_RESERVE_MB = 1024
 NET_MBPS_PC = 110.0  # 1 Gbit/s Ethernet
 NET_MBPS_PHONE = 25.0  # Wi-Fi
@@ -458,6 +483,7 @@ class Unit:
     net_mbps: float = NET_MBPS_PC
     device_caps: list[int] = field(default_factory=list)
     layers: int = 0
+    min_layers: int = 0  # e.g. the MTP tail that must stay on this PC
 
     @property
     def remote(self) -> bool:
@@ -467,9 +493,13 @@ class Unit:
 def fill_fastest_first(units: list[Unit], n_layer: int) -> int:
     """Assigns layers to the fastest units first; returns layers left over."""
     left = n_layer
-    for u in sorted(units, key=lambda u: -u.speed):
-        u.layers = min(u.capacity_layers, left)
+    for u in units:
+        u.layers = min(u.min_layers, u.capacity_layers, left)
         left -= u.layers
+    for u in sorted(units, key=lambda u: -u.speed):
+        more = min(u.capacity_layers - u.layers, left)
+        u.layers += more
+        left -= more
     return left
 
 
@@ -477,7 +507,7 @@ def token_time(units: list[Unit], m: ModelInfo, out_unit: Optional[Unit]) -> flo
     t = 0.0
     for u in units:
         if u.layers:
-            t += u.layers * m.layer_mb / 1024 / u.speed
+            t += u.layers * m.read_mb() / 1024 / u.speed
             if u.remote:
                 t += 2 * u.rtt_s + HOP_OVERHEAD_S + 2 * m.n_embd * 4 / 2**20 / u.net_mbps
     if out_unit is not None:
@@ -666,19 +696,7 @@ def _advertise(args, advs: list, name: str, port: int, txt: dict, address: str) 
         log(f"Advertised {name} on the LAN (phones: Phone cluster > Find nearby)")
 
 
-def cmd_serve(args) -> None:
-    model = str(Path(args.model).expanduser().resolve())
-    if not Path(model).is_file():
-        die(f"No such model: {model}")
-    m = gguf_info(model, args.ctx)
-    per_layer = m.per_layer_mb()
-    logits_mb = m.n_vocab * 4 * 512 / 2**20  # output buffer for a 512-token batch
-
-    devices = probe(bench=True)
-    local_gpus = usable_gpus(devices)
-    cpu = next((d for d in devices if d.type == "cpu"), None)
-    host_speed = cpu.bandwidth if cpu and cpu.bandwidth else 20.0
-
+def _find_workers(args) -> list[Peer]:
     workers: list[Peer] = []
     if args.workers not in ("off", "auto", "all"):
         # Workers by address; their speed and kind still come from mDNS
@@ -705,8 +723,12 @@ def cmd_serve(args) -> None:
         if not reachable(w.endpoint):
             log(f"Worker {w.endpoint} not reachable, leaving it out")
             workers.remove(w)
+    return workers
 
-    # Free memory per device, as the workers report it over RPC.
+
+def _remote_units(workers: list[Peer], per_layer: float) -> list[Unit]:
+    """One unit per worker, with room in layers per device as the workers
+    report their free memory over RPC."""
     reported = list_devices([w.endpoint for w in workers]) if workers else []
     remote: list[Unit] = []
     for w in workers:
@@ -730,28 +752,125 @@ def cmd_serve(args) -> None:
         log(f"Worker {u.label} ({w.endpoint}): room for {u.capacity_layers} layers, "
             f"{u.speed:.0f} GB/s, {u.rtt_s*1000:.1f} ms round trip")
         remote.append(u)
+    return remote
 
-    # The output head stays on this PC: on the fastest local GPU with room
-    # for it, else in RAM. (The report that prompted this: with the tail on
-    # a worker, 100k scores per token came back over the network.)
+
+@dataclass
+class MoePlan:
+    counts: list[int]  # layers per local GPU, registry order
+    n_cpu_moe: int  # experts of the first N layers stay in RAM
+    time_s: float
+
+
+def moe_local_plan(m: ModelInfo, gpus: list[Device], budgets: list[float], host_budget: float,
+                   host_speed: float) -> Optional[MoePlan]:
+    """MoE on this PC alone: attention, shared weights and KV cache of every
+    layer on the GPU(s), as many layers' experts as fit too, the rest of the
+    experts in RAM. Only the experts that run are read per token, so RAM
+    costs little; workers would add a network hop for nothing."""
+    if not gpus or not m.is_moe:
+        return None
+    dense = m.layer_mb - m.expert_mb + m.kv_layer_mb
+    for k in range(m.n_layer + 1):
+        counts = [0] * len(gpus)
+        used = [0.0] * len(gpus)
+        g = 0
+        ok = True
+        for il in range(m.n_layer):
+            need = dense + (m.expert_mb if il >= k else 0)
+            while g < len(gpus) and used[g] + need > budgets[g]:
+                g += 1
+            if g == len(gpus):
+                ok = False
+                break
+            used[g] += need
+            counts[g] += 1
+        if not ok:
+            continue
+        if k * m.expert_mb + m.embd_mb > host_budget:
+            return None
+        active = m.expert_mb * max(1, m.n_expert_used) / m.n_expert
+        t = 0.0
+        il = 0
+        for gi, c in enumerate(counts):
+            sp = gpus[gi].bandwidth or 100.0
+            for _ in range(c):
+                t += (m.layer_mb - m.expert_mb) / 1024 / sp
+                t += active / 1024 / (host_speed if il < k else sp)
+                il += 1
+        t += m.output_mb / 1024 / (gpus[-1].bandwidth or 100.0)
+        return MoePlan(counts, k, t)
+    return None
+
+
+@dataclass
+class ServerPlan:
+    cmd: list[str]
+    name: str
+    key: str
+    estimate_tps: float
+
+
+def build_server(args, quiet: bool = False) -> ServerPlan:
+    """Plans the split and returns the llama-server command."""
+    say = (lambda *a, **k: None) if quiet else print
+    model = str(Path(args.model).expanduser().resolve())
+    if not Path(model).is_file():
+        die(f"No such model: {model}")
+    m = gguf_info(model, args.ctx)
+    if args.mtp and not m.n_nextn:
+        die("This model has no MTP layers (nextn_predict_layers = 0). Use a model with MTP, "
+            "or leave out --mtp.")
+    per_layer = m.per_layer_mb()
+    logits_mb = m.n_vocab * 4 * 512 / 2**20  # output buffer for a 512-token batch
+    out_extra = m.output_mb + logits_mb + (MTP_RESERVE_MB if args.mtp else 0)
+
+    devices = probe(bench=True)
+    local_gpus = usable_gpus(devices)
+    cpu = next((d for d in devices if d.type == "cpu"), None)
+    host_speed = cpu.bandwidth if cpu and cpu.bandwidth else 20.0
+
+    # The output head (and the MTP draft layers, which sit at the tail)
+    # stays on this PC: on the last local GPU in llama.cpp's order that has
+    # room, so the tail of the model ends here; else in RAM.
     out_gpu = None
-    for d in sorted(local_gpus, key=lambda d: -(d.bandwidth or 0)):
-        if d.free_mb * GPU_SHARE - GPU_RESERVE_MB >= m.output_mb + logits_mb:
+    for d in reversed(local_gpus):
+        if d.free_mb * GPU_SHARE - GPU_RESERVE_MB >= out_extra + (m.n_nextn * per_layer if args.mtp else 0):
             out_gpu = d
             break
-    gpus = []
-    for d in local_gpus:
-        room = d.free_mb * GPU_SHARE - GPU_RESERVE_MB - (m.output_mb + logits_mb if d is out_gpu else 0)
-        gpus.append(Unit(f"{d.name} {d.description}", max(0, int(room // per_layer)),
-                         d.bandwidth or 100.0, [d.name], device_caps=[max(0, int(room // per_layer))]))
+    budgets = [d.free_mb * GPU_SHARE - GPU_RESERVE_MB - (out_extra if d is out_gpu else 0)
+               for d in local_gpus]
+    gpus = [Unit(f"{d.name} {d.description}", max(0, int(b // per_layer)), d.bandwidth or 100.0,
+                 [d.name], device_caps=[max(0, int(b // per_layer))],
+                 min_layers=m.n_nextn if (args.mtp and d is out_gpu) else 0)
+            for d, b in zip(local_gpus, budgets)]
     host_budget = host_available_mb() * HOST_SHARE - HOST_RESERVE_MB
     if args.ram_limit is not None:
         host_budget = min(host_budget, args.ram_limit * 1024)
-    host_room = host_budget - m.embd_mb - (0 if out_gpu else m.output_mb + logits_mb)
+    host_room = host_budget - m.embd_mb - (0 if out_gpu else out_extra)
     host = Unit("This PC (RAM)", max(0, int(host_room // per_layer)), host_speed, [])
 
+    # MoE on this PC alone (experts in RAM), if it fits and isn't slower.
+    moe = None
+    if m.is_moe and out_gpu is not None and out_gpu is local_gpus[-1] and args.workers in ("auto", "off"):
+        # experts not on the GPU live in RAM: the RAM budget is for them
+        moe = moe_local_plan(m, local_gpus, budgets, host_budget, host_speed)
+
+    workers = _find_workers(args) if not (moe and args.workers == "off") else []
+    remote = _remote_units(workers, per_layer)
     prune = args.workers == "auto"
     used = plan(gpus + remote + [host], m, prune)
+    layer_time = token_time(used, m, host if out_gpu is None else gpus[local_gpus.index(out_gpu)]) \
+        if used else float("inf")
+
+    # MoE that fits here (experts in RAM) stays here in auto mode: measured
+    # setups show MoE over RPC about even on generation, since only a few
+    # experts run per token; the time model would overrate the workers.
+    if moe:
+        if used and any(u.remote and u.layers for u in used):
+            log(f"MoE fits on this PC: staying here (est. {1/moe.time_s:.1f} tokens/s; with workers the "
+                f"estimate is {1/layer_time:.1f}). Compare for real: bench with --workers off and all.")
+        return _moe_command(args, model, m, local_gpus, moe, say)
     if not used:
         total = sum(u.capacity_layers for u in gpus + remote + [host])
         die(f"Model needs {m.n_layer} layers of ~{per_layer:.0f} MB (weights + KV cache at "
@@ -762,18 +881,20 @@ def cmd_serve(args) -> None:
         log("Not using (slower with them than without): " + ", ".join(u.label for u in dropped)
             + ". --workers all includes every worker that has room.")
     used_remote = [u for u in remote if u.layers]
-    # Output on this PC unless there is no GPU here and a worker GPU would
-    # do it faster even after shipping the scores back.
     out_unit: Unit = next((g for g in gpus if out_gpu and out_gpu.name in g.devices), host)
-    if out_gpu is None and used_remote:
+    if out_gpu is None and used_remote and not args.mtp:
+        # No GPU here: a worker GPU may compute the head faster even after
+        # shipping the scores back.
         best_r = max(used_remote, key=lambda u: u.speed)
         here = m.output_mb / 1024 / host.speed
         there = m.output_mb / 1024 / best_r.speed + m.n_vocab * 4 / 2**20 / best_r.net_mbps
         spare = (best_r.capacity_layers - best_r.layers) * per_layer
         if there < here and spare >= m.output_mb + logits_mb:
             out_unit = best_r
-    # The worker holding the output goes last among the workers.
-    used_remote.sort(key=lambda u: u is out_unit)
+    if args.mtp and out_gpu is None:
+        log("MTP without a GPU on this PC: the draft layers run on the last worker, "
+            "which costs extra network round trips.")
+    used_remote.sort(key=lambda u: u is out_unit)  # the worker holding the head goes last
     rpc = [u.endpoint for u in used_remote]
 
     devs = list_devices(rpc)
@@ -781,7 +902,7 @@ def cmd_serve(args) -> None:
     devs = [d for d in devs if d[0].startswith("RPC") or d[0] in local_names]
     counts: list[int] = []
     owner_of: list[Optional[Unit]] = []
-    per_worker_seen: dict[str, int] = {}
+    seen: dict[str, int] = {}
     for name, desc, _free in devs:
         if name.startswith("RPC"):
             u = next((u for u in used_remote if _on_worker(name, desc, u.endpoint)), None)
@@ -789,8 +910,8 @@ def cmd_serve(args) -> None:
                 counts.append(0)
                 owner_of.append(None)
                 continue
-            k = per_worker_seen.get(u.endpoint, 0)
-            per_worker_seen[u.endpoint] = k + 1
+            k = seen.get(u.endpoint, 0)
+            seen[u.endpoint] = k + 1
             shares = split_integer(u.layers, [float(c) for c in u.device_caps])
             counts.append(shares[k] if k < len(shares) else 0)
             owner_of.append(u)
@@ -799,7 +920,7 @@ def cmd_serve(args) -> None:
             counts.append(u.layers if u else 0)
             owner_of.append(u)
     for u in used_remote:
-        if per_worker_seen.get(u.endpoint, 0) != len(u.device_caps):
+        if seen.get(u.endpoint, 0) != len(u.device_caps):
             die(f"Worker {u.endpoint} changed its devices while planning; start again.")
 
     # llama.cpp offloads the last -ngl of n_layer + 1 slots, the output layer
@@ -822,45 +943,143 @@ def cmd_serve(args) -> None:
     est = token_time(used, m, out_unit)
     hops = len(used_remote)
     net_kb = hops * (2 * m.n_embd * 4) / 1024 + (m.n_vocab * 4 / 1024 if out_unit.remote else 0)
-    print("\nPlan:")
+    say("\nPlan (layers split across devices):")
     for u in sorted(used, key=lambda u: -u.speed):
-        print(f"  {u.label:<42} {u.layers:>3} layers  {u.layers * per_layer / 1024:5.1f} GB  "
-              f"({u.speed:.0f} GB/s{', %.1f ms RTT' % (u.rtt_s * 1000) if u.remote else ''})")
+        say(f"  {u.label:<42} {u.layers:>3} layers  {u.layers * per_layer / 1024:5.1f} GB  "
+            f"({u.speed:.0f} GB/s{', %.1f ms RTT' % (u.rtt_s * 1000) if u.remote else ''})")
     where = "this PC's RAM" if out_unit is host else out_unit.label
-    print(f"  Output head: {where}" + ("  (scores cross the network every token)" if out_unit.remote else ""))
-    print(f"  {m.n_layer} layers at {per_layer:.0f} MB each incl. KV cache for -c {args.ctx}")
-    print(f"  Estimate: ~{1/est:.1f} tokens/s, {hops} network hop(s), ~{net_kb:.0f} KB/token on the wire"
-          " (check with: privatelm-node bench)\n")
+    say(f"  Output head: {where}" + ("  (scores cross the network every token)" if out_unit.remote else ""))
+    _say_model(say, m, per_layer, args)
+    if moe:
+        say(f"  (MoE on this PC alone would give ~{1/moe.time_s:.1f} tokens/s)")
+    say(f"  Estimate: ~{1/est:.1f} tokens/s{' before MTP' if args.mtp else ''}, {hops} network hop(s), "
+        f"~{net_kb:.0f} KB/token on the wire (check with: privatelm-node bench)\n")
 
-    key = args.api_key if args.api_key is not None else _api_key()
-    cmd = [find_bin("llama-server"), "-m", model, "--host", args.host, "--port", str(args.port),
-           "-c", str(args.ctx), "--fit", "off", "-ngl", str(ngl)]
+    cmd = [find_bin("llama-server"), "-m", model, "-c", str(args.ctx), "--fit", "off", "-ngl", str(ngl)]
     if any(counts):
         cmd += ["--tensor-split", ",".join(str(c) for c in counts)]
     cmd += extra
     if rpc:
         cmd += ["--rpc", ",".join(rpc)]
+    return _finish_command(args, cmd, model, 1 / est)
+
+
+def _say_model(say, m: ModelInfo, per_layer: float, args) -> None:
+    kind = (f"MoE, {m.n_expert_used} of {m.n_expert} experts per token" if m.is_moe else "dense")
+    say(f"  Model: {m.n_layer} layers ({kind}), {per_layer:.0f} MB each incl. KV cache for -c {args.ctx}"
+        + (f"; MTP depth {args.mtp}" if args.mtp else (f"; has MTP (try --mtp 1)" if m.n_nextn else "")))
+
+
+def _moe_command(args, model: str, m: ModelInfo, gpus: list[Device], moe: MoePlan, say) -> ServerPlan:
+    say("\nPlan (MoE on this PC: experts that don't fit on the GPU stay in RAM):")
+    for d, c in zip(gpus, moe.counts):
+        if c:
+            say(f"  {d.name} {d.description:<36} {c:>3} layers ({d.bandwidth:.0f} GB/s)")
+    if moe.n_cpu_moe:
+        say(f"  Experts of the first {moe.n_cpu_moe} layers: this PC's RAM "
+            f"({moe.n_cpu_moe * m.expert_mb / 1024:.1f} GB)")
+    say(f"  Output head: {gpus[-1].name}")
+    _say_model(say, m, m.per_layer_mb(), args)
+    say(f"  Estimate: ~{1/moe.time_s:.1f} tokens/s{' before MTP' if args.mtp else ''}, no network hops\n")
+    counts = list(moe.counts)
+    counts[-1] += 1  # output slot on the last GPU
+    cmd = [find_bin("llama-server"), "-m", model, "-c", str(args.ctx), "--fit", "off",
+           "-ngl", str(m.n_layer + 1)]
+    if len(gpus) > 1:
+        cmd += ["--tensor-split", ",".join(str(c) for c in counts)]
+    if moe.n_cpu_moe:
+        cmd += ["--n-cpu-moe", str(moe.n_cpu_moe)]
+    return _finish_command(args, cmd, model, 1 / moe.time_s)
+
+
+def _finish_command(args, cmd: list[str], model: str, tps: float) -> ServerPlan:
+    if args.mtp:
+        cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(args.mtp)]
+    key = args.api_key if args.api_key is not None else _api_key()
+    cmd += ["--host", args.host, "--port", str(args.port)]
     if key:
         cmd += ["--api-key", key]
     cmd += args.extra
-    log(" ".join(cmd).replace(key, "***") if key else " ".join(cmd))
-    proc = subprocess.Popen(cmd)
+    return ServerPlan(cmd, Path(model).stem, key, tps)
+
+
+def cmd_serve(args) -> None:
+    sp = build_server(args)
+    log(" ".join(sp.cmd).replace(sp.key, "***") if sp.key else " ".join(sp.cmd))
+    proc = subprocess.Popen(sp.cmd)
 
     address = args.advertise_ip or (args.host if args.host not in ("0.0.0.0", "") else lan_address())
-    name = Path(model).stem
     adv = None
     if not args.no_advertise:
         adv = Advertiser(SERVER_TYPE, f"PrivateLM {socket.gethostname()}", args.port,
-                         {"path": "/v1", "model": name, "auth": "1" if key else "0", "v": "1"}, address)
+                         {"path": "/v1", "model": sp.name, "auth": "1" if sp.key else "0", "v": "1"}, address)
         adv.start()
     from urllib.parse import urlencode
 
-    params = {"url": f"http://{address}:{args.port}/v1", "model": name, "name": socket.gethostname()}
-    if key:
-        params["key"] = key
-    print(f"\nOpenAI-compatible API: http://{address}:{args.port}/v1  (model: {name})")
+    params = {"url": f"http://{address}:{args.port}/v1", "model": sp.name, "name": socket.gethostname()}
+    if sp.key:
+        params["key"] = sp.key
+    print(f"\nOpenAI-compatible API: http://{address}:{args.port}/v1  (model: {sp.name})")
     show_qr(f"privatelm://server?{urlencode(params)}")
     _wait(proc, adv)
+
+
+def cmd_tune_mtp(args) -> None:
+    """Starts the server once per MTP depth and measures it at the
+    temperature you actually use: a depth tuned at temperature 0 (what most
+    benchmarks run) can be slower at temperature 1, because fewer drafted
+    tokens are accepted."""
+    depths = [int(x) for x in args.depths.split(",")]
+    args.host, args.no_advertise = "127.0.0.1", True
+    if any(depths) and not gguf_info(str(Path(args.model).expanduser()), args.ctx).n_nextn:
+        die("This model has no MTP layers (nextn_predict_layers = 0); MTP needs a model that ships them.")
+    results = []
+    for depth in depths:
+        args.mtp = depth
+        sp = build_server(args, quiet=depth != depths[0])
+        base = f"http://127.0.0.1:{args.port}"
+        log(f"MTP depth {depth}: starting server...")
+        proc = subprocess.Popen(sp.cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            if not _wait_healthy(base, proc, timeout=args.load_timeout):
+                log(f"depth {depth}: server did not start (try it with privatelm-node serve --mtp {depth})")
+                continue
+            r = measure(base, sp.key, None, args.temp, args.tokens, args.context, runs=args.runs)
+            results.append((depth, r))
+            acc = f", accepted {r['acceptance']*100:.0f}%" if r.get("acceptance") is not None else ""
+            log(f"depth {depth}: {r['tps']:.1f} tokens/s{acc}")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    if not results:
+        die("No depth could be measured.")
+    best = max(results, key=lambda x: x[1]["tps"])
+    print(f"\nMTP at temperature {args.temp}, context ~{args.context} tokens:")
+    for depth, r in results:
+        acc = f"{r['acceptance']*100:5.0f}%" if r.get("acceptance") is not None else "    -"
+        print(f"  depth {depth}: {r['tps']:6.1f} tokens/s   accepted {acc}" + ("   <- best" if (depth, r) == best else ""))
+    print(f"\nUse: privatelm-node serve -m {args.model} --mtp {best[0]}" if best[0] else
+          "\nMTP doesn't pay off at this temperature: serve without --mtp.")
+
+
+def _wait_healthy(base: str, proc: subprocess.Popen, timeout: float) -> bool:
+    import urllib.request
+
+    t_end = time.time() + timeout
+    while time.time() < t_end:
+        if proc.poll() is not None:
+            return False
+        try:
+            with urllib.request.urlopen(base + "/health", timeout=3) as r:
+                if r.status == 200:
+                    return True
+        except OSError:
+            pass
+        time.sleep(2)
+    return False
 
 
 def cmd_scan(args) -> None:
@@ -894,51 +1113,102 @@ def _net_bytes(ifaces: Optional[list[str]]) -> tuple[int, int]:
     return rx, tx
 
 
-def cmd_bench(args) -> None:
+def _http(base: str, key: str):
     import urllib.request
 
-    base = args.url.rstrip("/")
-    if base.endswith("/v1"):
-        base = base[:-3]
-    key = args.api_key if args.api_key is not None else (
-        _api_key() if (CONFIG_DIR / "api_key").exists() else "")
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
 
     def call(path: str, body: Optional[dict] = None) -> dict:
+        import urllib.error
+
         req = urllib.request.Request(base + path, headers=headers,
                                      data=json.dumps(body).encode() if body is not None else None)
-        with urllib.request.urlopen(req, timeout=600) as r:
-            return json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=900) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            if e.code == 401:
+                die("The server wants an API key: --api-key KEY (privatelm-node serve printed it)")
+            die(f"Server answered {e.code} on {path}: {detail}")
 
+    return call
+
+
+FILLER = ("The lighthouse keeper wrote in his log every evening, noting the weather, the ships "
+          "that passed, the state of the lamp and the small events of the island. ")
+
+
+def measure(base: str, key: str, ifaces: Optional[list[str]], temp: float, tokens: int,
+            context: int, runs: int = 1) -> dict:
+    """Generation speed and network traffic per token (both directions:
+    the difference between a 1-token and an N-token run, so the prompt's
+    traffic drops out). context = rough prompt length in tokens: a full
+    context is slower, and that's where workers' extra memory pays off."""
+    call = _http(base, key)
     try:
         meta = (call("/v1/models").get("data") or [{}])[0].get("meta") or {}
     except OSError as e:
         die(f"No server at {base}: {e}")
-    n_vocab, n_embd = meta.get("n_vocab", 0), meta.get("n_embd", 0)
-    ifaces = args.iface.split(",") if args.iface else None
+    tail = "\nContinue the log with a new entry:"
+    prompt = tail
+    if context > 0:
+        try:
+            n_ctx = call("/props").get("default_generation_settings", {}).get("n_ctx", 0)
+        except SystemExit:
+            n_ctx = 0
+        if n_ctx:
+            room = n_ctx - tokens - 64
+            if context > room:
+                log(f"--context {context} doesn't fit the server's {n_ctx}-token context with "
+                    f"{tokens} new tokens; using {max(0, room)}")
+                context = max(0, room)
+        per = len(call("/tokenize", {"content": FILLER}).get("tokens", [])) or 30
+        prompt = FILLER * max(0, context // per) + tail
 
     def run(n: int) -> tuple[dict, int, int]:
         rx0, tx0 = _net_bytes(ifaces)
-        res = call("/completion", {"prompt": "Write a long story about a lighthouse keeper.",
-                                   "n_predict": n, "ignore_eos": True, "cache_prompt": False,
-                                   "temperature": 0})
+        res = call("/completion", {"prompt": prompt, "n_predict": n, "ignore_eos": True,
+                                   "cache_prompt": False, "temperature": temp, "seed": 42})
         rx1, tx1 = _net_bytes(ifaces)
         return res.get("timings", {}), rx1 - rx0, tx1 - tx0
 
-    log("Warm-up...")
-    run(4)
+    run(4)  # warm-up
     _, rx1, tx1 = run(1)
-    timings, rxn, txn = run(args.tokens)
-    n = timings.get("predicted_n") or args.tokens
-    per_rx = max(0, rxn - rx1) / max(1, n - 1)
-    per_tx = max(0, txn - tx1) / max(1, n - 1)
-    per = per_rx + per_tx
-    tps = timings.get("predicted_per_second", 0.0)
+    tps, per_rx, per_tx, drafted, accepted, n = [], 0.0, 0.0, 0, 0, tokens
+    for _ in range(max(1, runs)):
+        t, rxn, txn = run(tokens)
+        n = t.get("predicted_n") or tokens
+        tps.append(t.get("predicted_per_second", 0.0))
+        per_rx += max(0, rxn - rx1) / max(1, n - 1)
+        per_tx += max(0, txn - tx1) / max(1, n - 1)
+        drafted += t.get("draft_n", 0) or 0
+        accepted += t.get("draft_n_accepted", 0) or 0
+    k = max(1, runs)
+    return {"tps": sum(tps) / len(tps), "per_rx": per_rx / k, "per_tx": per_tx / k, "n": n,
+            "prompt_tokens": None, "acceptance": (accepted / drafted) if drafted else None,
+            "n_vocab": meta.get("n_vocab", 0), "n_embd": meta.get("n_embd", 0)}
 
-    print(f"Generation:   {tps:.1f} tokens/s ({n} tokens)")
-    print(f"Network:      {per/1024:.0f} KB per token  (in {per_rx/1024:.0f} KB, out {per_tx/1024:.0f} KB)")
+
+def cmd_bench(args) -> None:
+    base = args.url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    key = args.api_key if args.api_key is not None else (
+        _api_key() if (CONFIG_DIR / "api_key").exists() else "")
+    ifaces = args.iface.split(",") if args.iface else None
+    log(f"Measuring at temperature {args.temp}, context ~{args.context} tokens...")
+    r = measure(base, key, ifaces, args.temp, args.tokens, args.context, args.runs)
+    per = r["per_rx"] + r["per_tx"]
+    print(f"Generation:   {r['tps']:.1f} tokens/s ({r['n']} tokens, temperature {args.temp}, "
+          f"context ~{args.context})")
+    if r["acceptance"] is not None:
+        print(f"MTP/draft:    {r['acceptance']*100:.0f}% of drafted tokens accepted "
+              "(tune the depth at this temperature: privatelm-node tune-mtp)")
+    print(f"Network:      {per/1024:.0f} KB per token  (in {r['per_rx']/1024:.0f} KB, out {r['per_tx']/1024:.0f} KB)")
+    n_vocab, n_embd = r["n_vocab"], r["n_embd"]
     if not n_vocab:
         return
     logits = n_vocab * 4
@@ -947,7 +1217,7 @@ def cmd_bench(args) -> None:
           f"output scores {logits/1024:.0f} KB ({n_vocab} tokens x 4 bytes)")
     if per < 2048:
         print("Verdict:      no traffic per token: the model runs on this PC alone.")
-    elif per_rx >= 0.8 * logits:
+    elif r["per_rx"] >= 0.8 * logits:
         print("Verdict:      the output head sits on a worker: its scores come back every token.\n"
               "              Restart with privatelm-node serve (it keeps the head on this PC),\n"
               "              or give the head's device the last place in -dev / --rpc order.")
@@ -1036,6 +1306,8 @@ def main() -> None:
     s.add_argument("--port", type=int, default=DEFAULT_API_PORT)
     s.add_argument("--ctx", type=int, default=8192)
     s.add_argument("--api-key", help="default: generated once, kept in ~/.config/privatelm-node")
+    s.add_argument("--mtp", type=int, default=0,
+                   help="MTP draft depth (models with MTP layers; find the best with tune-mtp)")
     s.add_argument("--ram-limit", type=float,
                    help="GB of this PC's RAM the model may use (layers that don't fit go to workers)")
     s.add_argument("--advertise-ip")
@@ -1048,8 +1320,26 @@ def main() -> None:
     b.add_argument("--url", default=f"http://127.0.0.1:{DEFAULT_API_PORT}")
     b.add_argument("--api-key", help="default: the key privatelm-node serve created")
     b.add_argument("--tokens", type=int, default=64)
+    b.add_argument("--temp", type=float, default=0.7, help="the temperature you actually use (default 0.7)")
+    b.add_argument("--context", type=int, default=0, help="fill the prompt with ~N tokens first")
+    b.add_argument("--runs", type=int, default=1)
     b.add_argument("--iface", help="count only these interfaces, e.g. eth0 (default: all but lo)")
     b.set_defaults(fn=cmd_bench)
+
+    t = sub.add_parser("tune-mtp", help="find the best MTP depth at your temperature (stop the server first)")
+    t.add_argument("-m", "--model", required=True)
+    t.add_argument("--depths", default="0,1,2,3")
+    t.add_argument("--temp", type=float, default=0.7, help="the temperature you actually use (default 0.7)")
+    t.add_argument("--context", type=int, default=0, help="fill the prompt with ~N tokens first")
+    t.add_argument("--tokens", type=int, default=128)
+    t.add_argument("--runs", type=int, default=2)
+    t.add_argument("--workers", default="auto")
+    t.add_argument("--ctx", type=int, default=8192)
+    t.add_argument("--ram-limit", type=float)
+    t.add_argument("--port", type=int, default=18080)
+    t.add_argument("--load-timeout", type=float, default=900)
+    t.add_argument("--scan-timeout", type=float, default=4.0)
+    t.set_defaults(fn=cmd_tune_mtp, api_key="", extra=[], mtp=0)
 
     sc = sub.add_parser("scan", help="list workers and servers on the LAN")
     sc.add_argument("--timeout", type=float, default=4.0)
