@@ -50,9 +50,10 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / 
 # Share of a device's free memory the planner may fill. Phones: the same
 # 0.75 the app uses for workers. GPUs keep room for the KV cache and
 # compute buffers; the host keeps room for the OS and llama-server.
-GPU_SHARE = 0.9
+GPU_SHARE = 0.95  # of free VRAM; GPU_RESERVE_MB comes off on top
 PHONE_SHARE = 0.75
-HOST_SHARE = 0.7
+PC_RAM_SHARE = 0.9  # of what a PC RAM worker offers (already minus its reserve)
+HOST_SHARE = 0.8
 UNKNOWN_PHONE_SPEED = 4.0  # GB/s, as in the app
 
 
@@ -333,13 +334,31 @@ def show_qr(data: str) -> None:
 # ── GGUF ─────────────────────────────────────────────────────────────────────
 
 
-def gguf_block_count(path: str) -> int:
-    """The model's transformer block count, from its GGUF header."""
+@dataclass
+class ModelInfo:
+    n_layer: int
+    n_embd: int
+    n_vocab: int
+    layer_mb: float   # weights of one transformer block
+    kv_layer_mb: float  # KV cache of one block at the chosen context
+    output_mb: float  # output head (or tied token embedding)
+    size_mb: float
+    embd_mb: float = 0.0  # token embedding: always in this PC's RAM
+    tied: bool = False  # output head shares the token embedding
+
+    def per_layer_mb(self) -> float:
+        return self.layer_mb + self.kv_layer_mb
+
+
+def gguf_info(path: str, ctx: int) -> ModelInfo:
+    """Layer count, sizes and KV cache size from the GGUF header and tensor
+    table (tensor sizes are exact: taken from the data offsets)."""
     scalar = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+    file_size = os.path.getsize(path)
     with open(path, "rb") as f:
         if f.read(4) != b"GGUF":
             die(f"{path} is not a GGUF file")
-        version, _n_tensors, n_kv = struct.unpack("<IQQ", f.read(20))
+        version, n_tensors, n_kv = struct.unpack("<IQQ", f.read(20))
         if version < 2:
             die("GGUF v1 files are not supported")
 
@@ -360,57 +379,163 @@ def gguf_block_count(path: str) -> int:
                 else:
                     for _ in range(n):
                         read_val(et)
-                return None
+                return ("array", n)
             die(f"Unknown GGUF value type {t}")
 
-        kv = {}
+        kv: dict = {}
         for _ in range(n_kv):
             key = read_str()
             (t,) = struct.unpack("<I", f.read(4))
-            val = read_val(t)
-            if key == "general.architecture" or key.endswith(".block_count"):
-                kv[key] = val
-        arch = kv.get("general.architecture")
-        count = kv.get(f"{arch}.block_count")
-        if not isinstance(count, int) or count <= 0:
-            die("Could not read the model's layer count")
-        return count
+            kv[key] = read_val(t)
+
+        tensors = []
+        for _ in range(n_tensors):
+            name = read_str()
+            (nd,) = struct.unpack("<I", f.read(4))
+            dims = struct.unpack(f"<{nd}Q", f.read(8 * nd))
+            _ttype, offset = struct.unpack("<IQ", f.read(12))
+            tensors.append((offset, name, dims))
+        align = kv.get("general.alignment", 32) or 32
+        data_start = (f.tell() + align - 1) // align * align
+
+    arch = kv.get("general.architecture")
+    a = lambda k, d=None: kv.get(f"{arch}.{k}", d)  # noqa: E731
+    n_layer = a("block_count")
+    if not isinstance(n_layer, int) or n_layer <= 0:
+        die("Could not read the model's layer count")
+
+    tensors.sort()
+    sizes: dict[str, int] = {}
+    for i, (off, name, dims) in enumerate(tensors):
+        nxt = tensors[i + 1][0] if i + 1 < len(tensors) else file_size - data_start
+        sizes[name] = nxt - off
+    blk = sum(v for k, v in sizes.items() if k.startswith("blk."))
+    out = sizes.get("output.weight", sizes.get("token_embd.weight", 0))
+
+    n_embd = a("embedding_length", 0) or 0
+    n_head = a("attention.head_count", 1)
+    n_head_kv = a("attention.head_count_kv", n_head)
+    n_head = n_head if isinstance(n_head, int) and n_head > 0 else 1
+    n_head_kv = n_head_kv if isinstance(n_head_kv, int) and n_head_kv > 0 else n_head
+    k_dim = a("attention.key_length", n_embd // n_head if n_embd else 128)
+    v_dim = a("attention.value_length", k_dim)
+    vocab = kv.get("tokenizer.ggml.tokens")
+    n_vocab = vocab[1] if isinstance(vocab, tuple) else a("vocab_size", 0) or 0
+    kv_layer = ctx * n_head_kv * (k_dim + v_dim) * 2  # f16 K and V
+    return ModelInfo(n_layer, n_embd, n_vocab, blk / n_layer / 2**20, kv_layer / 2**20,
+                     out / 2**20, file_size / 2**20,
+                     sizes.get("token_embd.weight", 0) / 2**20, "output.weight" not in sizes)
 
 
-# ── Planning (mirrors the app's ClusterService) ─────────────────────────────
+# ── Planning ─────────────────────────────────────────────────────────────────
+#
+# llama.cpp runs a split model one device after another: per token, every
+# device works through its layers in turn, and every device boundary costs a
+# network round trip. So adding a slower device never makes it faster; it
+# only buys memory. The planner therefore:
+#   - fills the fastest devices first (memory bandwidth = token speed),
+#   - leaves room on each GPU for its KV cache and compute buffers,
+#   - estimates the time per token and, in "auto" mode, drops each worker
+#     whose network hop costs more than it saves,
+#   - keeps the output head (n_vocab scores per token) on this PC unless
+#     shipping the scores is cheaper, so they don't cross the wire.
+
+GPU_RESERVE_MB = 400  # compute buffers per GPU, beyond weights and KV
+HOST_RESERVE_MB = 1024
+NET_MBPS_PC = 110.0  # 1 Gbit/s Ethernet
+NET_MBPS_PHONE = 25.0  # Wi-Fi
+HOP_OVERHEAD_S = 0.002  # per worker per token: graph upload, sync (conservative)
 
 
 @dataclass
 class Unit:
     label: str
-    capacity_mb: float
-    speed: float
+    capacity_layers: int
+    speed: float  # GB/s
     devices: list[str]  # llama.cpp device names; [] for the host CPU
     endpoint: Optional[str] = None  # RPC workers
-    assigned_mb: float = 0.0
+    rtt_s: float = 0.0
+    net_mbps: float = NET_MBPS_PC
+    device_caps: list[int] = field(default_factory=list)
+    layers: int = 0
+
+    @property
+    def remote(self) -> bool:
+        return self.endpoint is not None
 
 
-def fill_fastest_first(units: list[Unit], need_mb: float) -> None:
-    left = need_mb
+def fill_fastest_first(units: list[Unit], n_layer: int) -> int:
+    """Assigns layers to the fastest units first; returns layers left over."""
+    left = n_layer
     for u in sorted(units, key=lambda u: -u.speed):
-        u.assigned_mb = min(u.capacity_mb, left)
-        left -= u.assigned_mb
+        u.layers = min(u.capacity_layers, left)
+        left -= u.layers
+    return left
 
 
-def split_by_speed(units: list[Unit], need_mb: float) -> None:
-    open_, left = list(units), need_mb
-    while open_ and left > 0.5:
-        speed_sum = sum(u.speed for u in open_) or 1.0
-        capped = [u for u in open_ if u.assigned_mb + left * u.speed / speed_sum >= u.capacity_mb]
-        if not capped:
-            for u in open_:
-                u.assigned_mb += left * u.speed / speed_sum
-            left = 0
-        else:
-            for u in capped:
-                left -= u.capacity_mb - u.assigned_mb
-                u.assigned_mb = u.capacity_mb
-            open_ = [u for u in open_ if u not in capped]
+def token_time(units: list[Unit], m: ModelInfo, out_unit: Optional[Unit]) -> float:
+    t = 0.0
+    for u in units:
+        if u.layers:
+            t += u.layers * m.layer_mb / 1024 / u.speed
+            if u.remote:
+                t += 2 * u.rtt_s + HOP_OVERHEAD_S + 2 * m.n_embd * 4 / 2**20 / u.net_mbps
+    if out_unit is not None:
+        t += m.output_mb / 1024 / out_unit.speed
+        if out_unit.remote:
+            t += m.n_vocab * 4 / 2**20 / out_unit.net_mbps
+    return t
+
+
+def plan(units: list[Unit], m: ModelInfo, prune: bool) -> list[Unit]:
+    """Fills fastest first; with prune, drops workers that don't pay off.
+    Returns the units that got layers."""
+    active = list(units)
+    for u in units:
+        u.layers = 0
+    if fill_fastest_first(active, m.n_layer) > 0:
+        return []
+    best = token_time(active, m, None)
+    improved = prune
+    while improved:
+        improved = False
+        for u in sorted([u for u in active if u.remote and u.layers], key=lambda u: u.speed):
+            trial = [x for x in active if x is not u]
+            snapshot = {id(x): x.layers for x in active}
+            if fill_fastest_first(trial, m.n_layer) == 0:
+                t = token_time(trial, m, None)
+                if t < best:
+                    u.layers, active, best, improved = 0, trial, t, True
+                    break
+            for x in active:
+                x.layers = snapshot[id(x)]
+    return [u for u in active if u.layers]
+
+
+def split_integer(total: int, weights: list[float]) -> list[int]:
+    """total split by weights into integers (largest remainder)."""
+    s = sum(weights)
+    if total <= 0 or s <= 0:
+        return [0] * len(weights)
+    raw = [total * w / s for w in weights]
+    out = [int(r) for r in raw]
+    for i in sorted(range(len(raw)), key=lambda i: out[i] - raw[i])[: total - sum(out)]:
+        out[i] += 1
+    return out
+
+
+def measure_rtt(endpoint: str) -> float:
+    host, _, port = endpoint.rpartition(":")
+    best = 0.05
+    for _ in range(3):
+        t0 = time.perf_counter()
+        try:
+            with socket.create_connection((host, int(port)), timeout=2):
+                pass
+        except OSError:
+            return 0.05
+        best = min(best, time.perf_counter() - t0)
+    return best
 
 
 def list_devices(rpc: list[str]) -> list[tuple[str, str, int]]:
@@ -545,17 +670,14 @@ def cmd_serve(args) -> None:
     model = str(Path(args.model).expanduser().resolve())
     if not Path(model).is_file():
         die(f"No such model: {model}")
-    model_mb = Path(model).stat().st_size / 2**20
-    need_mb = model_mb * 1.1  # + KV cache and working buffers
-    n_layer = gguf_block_count(model)
+    m = gguf_info(model, args.ctx)
+    per_layer = m.per_layer_mb()
+    logits_mb = m.n_vocab * 4 * 512 / 2**20  # output buffer for a 512-token batch
 
     devices = probe(bench=True)
     local_gpus = usable_gpus(devices)
     cpu = next((d for d in devices if d.type == "cpu"), None)
-    units = [Unit(f"{d.name} {d.description}", d.free_mb * GPU_SHARE, d.bandwidth or 100.0, [d.name])
-             for d in local_gpus]
-    host = Unit("This PC (CPU/RAM)", host_available_mb() * HOST_SHARE,
-                (cpu.bandwidth if cpu and cpu.bandwidth else 20.0), [])
+    host_speed = cpu.bandwidth if cpu and cpu.bandwidth else 20.0
 
     workers: list[Peer] = []
     if args.workers not in ("off", "auto", "all"):
@@ -583,80 +705,139 @@ def cmd_serve(args) -> None:
         if not reachable(w.endpoint):
             log(f"Worker {w.endpoint} not reachable, leaving it out")
             workers.remove(w)
-    # Free memory as the workers report it over RPC (also fills it in for
-    # workers given by address, which have no mDNS record).
-    if workers:
-        reported = list_devices([w.endpoint for w in workers])
-        for w in workers:
-            free = sum(f for n, d, f in reported if _on_worker(n, d, w.endpoint))
-            if free:
-                w.txt["ram"] = str(free)
+
+    # Free memory per device, as the workers report it over RPC.
+    reported = list_devices([w.endpoint for w in workers]) if workers else []
+    remote: list[Unit] = []
     for w in workers:
-        log(f"Worker {w.name}: {w.ram_mb or '?'} MB free, {w.bandwidth or '?'} GB/s")
+        devs_w = [(n, f) for n, d, f in reported if _on_worker(n, d, w.endpoint)]
+        if not devs_w:
+            log(f"Worker {w.endpoint} reported no devices, leaving it out")
+            continue
+        if w.is_gpu:
+            caps = [int((f * GPU_SHARE - GPU_RESERVE_MB) // per_layer) for _, f in devs_w]
+        else:
+            offered = sum(f for _, f in devs_w)
+            if w.ram_mb:
+                offered = min(offered, w.ram_mb)
+            budget = offered * (PC_RAM_SHARE if w.txt.get("kind") == "cpu" else PHONE_SHARE)
+            total_f = sum(f for _, f in devs_w) or 1
+            caps = [int(budget * f / total_f // per_layer) for _, f in devs_w]
+        caps = [max(0, c) for c in caps]
+        u = Unit(w.txt.get("model") or w.name, sum(caps), w.bandwidth or UNKNOWN_PHONE_SPEED, [],
+                 endpoint=w.endpoint, rtt_s=measure_rtt(w.endpoint),
+                 net_mbps=NET_MBPS_PC if w.txt.get("kind") else NET_MBPS_PHONE, device_caps=caps)
+        log(f"Worker {u.label} ({w.endpoint}): room for {u.capacity_layers} layers, "
+            f"{u.speed:.0f} GB/s, {u.rtt_s*1000:.1f} ms round trip")
+        remote.append(u)
 
-    local_total = sum(u.capacity_mb for u in units) + host.capacity_mb
-    if args.workers == "auto" and need_mb <= local_total:
-        if workers:
-            log(f"Model ({model_mb/1024:.1f} GB) fits on this PC: leaving workers out "
-                "(faster, no network in the loop). Use --workers all to include them.")
-        workers = []
-    remote = [Unit(w.name, (w.ram_mb or 2000) * (GPU_SHARE if w.is_gpu else PHONE_SHARE),
-                   w.bandwidth or UNKNOWN_PHONE_SPEED, [], endpoint=w.endpoint) for w in workers]
+    # The output head stays on this PC: on the fastest local GPU with room
+    # for it, else in RAM. (The report that prompted this: with the tail on
+    # a worker, 100k scores per token came back over the network.)
+    out_gpu = None
+    for d in sorted(local_gpus, key=lambda d: -(d.bandwidth or 0)):
+        if d.free_mb * GPU_SHARE - GPU_RESERVE_MB >= m.output_mb + logits_mb:
+            out_gpu = d
+            break
+    gpus = []
+    for d in local_gpus:
+        room = d.free_mb * GPU_SHARE - GPU_RESERVE_MB - (m.output_mb + logits_mb if d is out_gpu else 0)
+        gpus.append(Unit(f"{d.name} {d.description}", max(0, int(room // per_layer)),
+                         d.bandwidth or 100.0, [d.name], device_caps=[max(0, int(room // per_layer))]))
+    host_budget = host_available_mb() * HOST_SHARE - HOST_RESERVE_MB
+    if args.ram_limit is not None:
+        host_budget = min(host_budget, args.ram_limit * 1024)
+    host_room = host_budget - m.embd_mb - (0 if out_gpu else m.output_mb + logits_mb)
+    host = Unit("This PC (RAM)", max(0, int(host_room // per_layer)), host_speed, [])
 
-    all_units = units + remote + [host]
-    total = sum(u.capacity_mb for u in all_units)
-    if need_mb > total:
-        die(f"Model needs ~{need_mb/1024:.1f} GB, all devices together have ~{total/1024:.1f} GB free.")
-    explicit = args.workers not in ("off", "auto", "all")
-    if (args.workers == "all" or explicit) and remote:
-        split_by_speed(all_units, need_mb)
-    else:
-        fill_fastest_first(all_units, need_mb)
-
-    used_remote = [u for u in remote if u.assigned_mb > 0]
+    prune = args.workers == "auto"
+    used = plan(gpus + remote + [host], m, prune)
+    if not used:
+        total = sum(u.capacity_layers for u in gpus + remote + [host])
+        die(f"Model needs {m.n_layer} layers of ~{per_layer:.0f} MB (weights + KV cache at "
+            f"-c {args.ctx}); all devices together have room for {total}. "
+            "Add workers, lower --ctx, or use a smaller quantization.")
+    dropped = [u for u in remote if not u.layers]
+    if dropped and prune:
+        log("Not using (slower with them than without): " + ", ".join(u.label for u in dropped)
+            + ". --workers all includes every worker that has room.")
+    used_remote = [u for u in remote if u.layers]
+    # Output on this PC unless there is no GPU here and a worker GPU would
+    # do it faster even after shipping the scores back.
+    out_unit: Unit = next((g for g in gpus if out_gpu and out_gpu.name in g.devices), host)
+    if out_gpu is None and used_remote:
+        best_r = max(used_remote, key=lambda u: u.speed)
+        here = m.output_mb / 1024 / host.speed
+        there = m.output_mb / 1024 / best_r.speed + m.n_vocab * 4 / 2**20 / best_r.net_mbps
+        spare = (best_r.capacity_layers - best_r.layers) * per_layer
+        if there < here and spare >= m.output_mb + logits_mb:
+            out_unit = best_r
+    # The worker holding the output goes last among the workers.
+    used_remote.sort(key=lambda u: u is out_unit)
     rpc = [u.endpoint for u in used_remote]
-    # Device names per RPC worker (a PC worker may serve several GPUs).
+
     devs = list_devices(rpc)
-    for u in used_remote:
-        u.devices = [n for n, d, _ in devs if _on_worker(n, d, u.endpoint)]
-        if not u.devices:
-            die(f"Worker {u.endpoint} reported no devices (is it running {RPC_VERSION}?)")
-    # llama.cpp's device list, minus the cards it skips as duplicates.
     local_names = {d.name for d in local_gpus}
     devs = [d for d in devs if d[0].startswith("RPC") or d[0] in local_names]
-    split = []
-    for name, desc, free in devs:
+    counts: list[int] = []
+    owner_of: list[Optional[Unit]] = []
+    per_worker_seen: dict[str, int] = {}
+    for name, desc, _free in devs:
         if name.startswith("RPC"):
-            owner = next((u for u in used_remote if _on_worker(name, desc, u.endpoint)), None)
+            u = next((u for u in used_remote if _on_worker(name, desc, u.endpoint)), None)
+            if u is None:
+                counts.append(0)
+                owner_of.append(None)
+                continue
+            k = per_worker_seen.get(u.endpoint, 0)
+            per_worker_seen[u.endpoint] = k + 1
+            shares = split_integer(u.layers, [float(c) for c in u.device_caps])
+            counts.append(shares[k] if k < len(shares) else 0)
+            owner_of.append(u)
         else:
-            owner = next((u for u in units if name in u.devices), None)
-        if owner is None:
-            split.append(0.0)
-            continue
-        # A worker with several GPUs: share by each card's free memory, so a
-        # 4 GB card next to a 12 GB one gets a third of the 12 GB card's part.
-        mine = [f for n, d, f in devs if (n in owner.devices) and
-                (not n.startswith("RPC") or _on_worker(n, d, owner.endpoint))]
-        total_free = sum(mine)
-        split.append(owner.assigned_mb * free / total_free if total_free else
-                     owner.assigned_mb / len(owner.devices))
+            u = next((g for g in gpus if name in g.devices), None)
+            counts.append(u.layers if u else 0)
+            owner_of.append(u)
+    for u in used_remote:
+        if per_worker_seen.get(u.endpoint, 0) != len(u.device_caps):
+            die(f"Worker {u.endpoint} changed its devices while planning; start again.")
 
-    offloaded = sum(split)
-    local_layers = round(n_layer * host.assigned_mb / need_mb) if need_mb else 0
-    ngl = 0 if offloaded <= 0 else n_layer + 1 - max(0, min(n_layer, local_layers))
+    # llama.cpp offloads the last -ngl of n_layer + 1 slots, the output layer
+    # being the last slot: whenever any layer is offloaded, the output layer
+    # goes with it, to the last device. So it gets its own slot there, and
+    # -ot pins its weights (and with them its matmul) where it belongs.
+    n_off = sum(counts)
+    extra: list[str] = []
+    ngl = 0
+    if n_off:
+        ngl = n_off + 1
+        last = max(i for i, c in enumerate(counts) if c > 0)
+        counts[last] += 1
+        pattern = "^token_embd\\.weight$" if m.tied else "^output\\.weight$"
+        if out_unit is host:
+            extra += ["-ot", f"{pattern}=CPU"]
+        elif out_unit is not owner_of[last] and out_gpu is not None and not out_unit.remote:
+            extra += ["-ot", f"{pattern}={out_gpu.name}"]
 
+    est = token_time(used, m, out_unit)
+    hops = len(used_remote)
+    net_kb = hops * (2 * m.n_embd * 4) / 1024 + (m.n_vocab * 4 / 1024 if out_unit.remote else 0)
     print("\nPlan:")
-    for u in all_units:
-        if u.assigned_mb > 0:
-            size = f"{u.assigned_mb/1024:6.1f} GB" if u.assigned_mb >= 1024 else f"{u.assigned_mb:6.0f} MB"
-            print(f"  {u.label:<38} {size}  ({u.speed:.0f} GB/s)")
-    print(f"  {n_layer} layers, {ngl} offloaded to GPUs/workers\n")
+    for u in sorted(used, key=lambda u: -u.speed):
+        print(f"  {u.label:<42} {u.layers:>3} layers  {u.layers * per_layer / 1024:5.1f} GB  "
+              f"({u.speed:.0f} GB/s{', %.1f ms RTT' % (u.rtt_s * 1000) if u.remote else ''})")
+    where = "this PC's RAM" if out_unit is host else out_unit.label
+    print(f"  Output head: {where}" + ("  (scores cross the network every token)" if out_unit.remote else ""))
+    print(f"  {m.n_layer} layers at {per_layer:.0f} MB each incl. KV cache for -c {args.ctx}")
+    print(f"  Estimate: ~{1/est:.1f} tokens/s, {hops} network hop(s), ~{net_kb:.0f} KB/token on the wire"
+          " (check with: privatelm-node bench)\n")
 
     key = args.api_key if args.api_key is not None else _api_key()
     cmd = [find_bin("llama-server"), "-m", model, "--host", args.host, "--port", str(args.port),
            "-c", str(args.ctx), "--fit", "off", "-ngl", str(ngl)]
-    if any(split):
-        cmd += ["--tensor-split", ",".join(f"{s:.0f}" for s in split)]
+    if any(counts):
+        cmd += ["--tensor-split", ",".join(str(c) for c in counts)]
+    cmd += extra
     if rpc:
         cmd += ["--rpc", ",".join(rpc)]
     if key:
@@ -696,6 +877,85 @@ def cmd_scan(args) -> None:
         else:
             print(f"server  {p.endpoint:<22} http://{p.endpoint}{p.txt.get('path', '/v1')}  "
                   f"model {p.txt.get('model', '?')}")
+
+
+def _net_bytes(ifaces: Optional[list[str]]) -> tuple[int, int]:
+    """(received, sent) bytes over all interfaces but loopback, or the given
+    ones. Both directions: a one-way counter misses the scores coming back."""
+    rx = tx = 0
+    for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
+        name, data = line.split(":", 1)
+        name = name.strip()
+        if (ifaces and name not in ifaces) or (not ifaces and name == "lo"):
+            continue
+        f = data.split()
+        rx += int(f[0])
+        tx += int(f[8])
+    return rx, tx
+
+
+def cmd_bench(args) -> None:
+    import urllib.request
+
+    base = args.url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    key = args.api_key if args.api_key is not None else (
+        _api_key() if (CONFIG_DIR / "api_key").exists() else "")
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    def call(path: str, body: Optional[dict] = None) -> dict:
+        req = urllib.request.Request(base + path, headers=headers,
+                                     data=json.dumps(body).encode() if body is not None else None)
+        with urllib.request.urlopen(req, timeout=600) as r:
+            return json.loads(r.read())
+
+    try:
+        meta = (call("/v1/models").get("data") or [{}])[0].get("meta") or {}
+    except OSError as e:
+        die(f"No server at {base}: {e}")
+    n_vocab, n_embd = meta.get("n_vocab", 0), meta.get("n_embd", 0)
+    ifaces = args.iface.split(",") if args.iface else None
+
+    def run(n: int) -> tuple[dict, int, int]:
+        rx0, tx0 = _net_bytes(ifaces)
+        res = call("/completion", {"prompt": "Write a long story about a lighthouse keeper.",
+                                   "n_predict": n, "ignore_eos": True, "cache_prompt": False,
+                                   "temperature": 0})
+        rx1, tx1 = _net_bytes(ifaces)
+        return res.get("timings", {}), rx1 - rx0, tx1 - tx0
+
+    log("Warm-up...")
+    run(4)
+    _, rx1, tx1 = run(1)
+    timings, rxn, txn = run(args.tokens)
+    n = timings.get("predicted_n") or args.tokens
+    per_rx = max(0, rxn - rx1) / max(1, n - 1)
+    per_tx = max(0, txn - tx1) / max(1, n - 1)
+    per = per_rx + per_tx
+    tps = timings.get("predicted_per_second", 0.0)
+
+    print(f"Generation:   {tps:.1f} tokens/s ({n} tokens)")
+    print(f"Network:      {per/1024:.0f} KB per token  (in {per_rx/1024:.0f} KB, out {per_tx/1024:.0f} KB)")
+    if not n_vocab:
+        return
+    logits = n_vocab * 4
+    act = max(1, n_embd) * 4
+    print(f"Reference:    one hand-off of activations ~{act/1024:.0f} KB, "
+          f"output scores {logits/1024:.0f} KB ({n_vocab} tokens x 4 bytes)")
+    if per < 2048:
+        print("Verdict:      no traffic per token: the model runs on this PC alone.")
+    elif per_rx >= 0.8 * logits:
+        print("Verdict:      the output head sits on a worker: its scores come back every token.\n"
+              "              Restart with privatelm-node serve (it keeps the head on this PC),\n"
+              "              or give the head's device the last place in -dev / --rpc order.")
+    elif per > 64 * act + 256 * 1024:
+        print("Verdict:      far more traffic than a few hand-offs: layers are probably\n"
+              "              interleaved between machines. Check the device order (-dev).")
+    else:
+        print("Verdict:      fine: activations hand-offs only, the output head is local.")
 
 
 def _api_key() -> str:
@@ -771,16 +1031,25 @@ def main() -> None:
     s = sub.add_parser("serve", help="run a model here and serve an OpenAI-compatible API")
     s.add_argument("-m", "--model", required=True)
     s.add_argument("--workers", default="auto",
-                   help="auto (only if the model doesn't fit here), all, off, or host:port,...")
+                   help="auto (workers only where they pay off), all (every worker with room), off, or host:port,...")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=DEFAULT_API_PORT)
     s.add_argument("--ctx", type=int, default=8192)
     s.add_argument("--api-key", help="default: generated once, kept in ~/.config/privatelm-node")
+    s.add_argument("--ram-limit", type=float,
+                   help="GB of this PC's RAM the model may use (layers that don't fit go to workers)")
     s.add_argument("--advertise-ip")
     s.add_argument("--no-advertise", action="store_true")
     s.add_argument("--scan-timeout", type=float, default=4.0)
     s.add_argument("extra", nargs=argparse.REMAINDER, help="-- further llama-server options")
     s.set_defaults(fn=cmd_serve)
+
+    b = sub.add_parser("bench", help="measure tokens/s and network traffic per token (run on the master)")
+    b.add_argument("--url", default=f"http://127.0.0.1:{DEFAULT_API_PORT}")
+    b.add_argument("--api-key", help="default: the key privatelm-node serve created")
+    b.add_argument("--tokens", type=int, default=64)
+    b.add_argument("--iface", help="count only these interfaces, e.g. eth0 (default: all but lo)")
+    b.set_defaults(fn=cmd_bench)
 
     sc = sub.add_parser("scan", help="list workers and servers on the LAN")
     sc.add_argument("--timeout", type=float, default=4.0)

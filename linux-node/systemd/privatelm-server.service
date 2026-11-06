@@ -4,8 +4,8 @@ After=network-online.target avahi-daemon.service
 Wants=network-online.target
 
 [Service]
-# Set the model path. --workers auto uses phones only if the model doesn't fit
-# on this PC; "all" always includes them; "off" never.
+# Set the model path. --workers auto uses workers where they make it faster or
+# are needed for memory; "all" every worker with room; "off" none.
 ExecStart=/opt/privatelm-node/bin/privatelm-node serve -m /srv/models/model.gguf --workers auto
 DynamicUser=yes
 CacheDirectory=privatelm-node

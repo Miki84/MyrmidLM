@@ -6,7 +6,7 @@ Bringt Linux-PCs mit GPU (NVIDIA, AMD, Intel) in den PrivateLM-Cluster. Ein PC k
 |---|---|---|
 | **GPU-Worker** | `privatelm-node worker` | Der PC leiht seine GPU(s) einem Handy-Master. Er taucht in der App unter *Phone cluster → Find nearby* auf wie ein Handy, bekommt aber wegen der viel höheren Speicherbandbreite den größten Anteil der Layer. |
 | **Master / Server** | `privatelm-node serve -m model.gguf` | Das Modell läuft auf dem PC (GPU + RAM), optional mit Handys oder weiteren PCs als Workern. Bereitgestellt als OpenAI-kompatible API; die App verbindet sich per QR-Code oder *Find PCs*. |
-| **Diagnose** | `privatelm-node detect` / `scan` | Geräte, freier Speicher, gemessene Bandbreite / alle Worker und Server im LAN. |
+| **Diagnose** | `privatelm-node detect` / `scan` / `bench` | Geräte, freier Speicher, gemessene Bandbreite / alle Worker und Server im LAN / Token pro Sekunde und Netzwerkverkehr pro Token. |
 
 Technisch nutzt alles das RPC-Backend von llama.cpp, das die App bereits für den Handy-Cluster verwendet. Der Node wird aus **exakt demselben llama.cpp-Commit** gebaut wie die App (`LLAMA_CPP_COMMIT`, plus die beiden Logging-Patches der App unter `patches/`). Das ist Pflicht: RPC-Protokoll und Op-Liste müssen bitgenau passen, sonst bricht llama.cpp beim Verbinden ab. Beim Update der App auf eine neue llama.cpp-Version muss `LLAMA_CPP_COMMIT` mitziehen (Protokollkennung `rpc7` in der App und in `privatelm_node.py`).
 
@@ -62,7 +62,23 @@ privatelm-node serve -m model.gguf --workers 192.168.1.20:50052    # bestimmte W
 privatelm-node serve -m model.gguf -- --jinja -fa on               # weitere llama-server-Optionen
 ```
 
-Der Planer verteilt wie die App: schnellste Geräte zuerst (GPU > PC-RAM > Handys), jeweils bis zum freien Speicher. Handys kommen bei `auto` nur dazu, wenn GPU + RAM nicht reichen, denn jedes Token läuft dann einmal über das WLAN. Der API-Key wird beim ersten Start erzeugt (`~/.config/privatelm-node/api_key`) und steckt im QR-Code. In der App: *Phone cluster → Scan PC QR code* (oder *Find PCs*, dann Key eingeben). Der Chat läuft danach als eigenes Custom-Provider-Profil „PC · <hostname>“.
+So plant `serve`:
+
+- **Schnellste Geräte zuerst.** Ein aufgeteiltes Modell läuft Gerät für Gerät nacheinander: Pro Token addieren sich die Rechenzeiten, und jeder Worker kostet eine Netzwerk-Runde. Ein langsameres Gerät bringt also Speicher, nie Tempo. Der Planer füllt deshalb die Geräte nach Speicherbandbreite und rechnet in ganzen Layern.
+- **Platz für KV-Cache und Puffer.** Pro Layer zählen Gewichte plus KV-Cache für die gewählte Kontextlänge (`--ctx`), dazu 400 MB Rechenpuffer pro GPU. Eine bis zum Rand gefüllte Karte wird sonst langsamer oder lädt gar nicht.
+- **Zeitmodell bei `--workers auto`:** Die Netzwerk-Latenz zu jedem Worker wird gemessen; ein Worker wird weggelassen, wenn das Modell ohne ihn passt und die geschätzte Zeit pro Token ohne ihn kürzer ist. `--workers all` nimmt jeden Worker mit Platz, füllt aber ebenfalls die schnellsten zuerst.
+- **Ausgabeschicht bleibt lokal.** Sie berechnet pro Token einen Wert für jedes Wort des Vokabulars (z. B. 152.000 × 4 Byte ≈ 600 KB). Liegt sie auf einem Worker, kommt dieser Vektor bei jedem Token übers Netz. `serve` hält sie per `-ot` auf der schnellsten lokalen GPU oder im RAM (llama.cpp würde sie sonst mit den letzten Layern auf das letzte Gerät legen).
+- `--ram-limit GB` begrenzt den RAM, den der Master selbst für das Modell hergibt.
+
+Der Plan wird vor dem Start mit geschätzten Token/s, Anzahl Netzwerk-Hops und erwartetem Verkehr pro Token angezeigt.
+
+**Messen:** Auf dem Master, während `serve` läuft:
+
+```bash
+privatelm-node bench            # Token/s und KB pro Token (Ein- und Ausgang)
+```
+
+Gezählt werden beide Richtungen; ein Zähler nur für den Ausgang würde die zurückkommenden Ausgabe-Vektoren übersehen. Richtwerte: ein paar bis einige zehn KB pro Token und Worker sind normal. Etwa Vokabular × 4 Byte heißt, die Ausgabeschicht liegt auf einem Worker. Megabytes heißen, die Layer sind zwischen den Rechnern verschachtelt. Der API-Key wird beim ersten Start erzeugt (`~/.config/privatelm-node/api_key`) und steckt im QR-Code. In der App: *Phone cluster → Scan PC QR code* (oder *Find PCs*, dann Key eingeben). Der Chat läuft danach als eigenes Custom-Provider-Profil „PC · <hostname>“.
 
 **Als Dienst:** `systemd/privatelm-worker.service` bzw. `privatelm-server.service` nach `/etc/systemd/system/` kopieren, Pfade anpassen, `systemctl enable --now …`.
 
