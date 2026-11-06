@@ -153,5 +153,6 @@ if [[ -n "$INSTALL_DIR" ]]; then
     cp -a "$BUILD"/bin/*.so* "$BUILD"/bin/ggml-rpc-server "$BUILD"/bin/llama-server \
           "$BUILD"/bin/privatelm-probe "$INSTALL_DIR/bin/"
     install -m 755 "$HERE/privatelm_node.py" "$INSTALL_DIR/bin/privatelm-node"
+    install -m 644 "$HERE/dashboard.html" "$INSTALL_DIR/bin/dashboard.html"
     echo "==> Installed to $INSTALL_DIR (run $INSTALL_DIR/bin/privatelm-node --help)"
 fi

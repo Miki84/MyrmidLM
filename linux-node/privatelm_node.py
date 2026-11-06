@@ -484,6 +484,7 @@ class Unit:
     device_caps: list[int] = field(default_factory=list)
     layers: int = 0
     min_layers: int = 0  # e.g. the MTP tail that must stay on this PC
+    status_port: int = 0  # worker's monitoring endpoint
 
     @property
     def remote(self) -> bool:
@@ -642,10 +643,15 @@ def cmd_worker(args) -> None:
     log(f"Serving {', '.join(f'{d.name} ({d.description}, {d.free_mb} MB free)' for d in chosen)}")
     log(f"Offering {ram_mb} MB at {bw:.1f} GB/s on {address}:{args.port}")
     procs = [_rpc_server(args, args.port, [d.name for d in chosen])]
+    rpc_info = [{"port": args.port, "kind": "gpu" if gpu else "cpu", "offered_mb": ram_mb, "bw": bw,
+                 "devices": [{"name": d.name, "description": d.description, "free_mb": d.free_mb,
+                              "bandwidth": d.bandwidth} for d in chosen]}]
     advs: list[Advertiser] = []
     txt = {"ram": str(ram_mb), "bw": f"{bw:.1f}", "model": f"{host} · {label}", "v": RPC_VERSION,
            "id": wid, "kind": "gpu" if gpu else "cpu",
            "backend": ",".join(sorted({d.backend for d in chosen}))}
+    if not args.no_status:
+        txt["stat"] = str(args.status_port)
     _advertise(args, advs, f"PrivateLM {host}", args.port, txt, address)
     show_qr(worker_qr(address, args.port, f"{host} · {label}", ram_mb, bw, wid, txt["kind"]))
 
@@ -662,11 +668,18 @@ def cmd_worker(args) -> None:
             offered = _offered_ram(args)
             log(f"Offering {offered} MB RAM at {cpu.bandwidth:.1f} GB/s on {address}:{ram_port}")
             procs.append(_rpc_server(args, ram_port, ["CPU"]))
+            rpc_info.append({"port": ram_port, "kind": "cpu", "offered_mb": offered, "bw": cpu.bandwidth,
+                             "devices": [{"name": "CPU", "description": cpu.description,
+                                          "free_mb": offered, "bandwidth": cpu.bandwidth}]})
             rtxt = {"ram": str(offered), "bw": f"{cpu.bandwidth:.1f}", "model": f"{host} · RAM",
                     "v": RPC_VERSION, "id": f"{wid}-ram", "kind": "cpu", "backend": "CPU"}
+            if not args.no_status:
+                rtxt["stat"] = str(args.status_port)
             _advertise(args, advs, f"PrivateLM {host} RAM", ram_port, rtxt, address)
             show_qr(worker_qr(address, ram_port, f"{host} · RAM", offered, cpu.bandwidth,
                               f"{wid}-ram", "cpu"))
+    if not args.no_status:
+        start_worker_status(args, rpc_info, procs, devices)
     _wait(procs, advs)
 
 
@@ -748,7 +761,8 @@ def _remote_units(workers: list[Peer], per_layer: float) -> list[Unit]:
         caps = [max(0, c) for c in caps]
         u = Unit(w.txt.get("model") or w.name, sum(caps), w.bandwidth or UNKNOWN_PHONE_SPEED, [],
                  endpoint=w.endpoint, rtt_s=measure_rtt(w.endpoint),
-                 net_mbps=NET_MBPS_PC if w.txt.get("kind") else NET_MBPS_PHONE, device_caps=caps)
+                 net_mbps=NET_MBPS_PC if w.txt.get("kind") else NET_MBPS_PHONE, device_caps=caps,
+                 status_port=int(w.txt.get("stat") or STATUS_PORT))
         log(f"Worker {u.label} ({w.endpoint}): room for {u.capacity_layers} layers, "
             f"{u.speed:.0f} GB/s, {u.rtt_s*1000:.1f} ms round trip")
         remote.append(u)
@@ -809,6 +823,7 @@ class ServerPlan:
     name: str
     key: str
     estimate_tps: float
+    info: dict = field(default_factory=dict)  # the plan, for the dashboard
 
 
 def build_server(args, quiet: bool = False) -> ServerPlan:
@@ -927,6 +942,16 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     # being the last slot: whenever any layer is offloaded, the output layer
     # goes with it, to the last device. So it gets its own slot there, and
     # -ot pins its weights (and with them its matmul) where it belongs.
+    segments = []
+    if host.layers:
+        segments.append({"machine": "master", "device": "RAM (CPU)", "layers": host.layers})
+    for (name, desc, _f), c, own in zip(devs, counts, owner_of):
+        if not c:
+            continue
+        if name.startswith("RPC") and own is not None:
+            segments.append({"machine": own.endpoint.rsplit(":", 1)[0], "device": own.label, "layers": c})
+        else:
+            segments.append({"machine": "master", "device": own.label if own else name, "layers": c})
     n_off = sum(counts)
     extra: list[str] = []
     ngl = 0
@@ -961,7 +986,31 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     cmd += extra
     if rpc:
         cmd += ["--rpc", ",".join(rpc)]
-    return _finish_command(args, cmd, model, 1 / est)
+    info = _plan_info(args, model, m, "layers", 1 / est, hops, net_kb, segments, used_remote,
+                      {"machine": "master" if not out_unit.remote else out_unit.endpoint.rsplit(":", 1)[0],
+                       "label": where})
+    return _finish_command(args, cmd, model, 1 / est, info)
+
+
+def _plan_info(args, model: str, m: ModelInfo, mode: str, tps: float, hops: int, net_kb: float,
+               segments: list[dict], used_remote: list[Unit], output: dict, moe_cpu_layers: int = 0) -> dict:
+    machines = [{"id": "master", "role": "master", "host": socket.gethostname(),
+                 "layers": sum(s["layers"] for s in segments if s["machine"] == "master")}]
+    for u in used_remote:
+        hid = u.endpoint.rsplit(":", 1)[0]
+        mach = next((x for x in machines if x["id"] == hid), None)
+        if mach is None:
+            mach = {"id": hid, "role": "worker", "host": hid, "label": u.label, "endpoints": [],
+                    "status_port": u.status_port, "layers": 0, "rtt_ms": round(u.rtt_s * 1000, 2)}
+            machines.append(mach)
+        mach["endpoints"].append(u.endpoint)
+        mach["layers"] += u.layers
+    return {"model": Path(model).stem, "n_layer": m.n_layer, "kind": "moe" if m.is_moe else "dense",
+            "n_expert": m.n_expert, "n_expert_used": m.n_expert_used, "mode": mode, "mtp": args.mtp,
+            "ctx": args.ctx, "estimate_tps": round(tps, 1), "hops": hops, "net_kb_est": round(net_kb),
+            "per_layer_mb": round(m.per_layer_mb()), "size_gb": round(m.size_mb / 1024, 1),
+            "segments": segments, "output": output, "moe_cpu_layers": moe_cpu_layers,
+            "machines": machines}
 
 
 def _say_model(say, m: ModelInfo, per_layer: float, args) -> None:
@@ -981,6 +1030,10 @@ def _moe_command(args, model: str, m: ModelInfo, gpus: list[Device], moe: MoePla
     say(f"  Output head: {gpus[-1].name}")
     _say_model(say, m, m.per_layer_mb(), args)
     say(f"  Estimate: ~{1/moe.time_s:.1f} tokens/s{' before MTP' if args.mtp else ''}, no network hops\n")
+    segments = [{"machine": "master", "device": f"{d.name} {d.description}", "layers": c}
+                for d, c in zip(gpus, moe.counts) if c]
+    info = _plan_info(args, model, m, "moe", 1 / moe.time_s, 0, 0, segments, [],
+                      {"machine": "master", "label": gpus[-1].name}, moe.n_cpu_moe)
     counts = list(moe.counts)
     counts[-1] += 1  # output slot on the last GPU
     cmd = [find_bin("llama-server"), "-m", model, "-c", str(args.ctx), "--fit", "off",
@@ -989,10 +1042,11 @@ def _moe_command(args, model: str, m: ModelInfo, gpus: list[Device], moe: MoePla
         cmd += ["--tensor-split", ",".join(str(c) for c in counts)]
     if moe.n_cpu_moe:
         cmd += ["--n-cpu-moe", str(moe.n_cpu_moe)]
-    return _finish_command(args, cmd, model, 1 / moe.time_s)
+    return _finish_command(args, cmd, model, 1 / moe.time_s, info)
 
 
-def _finish_command(args, cmd: list[str], model: str, tps: float) -> ServerPlan:
+def _finish_command(args, cmd: list[str], model: str, tps: float, info: Optional[dict] = None) -> ServerPlan:
+    cmd += ["--metrics"]  # for the dashboard
     if args.mtp:
         cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(args.mtp)]
     key = args.api_key if args.api_key is not None else _api_key()
@@ -1000,7 +1054,7 @@ def _finish_command(args, cmd: list[str], model: str, tps: float) -> ServerPlan:
     if key:
         cmd += ["--api-key", key]
     cmd += args.extra
-    return ServerPlan(cmd, Path(model).stem, key, tps)
+    return ServerPlan(cmd, Path(model).stem, key, tps, info or {})
 
 
 def cmd_serve(args) -> None:
@@ -1020,6 +1074,11 @@ def cmd_serve(args) -> None:
     if sp.key:
         params["key"] = sp.key
     print(f"\nOpenAI-compatible API: http://{address}:{args.port}/v1  (model: {sp.name})")
+    if not args.no_dashboard:
+        dash = Dashboard(args, sp, proc, probe(bench=False))
+        if dash.start():
+            print(f"Dashboard:             http://{address}:{args.dashboard_port}/"
+                  + ("  (log in with the API key)" if sp.key else ""))
     show_qr(f"privatelm://server?{urlencode(params)}")
     _wait(proc, adv)
 
@@ -1275,6 +1334,384 @@ def _wait(procs, advs) -> None:
     sys.exit(0 if stopping else code)
 
 
+# ── Monitoring ───────────────────────────────────────────────────────────────
+#
+# Workers serve their live stats on a small read-only HTTP endpoint
+# (/status, port 50060). The master's dashboard (serve, port 8090) polls
+# llama-server's metrics, its own stats and every worker's, keeps ten
+# minutes of history and serves dashboard.html plus /api/status.
+
+STATUS_PORT = 50060
+DASHBOARD_PORT = 8090
+HISTORY_POINTS = 300  # x 2 s = 10 minutes
+
+
+class SystemStats:
+    """CPU, RAM, network and GPU readings of this PC, with rates computed
+    between calls."""
+
+    def __init__(self, devices: Optional[list[Device]] = None):
+        self.devices = devices or []
+        self._cpu = self._read_cpu()
+        self._net = (time.time(), _net_bytes(None))
+
+    @staticmethod
+    def _read_cpu() -> tuple[int, int]:
+        f = Path("/proc/stat").read_text().splitlines()[0].split()[1:]
+        vals = [int(x) for x in f]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        return sum(vals), idle
+
+    def sample(self) -> dict:
+        total, idle = self._read_cpu()
+        dt, di = total - self._cpu[0], idle - self._cpu[1]
+        self._cpu = (total, idle)
+        cpu = 100.0 * (1 - di / dt) if dt > 0 else 0.0
+        now = time.time()
+        rx, tx = _net_bytes(None)
+        t0, (rx0, tx0) = self._net
+        self._net = (now, (rx, tx))
+        span = max(1e-3, now - t0)
+        mem = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, v = line.split(":", 1)
+            if k in ("MemTotal", "MemAvailable"):
+                mem[k] = int(v.split()[0]) // 1024
+        return {
+            "host": socket.gethostname(),
+            "cpu_pct": round(cpu, 1),
+            "cpu_name": next((d.description for d in self.devices if d.type == "cpu"), ""),
+            "load": os.getloadavg()[0],
+            "ram_total_mb": mem.get("MemTotal", 0),
+            "ram_used_mb": mem.get("MemTotal", 0) - mem.get("MemAvailable", 0),
+            "net_rx_kbps": round((rx - rx0) / span / 1024, 1),
+            "net_tx_kbps": round((tx - tx0) / span / 1024, 1),
+            "net_rx_total": rx,
+            "net_tx_total": tx,
+            "gpus": self.gpus(),
+        }
+
+    def gpus(self) -> list[dict]:
+        out: list[dict] = []
+        if shutil.which("nvidia-smi"):
+            try:
+                res = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,"
+                     "temperature.gpu,power.draw", "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5).stdout
+                for line in res.strip().splitlines():
+                    f = [x.strip() for x in line.split(",")]
+                    out.append({"name": f[0], "vendor": "NVIDIA", "util_pct": _num(f[1]),
+                                "mem_used_mb": _num(f[2]), "mem_total_mb": _num(f[3]),
+                                "temp_c": _num(f[4]), "power_w": _num(f[5])})
+            except (OSError, subprocess.SubprocessError, IndexError):
+                pass
+        names = {d.device_id.lower(): d.description for d in self.devices if d.device_id}
+        for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+            dev = card / "device"
+            if not (dev / "vendor").exists() or "-" in card.name:
+                continue
+            vendor = (dev / "vendor").read_text().strip()
+            if vendor not in ("0x1002", "0x8086"):
+                continue  # NVIDIA comes from nvidia-smi
+            slot = ""
+            for line in _read(dev / "uevent").splitlines():
+                if line.startswith("PCI_SLOT_NAME="):
+                    slot = line.split("=", 1)[1].lower()
+            g = {"name": names.get(slot, "AMD GPU" if vendor == "0x1002" else "Intel GPU"),
+                 "vendor": "AMD" if vendor == "0x1002" else "Intel",
+                 "util_pct": _num(_read(dev / "gpu_busy_percent")),
+                 "mem_used_mb": _num(_read(dev / "mem_info_vram_used"), 2**20),
+                 "mem_total_mb": _num(_read(dev / "mem_info_vram_total"), 2**20),
+                 "temp_c": None, "power_w": None}
+            for hw in (dev / "hwmon").glob("hwmon*"):
+                g["temp_c"] = _num(_read(hw / "temp1_input"), 1000)
+                g["power_w"] = _num(_read(hw / "power1_average"), 1e6)
+            if g["mem_total_mb"] or g["util_pct"] is not None:
+                out.append(g)
+        return out
+
+
+def _read(p: Path) -> str:
+    try:
+        return p.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _num(s, div: float = 1.0) -> Optional[float]:
+    try:
+        return round(float(s) / div, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def tcp_peers(port: int) -> list[str]:
+    """IPs with an established connection to this local TCP port."""
+    peers = []
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        for line in _read(Path(path)).splitlines()[1:]:
+            f = line.split()
+            if len(f) < 4 or f[3] != "01":
+                continue
+            local, remote = f[1], f[2]
+            if int(local.rsplit(":", 1)[1], 16) != port:
+                continue
+            ip_hex = remote.rsplit(":", 1)[0]
+            if len(ip_hex) == 8:
+                peers.append(socket.inet_ntoa(struct.pack("<I", int(ip_hex, 16))))
+            elif ip_hex.startswith("0000000000000000FFFF0000"):
+                peers.append(socket.inet_ntoa(struct.pack("<I", int(ip_hex[24:], 16))))
+    return sorted(set(peers))
+
+
+def _start_http(host: str, port: int, handler_cls) -> Optional[object]:
+    from http.server import ThreadingHTTPServer
+    import threading
+
+    try:
+        srv = ThreadingHTTPServer((host, port), handler_cls)
+    except OSError as e:
+        log(f"Port {port} busy ({e}); no web endpoint")
+        return None
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _json_handler(get_routes: dict, post_routes: Optional[dict] = None, key: str = "",
+                  public: tuple = ()):
+    from http.server import BaseHTTPRequestHandler
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _authorized(self, path: str) -> bool:
+            if not key or path in public:
+                return True
+            got = self.headers.get("Authorization", "")
+            return secrets.compare_digest(got.encode(), f"Bearer {key}".encode())
+
+        def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _route(self, routes: dict) -> None:
+            path = self.path.split("?", 1)[0]
+            fn = routes.get(path)
+            if fn is None:
+                return self._send(404, b'{"error":"not found"}')
+            if not self._authorized(path):
+                return self._send(401, b'{"error":"API key required"}')
+            res = fn()
+            if isinstance(res, tuple):
+                return self._send(200, res[0], res[1])
+            self._send(200, json.dumps(res).encode())
+
+        def do_GET(self):
+            self._route(get_routes)
+
+        def do_POST(self):
+            self._route(post_routes or {})
+
+    return H
+
+
+def start_worker_status(args, rpc_info: list[dict], procs: list[subprocess.Popen],
+                        devices: list[Device]) -> None:
+    stats = SystemStats(devices)
+
+    def status() -> dict:
+        rpc = []
+        for info, p in zip(rpc_info, procs):
+            rpc.append(dict(info, alive=p.poll() is None, peers=tcp_peers(info["port"])))
+        return {"role": "worker", "host": socket.gethostname(), "version": RPC_VERSION,
+                "rpc": rpc, "stats": stats.sample()}
+
+    if _start_http(args.host, args.status_port, _json_handler({"/status": status})):
+        log(f"Status for the master's dashboard on port {args.status_port}")
+
+
+class Dashboard:
+    """Collects the cluster's state every 2 s for the master's dashboard."""
+
+    def __init__(self, args, sp: "ServerPlan", proc: subprocess.Popen, devices: list[Device]):
+        import threading
+
+        self.args, self.sp, self.proc = args, sp, proc
+        self.base = f"http://127.0.0.1:{args.port}"
+        self.stats = SystemStats(devices)
+        self.started = time.time()
+        self.lock = threading.Lock()
+        self.history: dict[str, list] = {"t": [], "tps": [], "net_kbps": [], "gpu": {}}
+        self.state: dict = {}
+        self.workers: dict[str, dict] = {}
+        self.lan: list[dict] = []
+        self.bench: dict = {"running": False}
+        self._last_metrics: Optional[tuple[float, float, int]] = None
+        self._last_tps = 0.0
+        self._kb_per_token: Optional[float] = None
+
+    # Collection ------------------------------------------------------------
+
+    def _llama(self) -> dict:
+        import urllib.request
+
+        out = {"status": "starting", "metrics": {}}
+        if self.proc.poll() is not None:
+            out["status"] = "stopped"
+            return out
+        try:
+            with urllib.request.urlopen(self.base + "/health", timeout=2) as r:
+                out["status"] = "ready" if r.status == 200 else "loading"
+        except OSError as e:
+            out["status"] = "loading" if "503" in str(e) else "starting"
+            return out
+        try:
+            req = urllib.request.Request(self.base + "/metrics",
+                                         headers={"Authorization": f"Bearer {self.sp.key}"} if self.sp.key else {})
+            with urllib.request.urlopen(req, timeout=2) as r:
+                for line in r.read().decode().splitlines():
+                    if line and not line.startswith("#"):
+                        k, _, v = line.rpartition(" ")
+                        out["metrics"][k.replace("llamacpp:", "")] = _num(v)
+        except OSError:
+            pass
+        return out
+
+    def _worker(self, w: dict) -> dict:
+        import urllib.request
+
+        t0 = time.perf_counter()
+        try:
+            with urllib.request.urlopen(f"http://{w['host']}:{w['status_port']}/status", timeout=1.5) as r:
+                data = json.loads(r.read())
+            return {"online": True, "rtt_ms": round((time.perf_counter() - t0) * 1000, 1), **data}
+        except (OSError, ValueError):
+            rpc_ok = any(reachable(ep, 1.0) for ep in w["endpoints"])
+            return {"online": rpc_ok, "status_missing": rpc_ok, "rtt_ms": None}
+
+    def collect(self) -> None:
+        llama = self._llama()
+        stats = self.stats.sample()
+        m = llama["metrics"]
+        now = time.time()
+        predicted = m.get("tokens_predicted_total")
+        net_total = stats["net_rx_total"] + stats["net_tx_total"]
+        tps = 0.0
+        if predicted is not None:
+            if self._last_metrics:
+                t0, p0, n0 = self._last_metrics
+                dp = predicted - p0
+                if dp > 0:
+                    tps = dp / max(1e-3, now - t0)
+                    self._last_tps = tps
+                    self._kb_per_token = (net_total - n0) / dp / 1024
+            self._last_metrics = (now, predicted, net_total)
+        workers = {}
+        for w in self.sp.info.get("machines", []):
+            if w["role"] == "worker":
+                workers[w["id"]] = {**w, **self._worker(w)}
+        with self.lock:
+            self.state = {"llama": llama, "stats": stats, "tps_now": round(tps, 2),
+                          "tps_last": round(self._last_tps, 2),
+                          "kb_per_token": None if self._kb_per_token is None else round(self._kb_per_token, 1)}
+            self.workers = workers
+            h = self.history
+            h["t"].append(int(now))
+            h["tps"].append(round(tps, 2))
+            h["net_kbps"].append(round(stats["net_rx_kbps"] + stats["net_tx_kbps"], 1))
+            gpu_now = {"master": [g.get("util_pct") for g in stats["gpus"]]}
+            for wid, w in workers.items():
+                gpu_now[wid] = [g.get("util_pct") for g in (w.get("stats") or {}).get("gpus", [])]
+            for k, v in gpu_now.items():
+                vals = [x for x in v if x is not None]
+                h["gpu"].setdefault(k, [None] * (len(h["t"]) - 1)).append(max(vals) if vals else None)
+            for k in h["gpu"]:
+                if len(h["gpu"][k]) < len(h["t"]):
+                    h["gpu"][k].append(None)
+            for k in ("t", "tps", "net_kbps"):
+                del h[k][:-HISTORY_POINTS]
+            for k in h["gpu"]:
+                del h["gpu"][k][:-HISTORY_POINTS]
+
+    def scan_lan(self) -> None:
+        used = {ep for w in self.sp.info.get("machines", []) for ep in w.get("endpoints", [])}
+        try:
+            peers = scan(3.0)
+        except Exception:  # noqa: BLE001 - mDNS problems must not stop the dashboard
+            return
+        lan = [{"kind": p.kind, "name": p.txt.get("model") or p.name, "endpoint": p.endpoint,
+                "ram_mb": p.ram_mb, "bw": p.bandwidth, "type": p.txt.get("kind", "phone" if p.kind == "worker" else ""),
+                "in_use": p.endpoint in used, "compatible": p.txt.get("v", RPC_VERSION) == RPC_VERSION}
+               for p in peers if p.txt.get("id") != machine_id() or p.kind == "server"]
+        with self.lock:
+            self.lan = lan
+
+    def loop(self) -> None:
+        last_scan = 0.0
+        while self.proc.poll() is None:
+            try:
+                self.collect()
+                if time.time() - last_scan > 30:
+                    last_scan = time.time()
+                    import threading
+                    threading.Thread(target=self.scan_lan, daemon=True).start()
+            except Exception as e:  # noqa: BLE001 - keep monitoring alive
+                log(f"Dashboard: {e}")
+            time.sleep(2)
+
+    # API ---------------------------------------------------------------------
+
+    def status(self) -> dict:
+        with self.lock:
+            return {"plan": self.sp.info, "master": {**self.state, "uptime_s": int(time.time() - self.started),
+                                                      "host": socket.gethostname()},
+                    "workers": self.workers, "lan": self.lan, "history": self.history,
+                    "bench": self.bench}
+
+    def run_bench(self) -> dict:
+        import threading
+
+        with self.lock:
+            if self.bench.get("running"):
+                return self.bench
+            self.bench = {"running": True, "started": int(time.time())}
+
+        def go():
+            try:
+                r = measure(self.base, self.sp.key, None, 0.7, 64, 0, 1)
+                res = {"running": False, "finished": int(time.time()), "tps": round(r["tps"], 1),
+                       "kb_per_token": round((r["per_rx"] + r["per_tx"]) / 1024, 1),
+                       "acceptance": r["acceptance"]}
+            except SystemExit:
+                res = {"running": False, "error": "Messung fehlgeschlagen (Server bereit?)"}
+            with self.lock:
+                self.bench = res
+
+        threading.Thread(target=go, daemon=True).start()
+        return self.bench
+
+    def start(self) -> Optional[str]:
+        import threading
+
+        html_path = next((p for p in (BIN_DIR / "dashboard.html", Path(__file__).resolve().parent / "dashboard.html")
+                          if p.exists()), None)
+        page = html_path.read_bytes() if html_path else b"<p>dashboard.html missing</p>"
+        handler = _json_handler({"/": lambda: (page, "text/html; charset=utf-8"),
+                                 "/api/status": self.status},
+                                {"/api/bench": self.run_bench}, key=self.sp.key, public=("/",))
+        if not _start_http(self.args.host, self.args.dashboard_port, handler):
+            return None
+        threading.Thread(target=self.loop, daemon=True).start()
+        return f"{self.args.dashboard_port}"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="privatelm-node", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1296,6 +1733,9 @@ def main() -> None:
     w.add_argument("--ram-reserve", type=float, default=4.0,
                    help="GB of RAM kept free for this PC (default 4)")
     w.add_argument("--ram-limit", type=float, help="lend at most this many GB of RAM")
+    w.add_argument("--status-port", type=int, default=STATUS_PORT,
+                   help=f"read-only status for the master's dashboard (default {STATUS_PORT})")
+    w.add_argument("--no-status", action="store_true")
     w.set_defaults(fn=cmd_worker)
 
     s = sub.add_parser("serve", help="run a model here and serve an OpenAI-compatible API")
@@ -1310,6 +1750,9 @@ def main() -> None:
                    help="MTP draft depth (models with MTP layers; find the best with tune-mtp)")
     s.add_argument("--ram-limit", type=float,
                    help="GB of this PC's RAM the model may use (layers that don't fit go to workers)")
+    s.add_argument("--dashboard-port", type=int, default=DASHBOARD_PORT,
+                   help=f"web dashboard (default {DASHBOARD_PORT}; same API key as the server)")
+    s.add_argument("--no-dashboard", action="store_true")
     s.add_argument("--advertise-ip")
     s.add_argument("--no-advertise", action="store_true")
     s.add_argument("--scan-timeout", type=float, default=4.0)

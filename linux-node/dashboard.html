@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PrivateLM-Cluster</title>
+<style>
+  :root {
+    --bg: #0f1e28;
+    --surface: #152936;
+    --surface-2: #1b3242;
+    --line: #25404f;
+    --text: #e4edf2;
+    --muted: #8ca3b2;
+    --good: #5fd39a;
+    --warn: #f0b54a;
+    --bad: #ef6f6f;
+    --focus: #8fd3ff;
+    --c0: #4fc3b4; --c1: #f0b54a; --c2: #a091f2; --c3: #ef7f98; --c4: #6cb4f0; --c5: #b5c95c;
+    --radius-l: 14px;
+    --radius-s: 6px;
+    font-family: system-ui, "Segoe UI", Ubuntu, Cantarell, "Noto Sans", sans-serif;
+    font-size: 15px;
+    line-height: 1.45;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #eef3f6; --surface: #ffffff; --surface-2: #f4f8fa; --line: #d3dee5;
+      --text: #12242f; --muted: #587080; --good: #1f9d63; --warn: #b9780d; --bad: #c73e3e;
+      --focus: #1d6fb8;
+      --c0: #1d9c8e; --c1: #c98a12; --c2: #6c58d6; --c3: #cf4a6c; --c4: #2f86cc; --c5: #7a8f24;
+      color-scheme: light;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 28px 24px 48px; }
+  h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+  h1 { font-size: 1.35rem; }
+  h2 { font-size: 1.05rem; }
+  h3 { font-size: 0.98rem; }
+  .num { font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+  button { font: inherit; }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  /* Header */
+  header.top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  header.top > .pill { align-self: flex-start; flex: none; }
+  .model { margin-top: 2px; color: var(--muted); }
+  .model strong { color: var(--text); font-weight: 600; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
+          background: var(--surface); border: 1px solid var(--line); font-size: 0.9rem; white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--good); }
+  .dot.warn { background: var(--warn); }
+  .dot.bad { background: var(--bad); }
+  .dot.busy { background: var(--good); animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--good) 25%, transparent); } }
+
+  /* Live figures */
+  .live { display: grid; grid-template-columns: minmax(240px, 1fr) 2fr; gap: 28px; align-items: end; margin: 30px 0 34px; }
+  .rate { font-size: clamp(3.2rem, 7vw, 5.2rem); font-weight: 700; line-height: 0.95; letter-spacing: -0.035em; }
+  .rate small { font-size: 1rem; font-weight: 500; letter-spacing: 0; color: var(--muted); margin-left: 6px; }
+  .rate-note { margin-top: 8px; color: var(--muted); font-size: 0.92rem; }
+  .facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px 22px; }
+  @media (max-width: 560px) { .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .fact { border-left: 2px solid var(--line); padding: 2px 0 2px 12px; }
+  .fact .v { font-size: 1.35rem; font-weight: 650; }
+  .fact .k { color: var(--muted); font-size: 0.86rem; }
+
+  /* Split strip */
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-l); padding: 20px 22px; }
+  .panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .strip-wrap { position: relative; }
+  .strip { display: flex; align-items: stretch; height: 54px; gap: 0; }
+  .seg { position: relative; min-width: 6px; border-radius: 4px;
+         background: repeating-linear-gradient(90deg, var(--c) 0 calc(var(--w) - 1.5px),
+           color-mix(in srgb, var(--c) 55%, var(--surface)) calc(var(--w) - 1.5px) var(--w)); }
+  .hop { flex: 0 0 34px; display: grid; place-items: center; color: var(--muted); }
+  .hop svg { width: 22px; height: 22px; }
+  .gap { flex: 0 0 4px; }
+  .out { flex: 0 0 64px; border-radius: 4px; display: grid; place-items: center; text-align: center;
+         font-size: 0.78rem; font-weight: 650; line-height: 1.1; color: #0f1e28;
+         background: var(--c); }
+  .moe-cover { position: absolute; top: 0; left: 0; height: 54px; border-radius: 4px; pointer-events: none;
+               background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--bg) 70%, transparent) 0 5px, transparent 5px 10px);
+               outline: 1px dashed var(--muted); }
+  .seg-labels { display: flex; gap: 0; margin-top: 10px; }
+  .seg-labels > div { min-width: 0; overflow: hidden; }
+  .seg-labels .name { font-weight: 600; font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .seg-labels .sub { color: var(--muted); font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; background: var(--c); margin-right: 6px; vertical-align: 0; }
+  .seg-list { display: none; margin: 12px 0 0; padding: 0; list-style: none; font-size: 0.88rem; }
+  .seg-list li { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+  @media (max-width: 700px) {
+    .seg-labels { display: none; }
+    .seg-list { display: block; }
+    .hop { flex-basis: 22px; }
+    .out { flex-basis: 52px; font-size: 0.72rem; }
+  }
+  .split-note { margin-top: 14px; color: var(--muted); font-size: 0.88rem; max-width: 75ch; }
+
+  /* Charts */
+  .charts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 16px; }
+  .chart h3 { font-size: 0.92rem; font-weight: 600; }
+  .chart .now { font-size: 1.15rem; font-weight: 650; }
+  .chart svg { display: block; width: 100%; height: 120px; margin-top: 8px; }
+  .chart-body { position: relative; }
+  .chart-empty { position: absolute; inset: 8px 0 0; display: grid; place-items: center; color: var(--muted); font-size: 0.9rem; }
+  .chart .axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
+  .chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; font-size: 0.8rem; color: var(--muted); }
+
+  /* Machines */
+  .section-head { display: flex; justify-content: space-between; align-items: baseline; margin: 34px 0 14px; gap: 12px; flex-wrap: wrap; }
+  .machines { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 16px; }
+  .machine { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-l); overflow: hidden; }
+  .machine-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; padding: 16px 18px 12px;
+                 border-top: 4px solid var(--c); }
+  .role { font-size: 0.82rem; color: var(--muted); }
+  .machine-body { padding: 0 18px 16px; display: grid; gap: 14px; }
+  .gpu { background: var(--surface-2); border-radius: var(--radius-s); padding: 10px 12px; display: grid; gap: 8px; }
+  .gpu-name { font-weight: 600; font-size: 0.9rem; display: flex; justify-content: space-between; gap: 8px; }
+  .gpu-name span:last-child { color: var(--muted); font-weight: 500; white-space: nowrap; }
+  .meter { display: grid; grid-template-columns: 74px 1fr auto; align-items: center; gap: 10px; font-size: 0.85rem; }
+  .meter .k { color: var(--muted); }
+  .meter .v { text-align: right; min-width: 92px; }
+  .bar { height: 8px; border-radius: 4px; background: color-mix(in srgb, var(--line) 80%, transparent); overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--c); border-radius: 4px; transition: width .6s ease; }
+  .bar.hot > i { background: var(--warn); }
+  .bar.full > i { background: var(--bad); }
+  .kv { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 0.85rem; }
+  .kv span b { font-weight: 600; }
+  .note { font-size: 0.84rem; color: var(--muted); }
+  .note.bad { color: var(--bad); }
+
+  /* LAN + footer */
+  table.lan { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  .lan th { text-align: left; font-weight: 600; color: var(--muted); padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); }
+  .lan td { padding: 8px 10px 8px 0; border-bottom: 1px solid var(--line); }
+  .actions { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-top: 34px; }
+  .btn { background: var(--c0); color: #0f1e28; border: 0; border-radius: 8px; padding: 9px 16px; font-weight: 650; cursor: pointer; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.quiet { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  .banner { margin-top: 18px; padding: 10px 14px; border-radius: 8px; background: color-mix(in srgb, var(--bad) 18%, var(--surface));
+            border: 1px solid color-mix(in srgb, var(--bad) 45%, var(--line)); }
+
+  /* Login */
+  .login { position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg); padding: 24px; }
+  .login form { width: min(420px, 100%); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-l); padding: 26px; display: grid; gap: 14px; }
+  .login input { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface-2); color: var(--text); }
+  [hidden] { display: none !important; }
+
+  @media (max-width: 900px) {
+    .live { grid-template-columns: 1fr; }
+    .charts { grid-template-columns: 1fr; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dot.busy { animation: none; }
+    .bar > i { transition: none; }
+  }
+</style>
+</head>
+<body>
+<div class="login" id="login" hidden>
+  <form id="login-form">
+    <h1>PrivateLM-Cluster</h1>
+    <p class="muted" style="margin:0">Geben Sie den API-Key des Servers ein. Er steht beim Start von <code>privatelm-node serve</code> im Terminal, als Dienst in <code>/var/lib/privatelm-node/privatelm-node/api_key</code>.</p>
+    <label for="key">API-Key</label>
+    <input id="key" type="password" autocomplete="current-password" required>
+    <p class="note bad" id="login-error" hidden>Dieser Key passt nicht zum Server.</p>
+    <button class="btn" type="submit">Anmelden</button>
+  </form>
+</div>
+
+<div class="wrap" id="app">
+  <header class="top">
+    <div>
+      <h1>PrivateLM-Cluster</h1>
+      <div class="model" id="model">Verbinde mit dem Master …</div>
+    </div>
+    <div class="pill" id="state"><span class="dot"></span><span>Verbinde …</span></div>
+  </header>
+
+  <div class="banner" id="offline" hidden>Der Master antwortet nicht. Läuft <code>privatelm-node serve</code> noch?</div>
+
+  <section class="live" aria-label="Live-Werte">
+    <div>
+      <div class="rate num" id="rate">–<small>Token/s</small></div>
+      <div class="rate-note" id="rate-note">Wartet auf die erste Anfrage.</div>
+    </div>
+    <div class="facts" id="facts"></div>
+  </section>
+
+  <section class="panel" aria-labelledby="split-title">
+    <div class="panel-head">
+      <h2 id="split-title">Modell-Aufteilung</h2>
+      <span class="muted" id="split-sub"></span>
+    </div>
+    <div class="strip-wrap">
+      <div class="strip" id="strip" role="img"></div>
+      <div class="moe-cover" id="moe-cover" hidden></div>
+    </div>
+    <div class="seg-labels" id="seg-labels"></div>
+    <ol class="seg-list" id="seg-list"></ol>
+    <p class="split-note" id="split-note"></p>
+  </section>
+
+  <section class="charts" aria-label="Verlauf der letzten 10 Minuten">
+    <div class="panel chart">
+      <div class="chart-head"><h3>Token pro Sekunde</h3><span class="now num" id="c-tps-now">–</span></div>
+      <svg id="c-tps" viewBox="0 0 600 120" preserveAspectRatio="none" aria-hidden="true"></svg>
+      <div class="axis"><span>vor 10 Min.</span><span id="c-tps-max"></span><span>jetzt</span></div>
+    </div>
+    <div class="panel chart">
+      <div class="chart-head"><h3>Netzwerk am Master</h3><span class="now num" id="c-net-now">–</span></div>
+      <svg id="c-net" viewBox="0 0 600 120" preserveAspectRatio="none" aria-hidden="true"></svg>
+      <div class="axis"><span>vor 10 Min.</span><span id="c-net-max"></span><span>jetzt</span></div>
+    </div>
+    <div class="panel chart">
+      <div class="chart-head"><h3>GPU-Auslastung je Rechner</h3><span class="now num" id="c-gpu-now"></span></div>
+      <div class="chart-body"><svg id="c-gpu" viewBox="0 0 600 120" preserveAspectRatio="none" aria-hidden="true"></svg><div class="chart-empty" id="c-gpu-empty" hidden>Noch keine GPU-Messwerte</div></div>
+      <div class="legend" id="c-gpu-legend"></div>
+    </div>
+  </section>
+
+  <div class="section-head">
+    <h2>Rechner</h2>
+    <span class="muted" id="machines-sub"></span>
+  </div>
+  <div class="machines" id="machines"></div>
+
+  <div id="lan-section" hidden>
+    <div class="section-head"><h2>Weitere Geräte im Netzwerk</h2><span class="muted">gefunden, aber nicht in diesem Plan</span></div>
+    <div class="panel"><table class="lan"><thead><tr><th>Gerät</th><th>Art</th><th>Adresse</th><th>Angebot</th><th>Status</th></tr></thead><tbody id="lan"></tbody></table></div>
+  </div>
+
+  <div class="actions">
+    <button class="btn" id="bench-btn" type="button">Kurztest starten</button>
+    <span class="muted" id="bench-out">Misst Token/s und Netzwerkverkehr pro Token mit 64 Tokens bei Temperatur 0,7.</span>
+    <span style="flex:1"></span>
+    <button class="btn quiet" id="logout" type="button" hidden>Abmelden</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const nf = (v, d = 1) => v == null || isNaN(v) ? "–" : Number(v).toLocaleString("de-DE", { minimumFractionDigits: d, maximumFractionDigits: d });
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const gb = (mb) => mb == null ? "–" : nf(mb / 1024, 1) + " GB";
+const rateText = (kb) => kb == null ? "–" : kb >= 1024 ? nf(kb / 1024, 1) + " MB/s" : nf(kb, 0) + " KB/s";
+
+let key = "";
+try { key = localStorage.getItem("plm_key") || ""; } catch (e) { /* storage not available */ }
+let colors = {};
+let last = null;
+
+function machineColor(id) { return colors[id] || "var(--c5)"; }
+
+async function api(path, opts = {}) {
+  const headers = key ? { Authorization: "Bearer " + key } : {};
+  const r = await fetch(path, { ...opts, headers });
+  if (r.status === 401) { const e = new Error("auth"); e.auth = true; throw e; }
+  if (!r.ok) throw new Error(String(r.status));
+  return r.json();
+}
+
+/* ── Rendering ───────────────────────────────────────────────────────── */
+
+function renderHeader(s) {
+  const p = s.plan, m = s.master;
+  const kind = p.kind === "moe" ? `MoE, ${p.n_expert_used} von ${p.n_expert} Experten aktiv` : "dicht";
+  $("model").innerHTML = `<strong>${esc(p.model)}</strong> &nbsp; ${nf(p.size_gb, 1)} GB, ${p.n_layer} Layer, ${kind}, Kontext ${p.ctx.toLocaleString("de-DE")}${p.mtp ? `, MTP-Tiefe ${p.mtp}` : ""} &nbsp;<span class="muted">auf ${esc(m.host)}</span>`;
+  const st = m.llama?.status, busy = (m.llama?.metrics?.requests_processing || 0) > 0;
+  const map = { ready: busy ? ["busy", "Generiert"] : ["ok", "Bereit"], loading: ["warn", "Lädt das Modell"],
+                starting: ["warn", "Startet"], stopped: ["bad", "Server beendet"] };
+  const [cls, txt] = map[st] || ["", "Unbekannt"];
+  const up = m.uptime_s || 0;
+  const upText = up >= 3600 ? `${Math.floor(up / 3600)} Std. ${Math.floor(up % 3600 / 60)} Min.` : `${Math.floor(up / 60)} Min.`;
+  $("state").innerHTML = `<span class="dot ${cls}"></span><span>${txt}</span><span class="muted">seit ${upText}</span>`;
+}
+
+function renderLive(s) {
+  const m = s.master, met = m.llama?.metrics || {}, p = s.plan;
+  const busy = (met.requests_processing || 0) > 0;
+  const shown = busy && m.tps_now > 0 ? m.tps_now : m.tps_last;
+  $("rate").innerHTML = `${shown ? nf(shown, 1) : "–"}<small>Token/s</small>`;
+  $("rate-note").textContent = busy ? `Generiert gerade. Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s.`
+    : shown ? `Letzte Generierung. Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s.`
+    : `Wartet auf die erste Anfrage. Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s.`;
+  const workers = Object.values(s.workers || {});
+  const online = workers.filter((w) => w.online).length;
+  const kv = met.kv_cache_usage_ratio;
+  const facts = [
+    [busy ? nf(met.requests_processing, 0) : "0", "Anfragen in Arbeit"],
+    kv == null ? [p.ctx.toLocaleString("de-DE"), "Tokens Kontext"] : [nf(kv * 100, 0) + " %", "KV-Cache belegt"],
+    [m.kb_per_token == null ? `≈ ${nf(p.net_kb_est, 0)} KB` : nf(m.kb_per_token, 0) + " KB", m.kb_per_token == null ? "Netz pro Token (geschätzt)" : "Netz pro Token (gemessen)"],
+    [workers.length ? `${online} von ${workers.length}` : "keine", "Worker erreichbar"],
+    [nf(met.tokens_predicted_total || 0, 0), "Tokens erzeugt"],
+    [p.hops ? `${p.hops}` : "keine", p.hops === 1 ? "Netzwerk-Übergang pro Token" : "Netzwerk-Übergänge pro Token"],
+  ];
+  $("facts").innerHTML = facts.map(([v, k]) => `<div class="fact"><div class="v num">${esc(v)}</div><div class="k">${esc(k)}</div></div>`).join("");
+}
+
+const hopSvg = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9h13l-3-3M20 15H7l3 3"/></svg>`;
+
+function machineName(s, id) {
+  if (id === "master") return s.master.host + " (Master)";
+  const w = (s.plan.machines || []).find((x) => x.id === id);
+  return w ? (w.label || w.host).split(" · ")[0] : id;
+}
+
+function renderSplit(s) {
+  const p = s.plan, segs = p.segments || [];
+  const strip = [], labels = [];
+  segs.forEach((seg, i) => {
+    if (i > 0) {
+      const changes = segs[i - 1].machine !== seg.machine;
+      strip.push(changes ? `<div class="hop" title="Netzwerk-Übergang">${hopSvg}</div>` : `<div class="gap"></div>`);
+      labels.push(`<div style="flex:0 0 ${changes ? 34 : 4}px"></div>`);
+    }
+    const c = machineColor(seg.machine);
+    strip.push(`<div class="seg" style="flex:${seg.layers} 1 0;--c:${c};--w:calc(100% / ${seg.layers})" title="${esc(seg.device)}: ${seg.layers} Layer"></div>`);
+    labels.push(`<div style="flex:${seg.layers} 1 0"><div class="name"><span class="swatch" style="--c:${c}"></span>${esc(machineName(s, seg.machine))}</div><div class="sub">${seg.layers} Layer, ${esc(seg.device.split(" · ").pop())}</div></div>`);
+  });
+  const out = p.output || {};
+  const outRemote = out.machine && out.machine !== "master";
+  const lastMachine = segs.length ? segs[segs.length - 1].machine : "master";
+  strip.push(lastMachine !== out.machine ? `<div class="hop" title="Netzwerk-Übergang">${hopSvg}</div>` : `<div class="gap"></div>`);
+  strip.push(`<div class="out" style="--c:${machineColor(out.machine || "master")}">Ausgabe</div>`);
+  labels.push(`<div style="flex:0 0 ${lastMachine !== out.machine ? 98 : 68}px"></div>`);
+  $("strip").innerHTML = strip.join("");
+  $("strip").setAttribute("aria-label", segs.map((x) => `${machineName(s, x.machine)}: ${x.layers} Layer`).join(", ") + ", danach die Ausgabeschicht");
+  $("seg-labels").innerHTML = labels.join("");
+  $("seg-list").innerHTML = segs.map((x) => `<li><span><span class="swatch" style="--c:${machineColor(x.machine)}"></span>${esc(machineName(s, x.machine))}</span><span class="muted num">${x.layers} Layer</span></li>`).join("")
+    + `<li><span><span class="swatch" style="--c:${machineColor(out.machine || "master")}"></span>Ausgabeschicht</span><span class="muted">${esc(machineName(s, out.machine || "master"))}</span></li>`;
+  const hops = p.hops || 0;
+  $("split-sub").textContent = `${p.n_layer} Layer in Ausführungsreihenfolge, ${hops ? hops + (hops === 1 ? " Netzwerk-Übergang" : " Netzwerk-Übergänge") : "ohne Netzwerk"}`;
+
+  const cover = $("moe-cover");
+  if (p.mode === "moe" && p.moe_cpu_layers > 0) {
+    const stripEl = $("strip"), first = stripEl.querySelector(".seg");
+    const total = segs.reduce((a, x) => a + x.layers, 0);
+    const segsWidth = [...stripEl.querySelectorAll(".seg")].reduce((a, el) => a + el.getBoundingClientRect().width, 0);
+    cover.style.left = (first ? first.offsetLeft : 0) + "px";
+    cover.style.width = (segsWidth * p.moe_cpu_layers / total) + "px";
+    cover.hidden = false;
+  } else cover.hidden = true;
+
+  let note;
+  if (p.mode === "moe") note = p.moe_cpu_layers > 0
+    ? `MoE auf dem Master: Die Experten der ersten ${p.moe_cpu_layers} Layer (schraffiert) liegen im Arbeitsspeicher. Pro Token rechnen nur wenige Experten, deshalb kostet das wenig.`
+    : "MoE vollständig auf der GPU des Masters.";
+  else if (outRemote) note = "Die Ausgabeschicht liegt auf einem Worker: Ihre Werte gehen bei jedem Token übers Netz.";
+  else note = hops ? "Jedes Token läuft einmal von links nach rechts durch alle Geräte. Die Ausgabeschicht bleibt auf dem Master, damit ihre Werte nicht übers Netz gehen."
+    : "Das Modell läuft vollständig auf dem Master.";
+  $("split-note").textContent = note;
+}
+
+function chart(svgId, series, opts = {}) {
+  const svg = $(svgId), W = 600, H = 120, pad = 6;
+  const all = series.flatMap((s) => s.values.filter((v) => v != null));
+  const max = opts.max || Math.max(1, ...all) * 1.15;
+  const n = Math.max(...series.map((s) => s.values.length), 2);
+  const x = (i, len) => W - (len - 1 - i) * (W / Math.max(n - 1, 1));
+  let out = `<line x1="0" x2="${W}" y1="${H - 0.5}" y2="${H - 0.5}" stroke="var(--line)" />`;
+  for (const s of series) {
+    const pts = [];
+    s.values.forEach((v, i) => { if (v != null) pts.push(`${x(i, s.values.length).toFixed(1)},${(H - pad - (v / max) * (H - 2 * pad)).toFixed(1)}`); });
+    if (pts.length < 2) continue;
+    if (s.fill) out += `<polygon points="${pts[0].split(",")[0]},${H} ${pts.join(" ")} ${pts[pts.length - 1].split(",")[0]},${H}" fill="${s.color}" opacity="0.16" />`;
+    out += `<polyline points="${pts.join(" ")}" fill="none" stroke="${s.color}" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round" />`;
+  }
+  svg.innerHTML = out;
+  return max;
+}
+
+function renderCharts(s) {
+  const h = s.history || { tps: [], net_kbps: [], gpu: {} };
+  const mt = chart("c-tps", [{ values: h.tps, color: "var(--c0)", fill: true }]);
+  $("c-tps-max").textContent = `Skala bis ${nf(mt, 0)}`;
+  const tpsVals = h.tps.filter((v) => v > 0);
+  $("c-tps-now").textContent = tpsVals.length ? nf(tpsVals[tpsVals.length - 1], 1) : "–";
+  const mn = chart("c-net", [{ values: h.net_kbps, color: "var(--c4)", fill: true }]);
+  $("c-net-max").textContent = `Skala bis ${rateText(mn)}`;
+  $("c-net-now").textContent = rateText(h.net_kbps[h.net_kbps.length - 1]);
+  const ids = Object.keys(h.gpu || {}).filter((id) => h.gpu[id].some((v) => v != null));
+  chart("c-gpu", ids.map((id) => ({ values: h.gpu[id], color: machineColor(id) })), { max: 100 });
+  $("c-gpu-empty").hidden = ids.length > 0;
+  $("c-gpu-legend").innerHTML = ids.length
+    ? ids.map((id) => `<span><span class="swatch" style="--c:${machineColor(id)}"></span>${esc(machineName(s, id))}</span>`).join("")
+    : "Werte kommen von nvidia-smi (NVIDIA) und den AMD-Treibern.";
+  const nowVals = ids.map((id) => h.gpu[id][h.gpu[id].length - 1]).filter((v) => v != null);
+  $("c-gpu-now").textContent = nowVals.length ? `max. ${nf(Math.max(...nowVals), 0)} %` : "";
+}
+
+function meter(label, pct, valueText, warnAt = 85, fullAt = 96) {
+  const p = Math.max(0, Math.min(100, pct || 0));
+  const cls = pct == null ? "" : p >= fullAt ? "full" : p >= warnAt ? "hot" : "";
+  return `<div class="meter"><span class="k">${esc(label)}</span><span class="bar ${cls}" role="meter" aria-label="${esc(label)}" aria-valuenow="${Math.round(p)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${p}%"></i></span><span class="v num">${valueText}</span></div>`;
+}
+
+function gpuBlock(g) {
+  const memPct = g.mem_total_mb ? 100 * g.mem_used_mb / g.mem_total_mb : null;
+  const extra = [g.temp_c != null ? `${nf(g.temp_c, 0)} °C` : "", g.power_w != null ? `${nf(g.power_w, 0)} W` : ""].filter(Boolean).join(", ");
+  return `<div class="gpu"><div class="gpu-name"><span>${esc(g.name)}</span><span>${extra}</span></div>
+    ${meter("Auslastung", g.util_pct, g.util_pct == null ? "–" : nf(g.util_pct, 0) + " %")}
+    ${meter("VRAM", memPct, `${gb(g.mem_used_mb)} / ${gb(g.mem_total_mb)}`, 92, 98)}</div>`;
+}
+
+function machineCard(s, id, st, extra) {
+  const c = machineColor(id);
+  const stats = st.stats || {};
+  const ramPct = stats.ram_total_mb ? 100 * stats.ram_used_mb / stats.ram_total_mb : null;
+  const isOut = (s.plan.output || {}).machine === id;
+  const layers = (s.plan.segments || []).filter((x) => x.machine === id).reduce((a, x) => a + x.layers, 0);
+  const gpus = (stats.gpus || []).map(gpuBlock).join("");
+  return `<article class="machine" style="--c:${c}">
+    <div class="machine-top"><div><h3>${esc(st.title)}</h3><div class="role">${esc(st.role)}</div></div>
+      <div class="pill"><span class="dot ${st.dot}"></span><span>${esc(st.stateText)}</span></div></div>
+    <div class="machine-body">
+      <div class="kv"><span><b class="num">${layers}</b> Layer</span>${isOut ? "<span>Ausgabeschicht</span>" : ""}${st.rtt != null ? `<span>Antwortzeit <b class="num">${nf(st.rtt, 1)} ms</b></span>` : ""}</div>
+      ${gpus || (stats.host ? `<div class="note">Keine GPU-Messwerte (Intel-GPU oder ohne Treiberwerkzeug).</div>` : "")}
+      ${stats.host ? meter("CPU", stats.cpu_pct, nf(stats.cpu_pct, 0) + " %") : ""}
+      ${stats.host ? meter("RAM", ramPct, `${gb(stats.ram_used_mb)} / ${gb(stats.ram_total_mb)}`, 90, 97) : ""}
+      ${stats.host ? `<div class="kv"><span>Netz empfangen <b class="num">${rateText(stats.net_rx_kbps)}</b></span><span>gesendet <b class="num">${rateText(stats.net_tx_kbps)}</b></span></div>` : ""}
+      ${extra || ""}
+    </div></article>`;
+}
+
+function renderMachines(s) {
+  const cards = [];
+  const m = s.master;
+  const st = m.llama?.status;
+  cards.push(machineCard(s, "master", { title: m.host, role: "Master, stellt das Modell bereit", stats: m.stats,
+    dot: st === "ready" ? "ok" : st === "stopped" ? "bad" : "warn", stateText: st === "ready" ? "Bereit" : st === "stopped" ? "Beendet" : "Lädt" }));
+  for (const [id, w] of Object.entries(s.workers || {})) {
+    let dot = "ok", stateText = "Online", extra = "";
+    if (!w.online) { dot = "bad"; stateText = "Nicht erreichbar"; extra = `<div class="note bad">Keine Verbindung zu ${esc((w.endpoints || []).join(", "))}. Läuft der Worker, und ist die Firewall offen?</div>`; }
+    else if (w.status_missing) { dot = "warn"; stateText = "Ohne Messwerte"; extra = `<div class="note">Der Worker rechnet, meldet aber keine Messwerte (Port ${w.status_port}). Worker mit neuer Version starten.</div>`; }
+    else {
+      const rpc = (w.rpc || []).map((r) => {
+        const what = r.kind === "gpu" ? "GPU" : "RAM";
+        const peer = r.peers && r.peers.length ? `verbunden mit ${r.peers.map(esc).join(", ")}` : "kein Master verbunden";
+        return `<span>${what} auf Port ${r.port}: <b>${r.alive ? peer : "Prozess beendet"}</b></span>`;
+      }).join("");
+      if (rpc) extra = `<div class="kv">${rpc}</div>`;
+      if ((w.rpc || []).some((r) => !r.alive)) { dot = "bad"; stateText = "Fehler"; }
+    }
+    const title = (w.stats && w.stats.host) || (w.label || w.host).split(" · ")[0];
+    cards.push(machineCard(s, id, { title, role: `Worker, ${(w.endpoints || []).join(", ")}`, stats: w.stats, dot, stateText, rtt: w.rtt_ms }, extra));
+  }
+  $("machines").innerHTML = cards.join("");
+  const n = Object.keys(s.workers || {}).length;
+  $("machines-sub").textContent = n ? `Master und ${n} Worker, aktualisiert alle 2 Sekunden` : "nur der Master, aktualisiert alle 2 Sekunden";
+}
+
+function renderLan(s) {
+  const rows = (s.lan || []).filter((d) => !d.in_use);
+  $("lan-section").hidden = rows.length === 0;
+  const kind = (d) => d.kind === "server" ? "Server" : d.type === "gpu" ? "GPU-Worker" : d.type === "cpu" ? "RAM-Worker" : "Handy";
+  $("lan").innerHTML = rows.map((d) => `<tr><td>${esc(d.name)}</td><td>${kind(d)}</td><td class="num">${esc(d.endpoint)}</td>
+    <td class="num">${d.ram_mb ? gb(d.ram_mb) : "–"}${d.bw ? `, ${nf(d.bw, 0)} GB/s` : ""}</td>
+    <td>${d.compatible ? (d.kind === "worker" ? "frei, nicht im Plan" : "eigener Server") : "andere Version"}</td></tr>`).join("");
+}
+
+function renderBench(s) {
+  const b = s.bench || {}, btn = $("bench-btn"), ready = s.master.llama?.status === "ready";
+  btn.disabled = !!b.running || !ready;
+  btn.textContent = b.running ? "Test läuft …" : "Kurztest starten";
+  if (b.error) $("bench-out").textContent = b.error;
+  else if (b.tps != null) {
+    const acc = b.acceptance != null ? `, MTP-Treffer ${nf(b.acceptance * 100, 0)} %` : "";
+    $("bench-out").textContent = `Letzter Test: ${nf(b.tps, 1)} Token/s, ${nf(b.kb_per_token, 0)} KB Netz pro Token${acc}.`;
+  }
+}
+
+function render(s) {
+  colors = { master: "var(--c0)" };
+  (s.plan.machines || []).filter((m) => m.role === "worker").forEach((m, i) => { colors[m.id] = `var(--c${(i + 1) % 6})`; });
+  renderHeader(s); renderLive(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderBench(s);
+}
+
+/* ── Polling, login ──────────────────────────────────────────────────── */
+
+async function tick() {
+  try {
+    const s = await api("/api/status");
+    last = s;
+    $("offline").hidden = true;
+    $("login").hidden = true;
+    $("logout").hidden = !key;
+    render(s);
+  } catch (e) {
+    if (e.auth) { $("login").hidden = false; $("key").focus(); return; }
+    $("offline").hidden = false;
+  }
+  setTimeout(tick, 2000);
+}
+
+$("login-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  key = $("key").value.trim();
+  try {
+    await api("/api/status");
+    try { localStorage.setItem("plm_key", key); } catch (e) { /* not persisted */ }
+    $("login-error").hidden = true;
+    $("login").hidden = true;
+    tick();
+  } catch (e) { $("login-error").hidden = !e.auth; }
+});
+
+$("logout").addEventListener("click", () => {
+  try { localStorage.removeItem("plm_key"); } catch (e) { /* ignore */ }
+  key = ""; location.reload();
+});
+
+$("bench-btn").addEventListener("click", async () => {
+  $("bench-btn").disabled = true;
+  $("bench-out").textContent = "Test läuft, das dauert je nach Modell bis zu einer Minute.";
+  try { await api("/api/bench", { method: "POST" }); } catch (e) { $("bench-out").textContent = "Test konnte nicht starten."; }
+});
+
+window.addEventListener("resize", () => { if (last) renderSplit(last); });
+tick();
+</script>
+</body>
+</html>
