@@ -7,6 +7,8 @@ Wants=network-online.target
 # Set the model path. --workers auto uses workers where they make it faster or
 # are needed for memory; "all" every worker with room; "off" none.
 ExecStart=/opt/privatelm-node/bin/privatelm-node serve -m /srv/models/model.gguf --workers auto
+# With a router (small model for simple requests, switchable in the dashboard):
+#ExecStart=/opt/privatelm-node/bin/privatelm-node serve -m /srv/models/model.gguf --fast-model /srv/models/small.gguf
 DynamicUser=yes
 CacheDirectory=privatelm-node
 Environment=XDG_CACHE_HOME=/var/cache/privatelm-node

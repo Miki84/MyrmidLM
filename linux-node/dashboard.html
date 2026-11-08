@@ -70,6 +70,32 @@
   .fact .v { font-size: 1.35rem; font-weight: 650; }
   .fact .k { color: var(--muted); font-size: 0.86rem; }
 
+  /* Router */
+  .router { margin-bottom: 16px; display: grid; grid-template-columns: minmax(260px, 1fr) 1.4fr; gap: 26px; }
+  .router-controls { display: grid; gap: 14px; align-content: start; }
+  .switch-row { display: flex; align-items: center; gap: 12px; }
+  .switch { position: relative; width: 48px; height: 28px; border-radius: 999px; border: 1px solid var(--line);
+            background: var(--surface-2); cursor: pointer; flex: none; padding: 0; }
+  .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%;
+                   background: var(--muted); transition: transform .2s ease, background .2s ease; }
+  .switch[aria-checked="true"] { background: color-mix(in srgb, var(--c0) 35%, var(--surface-2)); border-color: var(--c0); }
+  .switch[aria-checked="true"]::after { transform: translateX(20px); background: var(--c0); }
+  .switch:disabled { opacity: .5; cursor: default; }
+  .seg-ctl { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg-ctl button { background: transparent; color: var(--muted); border: 0; padding: 6px 12px; cursor: pointer; font-size: 0.88rem; }
+  .seg-ctl button[aria-pressed="true"] { background: var(--surface-2); color: var(--text); font-weight: 600; }
+  .routes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .route { background: var(--surface-2); border-radius: var(--radius-s); padding: 12px 14px; border-left: 3px solid var(--rc); }
+  .route .n { font-size: 1.5rem; font-weight: 650; }
+  .route .m { font-size: 0.86rem; color: var(--muted); }
+  .share { display: flex; height: 8px; border-radius: 4px; overflow: hidden; margin: 12px 0 4px; background: var(--line); }
+  .share i { display: block; height: 100%; }
+  .decisions { list-style: none; margin: 10px 0 0; padding: 0; font-size: 0.85rem; max-height: 170px; overflow: auto; }
+  .decisions li { display: grid; grid-template-columns: 62px 74px 1fr; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+  .tag { font-weight: 600; }
+  @media (max-width: 900px) { .router { grid-template-columns: 1fr; } }
+  .router-off { margin-bottom: 16px; color: var(--muted); font-size: 0.9rem; }
+
   /* Split strip */
   .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-l); padding: 20px 22px; }
   .panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
@@ -158,6 +184,7 @@
     .charts { grid-template-columns: 1fr; }
   }
   @media (prefers-reduced-motion: reduce) {
+    .switch::after { transition: none; }
     .dot.busy { animation: none; }
     .bar > i { transition: none; }
   }
@@ -194,6 +221,31 @@
     <div class="facts" id="facts"></div>
   </section>
 
+  <section class="panel router" id="router" aria-labelledby="router-title" hidden>
+    <div class="router-controls">
+      <div class="panel-head" style="margin:0"><h2 id="router-title">Router</h2></div>
+      <div class="switch-row">
+        <button class="switch" id="router-switch" role="switch" aria-checked="false" aria-labelledby="router-switch-label" type="button"></button>
+        <span id="router-switch-label">Anfragen verteilen</span>
+      </div>
+      <p class="muted" id="router-explain" style="margin:0"></p>
+      <div>
+        <div class="muted" style="font-size:.86rem;margin-bottom:6px" id="mode-label">Wer entscheidet</div>
+        <div class="seg-ctl" role="group" aria-labelledby="mode-label">
+          <button type="button" data-mode="heuristic" aria-pressed="true">Regeln</button>
+          <button type="button" data-mode="model" aria-pressed="false">Schnelles Modell</button>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="routes" id="routes"></div>
+      <div class="share" id="share" aria-hidden="true"></div>
+      <div class="muted" style="font-size:.84rem" id="share-text"></div>
+      <ul class="decisions" id="decisions" aria-label="Letzte Entscheidungen"></ul>
+    </div>
+  </section>
+  <p class="router-off" id="router-off" hidden>Router nicht aktiv: Es läuft nur ein Modell. Mit <code>--fast-model klein.gguf</code> beantwortet ein zweites, schnelles Modell einfache Anfragen.</p>
+
   <section class="panel" aria-labelledby="split-title">
     <div class="panel-head">
       <h2 id="split-title">Modell-Aufteilung</h2>
@@ -213,6 +265,7 @@
       <div class="chart-head"><h3>Token pro Sekunde</h3><span class="now num" id="c-tps-now">–</span></div>
       <svg id="c-tps" viewBox="0 0 600 120" preserveAspectRatio="none" aria-hidden="true"></svg>
       <div class="axis"><span>vor 10 Min.</span><span id="c-tps-max"></span><span>jetzt</span></div>
+      <div class="legend" id="c-tps-legend" hidden><span><span class="swatch" style="--c:var(--c0)"></span>großes Modell</span><span><span class="swatch" style="--c:var(--c1)"></span>schnelles Modell</span></div>
     </div>
     <div class="panel chart">
       <div class="chart-head"><h3>Netzwerk am Master</h3><span class="now num" id="c-net-now">–</span></div>
@@ -262,6 +315,7 @@ function machineColor(id) { return colors[id] || "var(--c5)"; }
 
 async function api(path, opts = {}) {
   const headers = key ? { Authorization: "Bearer " + key } : {};
+  if (opts.body) headers["Content-Type"] = "application/json";
   const r = await fetch(path, { ...opts, headers });
   if (r.status === 401) { const e = new Error("auth"); e.auth = true; throw e; }
   if (!r.ok) throw new Error(String(r.status));
@@ -380,7 +434,9 @@ function chart(svgId, series, opts = {}) {
 
 function renderCharts(s) {
   const h = s.history || { tps: [], net_kbps: [], gpu: {} };
-  const mt = chart("c-tps", [{ values: h.tps, color: "var(--c0)", fill: true }]);
+  const hasFast = (h.tps_fast || []).some((v) => v != null);
+  const mt = chart("c-tps", [{ values: h.tps, color: "var(--c0)", fill: true }].concat(hasFast ? [{ values: h.tps_fast, color: "var(--c1)" }] : []));
+  $("c-tps-legend").hidden = !hasFast;
   $("c-tps-max").textContent = `Skala bis ${nf(mt, 0)}`;
   const tpsVals = h.tps.filter((v) => v > 0);
   $("c-tps-now").textContent = tpsVals.length ? nf(tpsVals[tpsVals.length - 1], 1) : "–";
@@ -467,6 +523,47 @@ function renderLan(s) {
     <td>${d.compatible ? (d.kind === "worker" ? "frei, nicht im Plan" : "eigener Server") : "andere Version"}</td></tr>`).join("");
 }
 
+function renderRouter(s) {
+  const r = s.router || {};
+  $("router").hidden = !r.available;
+  $("router-off").hidden = !!r.available;
+  if (!r.available) return;
+  const sw = $("router-switch");
+  if (!sw.dataset.busy) sw.setAttribute("aria-checked", String(!!r.enabled));
+  document.querySelectorAll(".seg-ctl button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === r.mode)));
+  const fastName = r.fast.model, bigName = r.big.model;
+  $("router-explain").textContent = r.enabled
+    ? (r.mode === "model"
+      ? `Das schnelle Modell schätzt jede Anfrage ein. Einfache beantwortet ${fastName} selbst, alles andere ${bigName}.`
+      : `Kurze, einfache Anfragen beantwortet ${fastName}, alles mit Code, Analyse, Werkzeugen, Bildern oder langem Kontext ${bigName}.`)
+    : `Aus: Alle Anfragen gehen an ${bigName}. Mit dem Modellnamen „fast“ lässt sich das schnelle Modell trotzdem gezielt ansprechen.`;
+  const fl = r.fast_live || {}, plan = s.plan || {}, fi = plan.fast || {};
+  const statusText = (st) => ({ ready: "bereit", loading: "lädt", down: "nicht erreichbar", starting: "startet" }[st] || st || "–");
+  const n = r.counts || { fast: 0, big: 0 }, total = (n.fast || 0) + (n.big || 0);
+  const fastTps = fl.tps_now > 0 ? fl.tps_now : fl.tps_last;
+  $("routes").innerHTML = `
+    <div class="route" style="--rc:var(--c1)"><div class="m">Schnell</div><div class="n num">${nf(n.fast, 0)}</div>
+      <div class="m">${esc(fastName)}${fi.device ? `, ${esc(fi.device)}` : ""}</div>
+      <div class="m">${statusText(r.fast.status)}${fastTps ? `, ${nf(fastTps, 1)} Token/s` : ""}</div></div>
+    <div class="route" style="--rc:var(--c0)"><div class="m">Groß</div><div class="n num">${nf(n.big, 0)}</div>
+      <div class="m">${esc(bigName)}</div><div class="m">${statusText(r.big.status)}</div></div>`;
+  const pf = total ? 100 * n.fast / total : 0;
+  $("share").innerHTML = total ? `<i style="width:${pf}%;background:var(--c1)"></i><i style="width:${100 - pf}%;background:var(--c0)"></i>` : "";
+  $("share-text").textContent = total ? `${nf(pf, 0)} % der ${nf(total, 0)} Anfragen seit dem Start gingen an das schnelle Modell.` : "Noch keine Anfragen seit dem Start.";
+  $("decisions").innerHTML = (r.recent || []).slice().reverse().map((d) => {
+    const t = new Date(d.t * 1000).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    return `<li><span class="muted num">${t}</span><span class="tag" style="color:${d.route === "fast" ? "var(--c1)" : "var(--c0)"}">${d.route === "fast" ? "schnell" : "groß"}</span><span>${esc(d.reason)}</span></li>`;
+  }).join("");
+}
+
+async function setRouter(body) {
+  const sw = $("router-switch");
+  sw.dataset.busy = "1";
+  try { const r = await api("/api/router", { method: "POST", body: JSON.stringify(body) }); if (last) { last.router = { ...last.router, ...r }; renderRouter(last); } }
+  catch (e) { /* the next poll shows the real state */ }
+  delete sw.dataset.busy;
+}
+
 function renderBench(s) {
   const b = s.bench || {}, btn = $("bench-btn"), ready = s.master.llama?.status === "ready";
   btn.disabled = !!b.running || !ready;
@@ -481,7 +578,7 @@ function renderBench(s) {
 function render(s) {
   colors = { master: "var(--c0)" };
   (s.plan.machines || []).filter((m) => m.role === "worker").forEach((m, i) => { colors[m.id] = `var(--c${(i + 1) % 6})`; });
-  renderHeader(s); renderLive(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderBench(s);
+  renderHeader(s); renderLive(s); renderRouter(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderBench(s);
 }
 
 /* ── Polling, login ──────────────────────────────────────────────────── */
@@ -523,6 +620,16 @@ $("bench-btn").addEventListener("click", async () => {
   $("bench-out").textContent = "Test läuft, das dauert je nach Modell bis zu einer Minute.";
   try { await api("/api/bench", { method: "POST" }); } catch (e) { $("bench-out").textContent = "Test konnte nicht starten."; }
 });
+
+$("router-switch").addEventListener("click", () => {
+  const on = $("router-switch").getAttribute("aria-checked") !== "true";
+  $("router-switch").setAttribute("aria-checked", String(on));
+  setRouter({ enabled: on });
+});
+document.querySelectorAll(".seg-ctl button").forEach((b) => b.addEventListener("click", () => {
+  document.querySelectorAll(".seg-ctl button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+  setRouter({ mode: b.dataset.mode });
+}));
 
 window.addEventListener("resize", () => { if (last) renderSplit(last); });
 tick();

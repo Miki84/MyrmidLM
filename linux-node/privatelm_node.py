@@ -841,6 +841,9 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     out_extra = m.output_mb + logits_mb + (MTP_RESERVE_MB if args.mtp else 0)
 
     devices = probe(bench=True)
+    for d in devices:  # memory kept for the router's fast model
+        if d.name in getattr(args, "reserve_mb", {}):
+            d.free_mb = max(0, int(d.free_mb - args.reserve_mb[d.name]))
     local_gpus = usable_gpus(devices)
     cpu = next((d for d in devices if d.type == "cpu"), None)
     host_speed = cpu.bandwidth if cpu and cpu.bandwidth else 20.0
@@ -1058,29 +1061,71 @@ def _finish_command(args, cmd: list[str], model: str, tps: float, info: Optional
 
 
 def cmd_serve(args) -> None:
+    has_fast = bool(args.fast_model or args.fast_url)
+    if args.router == "on" and not has_fast:
+        die("--router on needs a fast model: --fast-model small.gguf or --fast-url http://host:port/v1")
+    public_host, public_port = args.host, args.port
+    fast_cmd: Optional[list[str]] = None
+    fast_info: dict = {}
+    if has_fast:
+        if args.fast_model:
+            fast_cmd, args.reserve_mb, fast_info = plan_fast(args, probe(bench=True))
+        else:
+            fast_info = {"model": args.fast_url, "device": "eigener Server", "ctx": args.fast_ctx}
+        # The big model listens locally; the router takes the public port.
+        args.host, args.port = "127.0.0.1", public_port + 1
+
     sp = build_server(args)
+    big_base = f"http://127.0.0.1:{args.port}"
     log(" ".join(sp.cmd).replace(sp.key, "***") if sp.key else " ".join(sp.cmd))
     proc = subprocess.Popen(sp.cmd)
+    fast_proc = None
+    router = None
+    public_name = sp.name
+    if has_fast:
+        if fast_cmd:
+            if sp.key:
+                fast_cmd += ["--api-key", sp.key]
+            print(f"Fast model: {fast_info['model']} ({fast_info['size_gb']} GB) on {fast_info['device']}, "
+                  f"context {args.fast_ctx}\n")
+            fast_proc = subprocess.Popen(fast_cmd)
+            fast = Backend("fast", f"http://127.0.0.1:{fast_info['port']}", sp.key, fast_info["model"])
+        else:
+            url = args.fast_url.rstrip("/")
+            fast = Backend("fast", url[:-3] if url.endswith("/v1") else url, args.fast_key or "", url)
+        enabled, mode = _router_initial(args.router, True)
+        if args.router_mode:
+            mode = args.router_mode
+        public_name = args.model_name
+        router = Router(Backend("big", big_base, sp.key, sp.name), fast, args.fast_ctx, enabled, mode,
+                        public_name, sp.key)
+        sp.info["fast"] = fast_info
+        if not router.start(public_host, public_port):
+            proc.terminate()
+            die(f"Port {public_port} is busy.")
+        log(f"Router on port {public_port}: {'on' if enabled else 'off'} ({mode}); "
+            "switch it in the dashboard or with --router on/off")
+        args.host, args.port = public_host, public_port
 
     address = args.advertise_ip or (args.host if args.host not in ("0.0.0.0", "") else lan_address())
     adv = None
     if not args.no_advertise:
         adv = Advertiser(SERVER_TYPE, f"PrivateLM {socket.gethostname()}", args.port,
-                         {"path": "/v1", "model": sp.name, "auth": "1" if sp.key else "0", "v": "1"}, address)
+                         {"path": "/v1", "model": public_name, "auth": "1" if sp.key else "0", "v": "1"}, address)
         adv.start()
     from urllib.parse import urlencode
 
-    params = {"url": f"http://{address}:{args.port}/v1", "model": sp.name, "name": socket.gethostname()}
+    params = {"url": f"http://{address}:{args.port}/v1", "model": public_name, "name": socket.gethostname()}
     if sp.key:
         params["key"] = sp.key
-    print(f"\nOpenAI-compatible API: http://{address}:{args.port}/v1  (model: {sp.name})")
+    print(f"\nOpenAI-compatible API: http://{address}:{args.port}/v1  (model: {public_name})")
     if not args.no_dashboard:
-        dash = Dashboard(args, sp, proc, probe(bench=False))
+        dash = Dashboard(args, sp, proc, probe(bench=False), router=router, big_base=big_base)
         if dash.start():
             print(f"Dashboard:             http://{address}:{args.dashboard_port}/"
                   + ("  (log in with the API key)" if sp.key else ""))
     show_qr(f"privatelm://server?{urlencode(params)}")
-    _wait(proc, adv)
+    _wait([proc], adv, also_stop=[fast_proc] if fast_proc else [])
 
 
 def cmd_tune_mtp(args) -> None:
@@ -1172,10 +1217,12 @@ def _net_bytes(ifaces: Optional[list[str]]) -> tuple[int, int]:
     return rx, tx
 
 
-def _http(base: str, key: str):
+def _http(base: str, key: str, route: str = "auto"):
     import urllib.request
 
     headers = {"Content-Type": "application/json"}
+    if route != "auto":
+        headers["X-PrivateLM-Route"] = route  # with the router: measure this model
     if key:
         headers["Authorization"] = f"Bearer {key}"
 
@@ -1201,12 +1248,12 @@ FILLER = ("The lighthouse keeper wrote in his log every evening, noting the weat
 
 
 def measure(base: str, key: str, ifaces: Optional[list[str]], temp: float, tokens: int,
-            context: int, runs: int = 1) -> dict:
+            context: int, runs: int = 1, route: str = "big") -> dict:
     """Generation speed and network traffic per token (both directions:
     the difference between a 1-token and an N-token run, so the prompt's
     traffic drops out). context = rough prompt length in tokens: a full
     context is slower, and that's where workers' extra memory pays off."""
-    call = _http(base, key)
+    call = _http(base, key, route)
     try:
         meta = (call("/v1/models").get("data") or [{}])[0].get("meta") or {}
     except OSError as e:
@@ -1259,7 +1306,7 @@ def cmd_bench(args) -> None:
         _api_key() if (CONFIG_DIR / "api_key").exists() else "")
     ifaces = args.iface.split(",") if args.iface else None
     log(f"Measuring at temperature {args.temp}, context ~{args.context} tokens...")
-    r = measure(base, key, ifaces, args.temp, args.tokens, args.context, args.runs)
+    r = measure(base, key, ifaces, args.temp, args.tokens, args.context, args.runs, args.route)
     per = r["per_rx"] + r["per_tx"]
     print(f"Generation:   {r['tps']:.1f} tokens/s ({r['n']} tokens, temperature {args.temp}, "
           f"context ~{args.context})")
@@ -1296,8 +1343,9 @@ def _api_key() -> str:
     return path.read_text().strip()
 
 
-def _wait(procs, advs) -> None:
-    """Runs until a child exits or we're stopped, then stops everything."""
+def _wait(procs, advs, also_stop: Optional[list] = None) -> None:
+    """Runs until a child exits or we're stopped, then stops everything
+    (also_stop: helpers whose exit doesn't end the run)."""
     if isinstance(procs, subprocess.Popen):
         procs = [procs]
     if advs is None:
@@ -1321,6 +1369,7 @@ def _wait(procs, advs) -> None:
                 break
             time.sleep(0.5)
     finally:
+        procs = list(procs) + list(also_stop or [])
         for p in procs:
             if p.poll() is None:
                 p.terminate()
@@ -1501,14 +1550,22 @@ def _json_handler(get_routes: dict, post_routes: Optional[dict] = None, key: str
             self.end_headers()
             self.wfile.write(body)
 
-        def _route(self, routes: dict) -> None:
+        def _route(self, routes: dict, post: bool = False) -> None:
             path = self.path.split("?", 1)[0]
             fn = routes.get(path)
             if fn is None:
                 return self._send(404, b'{"error":"not found"}')
             if not self._authorized(path):
                 return self._send(401, b'{"error":"API key required"}')
-            res = fn()
+            if post:
+                n = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(n)) if n else {}
+                except ValueError:
+                    body = {}
+                res = fn(body if isinstance(body, dict) else {})
+            else:
+                res = fn()
             if isinstance(res, tuple):
                 return self._send(200, res[0], res[1])
             self._send(200, json.dumps(res).encode())
@@ -1517,7 +1574,7 @@ def _json_handler(get_routes: dict, post_routes: Optional[dict] = None, key: str
             self._route(get_routes)
 
         def do_POST(self):
-            self._route(post_routes or {})
+            self._route(post_routes or {}, post=True)
 
     return H
 
@@ -1540,11 +1597,14 @@ def start_worker_status(args, rpc_info: list[dict], procs: list[subprocess.Popen
 class Dashboard:
     """Collects the cluster's state every 2 s for the master's dashboard."""
 
-    def __init__(self, args, sp: "ServerPlan", proc: subprocess.Popen, devices: list[Device]):
+    def __init__(self, args, sp: "ServerPlan", proc: subprocess.Popen, devices: list[Device],
+                 router: Optional["Router"] = None, big_base: Optional[str] = None):
         import threading
 
-        self.args, self.sp, self.proc = args, sp, proc
-        self.base = f"http://127.0.0.1:{args.port}"
+        self.args, self.sp, self.proc, self.router = args, sp, proc, router
+        self.base = big_base or f"http://127.0.0.1:{args.port}"
+        self._fast_last: Optional[tuple[float, float]] = None
+        self._fast_tps_last = 0.0
         self.stats = SystemStats(devices)
         self.started = time.time()
         self.lock = threading.Lock()
@@ -1556,6 +1616,7 @@ class Dashboard:
         self._last_metrics: Optional[tuple[float, float, int]] = None
         self._last_tps = 0.0
         self._kb_per_token: Optional[float] = None
+        self.fast_state: dict = {}
 
     # Collection ------------------------------------------------------------
 
@@ -1613,6 +1674,7 @@ class Dashboard:
                     self._last_tps = tps
                     self._kb_per_token = (net_total - n0) / dp / 1024
             self._last_metrics = (now, predicted, net_total)
+        self.fast_state = self._fast() if self.router else {}
         workers = {}
         for w in self.sp.info.get("machines", []):
             if w["role"] == "worker":
@@ -1625,6 +1687,8 @@ class Dashboard:
             h = self.history
             h["t"].append(int(now))
             h["tps"].append(round(tps, 2))
+            h.setdefault("tps_fast", [None] * (len(h["t"]) - 1)).append(
+                round(self.fast_state.get("tps_now", 0.0), 2) if self.router else None)
             h["net_kbps"].append(round(stats["net_rx_kbps"] + stats["net_tx_kbps"], 1))
             gpu_now = {"master": [g.get("util_pct") for g in stats["gpus"]]}
             for wid, w in workers.items():
@@ -1635,7 +1699,7 @@ class Dashboard:
             for k in h["gpu"]:
                 if len(h["gpu"][k]) < len(h["t"]):
                     h["gpu"][k].append(None)
-            for k in ("t", "tps", "net_kbps"):
+            for k in ("t", "tps", "net_kbps", "tps_fast"):
                 del h[k][:-HISTORY_POINTS]
             for k in h["gpu"]:
                 del h["gpu"][k][:-HISTORY_POINTS]
@@ -1668,9 +1732,41 @@ class Dashboard:
 
     # API ---------------------------------------------------------------------
 
+    def set_router(self, body: dict) -> dict:
+        if not self.router:
+            return {"available": False}
+        return self.router.set(body)
+
+    def _fast(self) -> dict:
+        """The router's fast model: status and generation speed."""
+        import urllib.request
+
+        r = self.router
+        out = {"status": r.fast.status, "tps_now": 0.0, "tps_last": self._fast_tps_last, "tokens": None}
+        try:
+            req = urllib.request.Request(r.fast.base + "/metrics",
+                                         headers={"Authorization": f"Bearer {r.fast.key}"} if r.fast.key else {})
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                for line in resp.read().decode().splitlines():
+                    if line.startswith("llamacpp:tokens_predicted_total"):
+                        out["tokens"] = _num(line.rpartition(" ")[2])
+        except OSError:
+            return out
+        now = time.time()
+        if out["tokens"] is not None:
+            if self._fast_last and out["tokens"] > self._fast_last[1]:
+                out["tps_now"] = (out["tokens"] - self._fast_last[1]) / max(1e-3, now - self._fast_last[0])
+                self._fast_tps_last = out["tps_now"]
+                out["tps_last"] = self._fast_tps_last
+            self._fast_last = (now, out["tokens"])
+        return out
+
     def status(self) -> dict:
+        router = None
+        if self.router:
+            router = {**self.router.info(), **{"fast_live": self.fast_state}}
         with self.lock:
-            return {"plan": self.sp.info, "master": {**self.state, "uptime_s": int(time.time() - self.started),
+            return {"router": router or {"available": False}, "plan": self.sp.info, "master": {**self.state, "uptime_s": int(time.time() - self.started),
                                                       "host": socket.gethostname()},
                     "workers": self.workers, "lan": self.lan, "history": self.history,
                     "bench": self.bench}
@@ -1705,11 +1801,358 @@ class Dashboard:
         page = html_path.read_bytes() if html_path else b"<p>dashboard.html missing</p>"
         handler = _json_handler({"/": lambda: (page, "text/html; charset=utf-8"),
                                  "/api/status": self.status},
-                                {"/api/bench": self.run_bench}, key=self.sp.key, public=("/",))
+                                {"/api/bench": lambda body: self.run_bench(),
+                                 "/api/router": self.set_router}, key=self.sp.key, public=("/",))
         if not _start_http(self.args.host, self.args.dashboard_port, handler):
             return None
         threading.Thread(target=self.loop, daemon=True).start()
         return f"{self.args.dashboard_port}"
+
+
+# ── Router ───────────────────────────────────────────────────────────────────
+#
+# With a fast model (--fast-model or --fast-url), serve puts a router on the
+# public API port: one endpoint, one model name, and each request goes to
+# the fast model (short, simple) or the big one (everything else). The big
+# model may be split across workers; the fast one runs on a single device,
+# so simple answers come back with no network round trips.
+#
+# Overrides per request: model "fast" or "big", or header X-PrivateLM-Route.
+# On/off and the decision method can be changed live from the dashboard.
+
+ROUTER_STATE = CONFIG_DIR / "router.json"
+
+HARD_WORDS = re.compile(
+    r"(```|\b(code|programm\w*|skript|script|funktion|function|klasse|class|debug\w*|bug|fehler\w*|"
+    r"refactor\w*|implementier\w*|analys\w*|analyz\w*|vergleich\w*|compare|beweis\w*|prove|herleit\w*|"
+    r"berechn\w*|calculate|schritt für schritt|step by step|ausführlich|in detail|entwirf|entwurf|design|"
+    r"architektur|architecture|strategie|strategy|konzept|zusammenfass\w*|summari[sz]\w*|übersetze den|"
+    r"translate the following|review|optimier\w*|sql|regex|kubernetes|ansible|docker|yaml|json)\b)",
+    re.IGNORECASE)
+ROUTER_PROMPT = (
+    "Du entscheidest, welches Sprachmodell eine Anfrage beantwortet. Antworte nur mit einem "
+    "Buchstaben: E, wenn ein kleines Modell sie gut beantworten kann (Smalltalk, kurze Fakten, "
+    "kurze Umformulierungen, einfache Fragen), S, wenn sie ein großes Modell braucht "
+    "(Programmieren, Analyse, Mathematik, lange Texte, mehrstufiges Denken, Fachwissen).")
+
+
+def _message_text(content) -> tuple[str, bool]:
+    """Text of a message content, and whether it carries an image."""
+    if isinstance(content, str):
+        return content, False
+    text, image = [], False
+    for part in content or []:
+        if isinstance(part, dict):
+            if part.get("type") == "text":
+                text.append(part.get("text", ""))
+            elif part.get("type") in ("image_url", "input_image", "image"):
+                image = True
+    return "\n".join(text), image
+
+
+@dataclass
+class Backend:
+    name: str  # "fast" or "big"
+    base: str  # http://host:port
+    key: str
+    label: str  # model name for display
+    healthy: bool = False
+    status: str = "starting"
+
+
+class Router:
+    def __init__(self, big: Backend, fast: Backend, fast_ctx: int, enabled: bool, mode: str,
+                 public_name: str, key: str):
+        import threading
+
+        self.big, self.fast = big, fast
+        self.fast_ctx = fast_ctx
+        self.enabled, self.mode = enabled, mode
+        self.public_name, self.key = public_name, key
+        self.lock = threading.Lock()
+        self.counts = {"fast": 0, "big": 0}
+        self.recent: list[dict] = []
+
+    # State -----------------------------------------------------------------
+
+    def save(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            ROUTER_STATE.write_text(json.dumps({"enabled": self.enabled, "mode": self.mode}))
+        except OSError as e:
+            log(f"Router: could not save the setting ({e})")
+
+    def set(self, body: dict) -> dict:
+        with self.lock:
+            if "enabled" in body:
+                self.enabled = bool(body["enabled"])
+            if body.get("mode") in ("heuristic", "model"):
+                self.mode = body["mode"]
+        self.save()
+        log(f"Router {'on' if self.enabled else 'off'} ({self.mode})")
+        return self.info()
+
+    def info(self) -> dict:
+        with self.lock:
+            return {"available": True, "enabled": self.enabled, "mode": self.mode,
+                    "fast": {"model": self.fast.label, "status": self.fast.status, "base": self.fast.base},
+                    "big": {"model": self.big.label, "status": self.big.status},
+                    "counts": dict(self.counts), "recent": list(self.recent[-12:])}
+
+    def watch_health(self) -> None:
+        import urllib.request
+
+        while True:
+            for b in (self.big, self.fast):
+                try:
+                    with urllib.request.urlopen(b.base + "/health", timeout=2) as r:
+                        b.healthy, b.status = r.status == 200, "ready"
+                except OSError as e:
+                    b.healthy = False
+                    b.status = "loading" if "503" in str(e) else "down"
+            time.sleep(3)
+
+    # Decision ----------------------------------------------------------------
+
+    def decide(self, body: dict, headers) -> tuple[Backend, str]:
+        forced = (headers.get("X-PrivateLM-Route") or "").lower() or str(body.get("model", "")).lower()
+        if forced in ("fast", "schnell", "small"):
+            return self._pick(self.fast, "angefordert")
+        if forced in ("big", "large", "groß", "gross"):
+            return self._pick(self.big, "angefordert")
+        if not self.enabled:
+            return self._pick(self.big, "Router aus")
+        if not self.big.healthy and self.fast.healthy:
+            return self.fast, "großes Modell nicht bereit"
+        if not self.fast.healthy:
+            return self.big, "schnelles Modell nicht bereit"
+        route, reason = self.classify(body)
+        if route == "fast" and self.mode == "model":
+            route, reason = self.ask_fast_model(body, reason)
+        return (self.fast if route == "fast" else self.big), reason
+
+    def _pick(self, b: Backend, reason: str) -> tuple[Backend, str]:
+        other = self.big if b is self.fast else self.fast
+        if not b.healthy and other.healthy:
+            return other, f"{reason}, aber {'schnelles' if b is self.fast else 'großes'} Modell nicht bereit"
+        return b, reason
+
+    def classify(self, body: dict) -> tuple[str, str]:
+        """Rules first (what the small model can't do), then the shape of the
+        request. Errs towards the big model: a wrong 'big' costs time, a
+        wrong 'fast' costs quality."""
+        msgs = body.get("messages")
+        if msgs is None:
+            msgs = [{"role": "user", "content": body.get("prompt", "")}]
+        if body.get("tools") or body.get("functions"):
+            return "big", "Werkzeuge (Tools)"
+        texts, image = [], False
+        for m in msgs:
+            t, img = _message_text(m.get("content"))
+            texts.append(t)
+            image = image or img
+        if image:
+            return "big", "Bild in der Anfrage"
+        total = sum(len(t) for t in texts)
+        if total / 3.5 > self.fast_ctx * 0.6:
+            return "big", "langer Kontext"
+        max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or 0
+        if isinstance(max_tokens, int) and max_tokens > 1024:
+            return "big", "lange Antwort verlangt"
+        if (body.get("response_format") or {}).get("type") == "json_schema":
+            return "big", "strukturierte Ausgabe"
+        users = [t for m, t in zip(msgs, texts) if m.get("role") == "user"]
+        last = users[-1] if users else (texts[-1] if texts else "")
+        if len(users) > 8:
+            return "big", "langes Gespräch"
+        if len(last) > 600:
+            return "big", "lange Anfrage"
+        if HARD_WORDS.search(last):
+            return "big", "anspruchsvolle Aufgabe"
+        return "fast", "kurz und einfach"
+
+    def ask_fast_model(self, body: dict, reason: str) -> tuple[str, str]:
+        """Lets the fast model judge the request (one token, a few ms)."""
+        import urllib.request
+
+        msgs = body.get("messages") or [{"role": "user", "content": body.get("prompt", "")}]
+        users = [_message_text(m.get("content"))[0] for m in msgs if m.get("role", "user") == "user"]
+        q = (users[-1] if users else "")[:1500]
+        req = {"messages": [{"role": "system", "content": ROUTER_PROMPT}, {"role": "user", "content": q}],
+               "max_tokens": 1, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}
+        try:
+            r = urllib.request.Request(self.fast.base + "/v1/chat/completions", data=json.dumps(req).encode(),
+                                       headers={"Content-Type": "application/json",
+                                                **({"Authorization": f"Bearer {self.fast.key}"} if self.fast.key else {})})
+            with urllib.request.urlopen(r, timeout=3) as resp:
+                ans = json.loads(resp.read())["choices"][0]["message"].get("content", "").strip().upper()
+        except (OSError, ValueError, KeyError, IndexError):
+            return "fast", reason + " (Modell nicht befragt)"
+        if ans.startswith("S"):
+            return "big", "Modell: schwer"
+        if ans.startswith("E"):
+            return "fast", "Modell: einfach"
+        return "fast", reason
+
+    def record(self, backend: Backend, reason: str, chars: int, stream: bool) -> None:
+        with self.lock:
+            self.counts[backend.name] += 1
+            self.recent.append({"t": int(time.time()), "route": backend.name, "reason": reason,
+                                "chars": chars, "stream": stream})
+            del self.recent[:-50]
+
+    # HTTP --------------------------------------------------------------------
+
+    def handler(self):
+        from http.server import BaseHTTPRequestHandler
+        import http.client
+        from urllib.parse import urlsplit
+
+        router = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _auth(self) -> bool:
+                if not router.key or self.path.startswith("/health"):
+                    return True
+                got = self.headers.get("Authorization", "")
+                return secrets.compare_digest(got.encode(), f"Bearer {router.key}".encode())
+
+            def _json(self, code: int, obj: dict) -> None:
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if not self._auth():
+                    return self._json(401, {"error": {"message": "Invalid API Key", "type": "authentication_error"}})
+                path = self.path.split("?", 1)[0]
+                if path in ("/v1/models", "/models"):
+                    now = int(time.time())
+                    data = [{"id": router.public_name, "object": "model", "owned_by": "privatelm", "created": now},
+                            {"id": "fast", "object": "model", "owned_by": "privatelm", "created": now,
+                             "meta": {"model": router.fast.label}},
+                            {"id": "big", "object": "model", "owned_by": "privatelm", "created": now,
+                             "meta": {"model": router.big.label}}]
+                    return self._json(200, {"object": "list", "data": data})
+                if path == "/health":
+                    ok = router.big.healthy or router.fast.healthy
+                    return self._json(200 if ok else 503, {"status": "ok" if ok else "loading"})
+                self._forward(router.big, "GET", None, "")
+
+            def do_POST(self):
+                if not self._auth():
+                    return self._json(401, {"error": {"message": "Invalid API Key", "type": "authentication_error"}})
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n) if n else b""
+                path = self.path.split("?", 1)[0]
+                body = {}
+                try:
+                    body = json.loads(raw) if raw else {}
+                except ValueError:
+                    pass
+                if path.rstrip("/") in ("/v1/chat/completions", "/chat/completions", "/v1/completions",
+                                        "/completions", "/completion") and isinstance(body, dict):
+                    backend, reason = router.decide(body, self.headers)
+                    chars = len(json.dumps(body.get("messages") or body.get("prompt") or ""))
+                    router.record(backend, reason, chars, bool(body.get("stream")))
+                else:
+                    backend, reason = router.big, "keine Chat-Anfrage"
+                self._forward(backend, "POST", raw, reason)
+
+            def _forward(self, backend: Backend, method: str, raw: Optional[bytes], reason: str) -> None:
+                u = urlsplit(backend.base)
+                conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+                conn = conn_cls(u.hostname, u.port or (443 if u.scheme == "https" else 80), timeout=900)
+                headers = {"Content-Type": self.headers.get("Content-Type", "application/json"),
+                           "Accept": self.headers.get("Accept", "*/*")}
+                if backend.key:
+                    headers["Authorization"] = f"Bearer {backend.key}"
+                path = (u.path.rstrip("/") + self.path) if u.path not in ("", "/") else self.path
+                try:
+                    conn.request(method, path, body=raw, headers=headers)
+                    resp = conn.getresponse()
+                except OSError as e:
+                    return self._json(502, {"error": {"message": f"{backend.name} model unreachable: {e}"}})
+                try:
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
+                    self.send_header("X-PrivateLM-Route", backend.name)
+                    self.send_header("X-PrivateLM-Reason", reason.encode("ascii", "replace").decode())
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    while True:
+                        chunk = resp.read1(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                        self.wfile.flush()
+                    self.wfile.write(b"0\r\n\r\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # client went away; closing the backend stops its generation
+                finally:
+                    conn.close()
+
+        return H
+
+    def start(self, host: str, port: int) -> bool:
+        import threading
+
+        threading.Thread(target=self.watch_health, daemon=True).start()
+        return _start_http(host, port, self.handler()) is not None
+
+
+def _router_initial(arg: str, has_fast: bool) -> tuple[bool, str]:
+    saved = {}
+    try:
+        saved = json.loads(ROUTER_STATE.read_text())
+    except (OSError, ValueError):
+        pass
+    mode = saved.get("mode", "heuristic")
+    if arg == "on":
+        return True, mode
+    if arg == "off":
+        return False, mode
+    return bool(saved.get("enabled", has_fast)), mode
+
+
+def plan_fast(args, devices: list[Device]) -> tuple[list[str], dict, dict]:
+    """Where the fast model runs: --fast-device, or the local GPU it fits on
+    best (smallest that fits), or the CPU. Returns the llama-server command,
+    the VRAM to keep free on that GPU for the big model's planning, and info."""
+    model = str(Path(args.fast_model).expanduser().resolve())
+    if not Path(model).is_file():
+        die(f"No such model: {model}")
+    m = gguf_info(model, args.fast_ctx)
+    need = m.size_mb + m.kv_layer_mb * m.n_layer + GPU_RESERVE_MB + m.n_vocab * 4 * 512 / 2**20
+    gpus = usable_gpus(devices)
+    dev: Optional[Device] = None
+    if args.fast_device:
+        if args.fast_device.upper() != "CPU":
+            dev = next((d for d in devices if d.name == args.fast_device), None)
+            if dev is None:
+                die(f"--fast-device {args.fast_device}: no such device ({', '.join(d.name for d in devices)})")
+    else:
+        fits = [d for d in gpus if d.free_mb * GPU_SHARE >= need]
+        dev = min(fits, key=lambda d: d.free_mb) if fits else None
+        if dev is None:
+            log(f"Fast model ({need/1024:.1f} GB with cache) fits on no GPU here: it runs on the CPU.")
+    port = args.port + 2
+    cmd = [find_bin("llama-server"), "-m", model, "-c", str(args.fast_ctx), "--fit", "off",
+           "--host", "127.0.0.1", "--port", str(port), "--metrics"]
+    cmd += ["-ngl", "999", "--device", dev.name] if dev else ["-ngl", "0", "--device", "none"]
+    reserve = {dev.name: need} if dev else {}
+    info = {"model": Path(model).stem, "device": f"{dev.name} {dev.description}" if dev else "CPU",
+            "size_gb": round(m.size_mb / 1024, 1), "ctx": args.fast_ctx, "port": port,
+            "need_gb": round(need / 1024, 1)}
+    return cmd, reserve, info
 
 
 def main() -> None:
@@ -1750,6 +2193,16 @@ def main() -> None:
                    help="MTP draft depth (models with MTP layers; find the best with tune-mtp)")
     s.add_argument("--ram-limit", type=float,
                    help="GB of this PC's RAM the model may use (layers that don't fit go to workers)")
+    s.add_argument("--fast-model", help="router: small model for simple requests (runs on one device here)")
+    s.add_argument("--fast-url", help="router: use an existing OpenAI-compatible server as the fast model")
+    s.add_argument("--fast-key", help="API key for --fast-url")
+    s.add_argument("--fast-device", help="device for --fast-model, e.g. CUDA0 or CPU (default: best fit)")
+    s.add_argument("--fast-ctx", type=int, default=8192, help="context of the fast model (default 8192)")
+    s.add_argument("--router", choices=["auto", "on", "off"], default="auto",
+                   help="route requests between the models (auto: last setting from the dashboard, else on)")
+    s.add_argument("--router-mode", choices=["heuristic", "model"],
+                   help="heuristic: rules on the request; model: the fast model judges (default: last setting)")
+    s.add_argument("--model-name", default="privatelm", help="model name clients see with the router")
     s.add_argument("--dashboard-port", type=int, default=DASHBOARD_PORT,
                    help=f"web dashboard (default {DASHBOARD_PORT}; same API key as the server)")
     s.add_argument("--no-dashboard", action="store_true")
@@ -1766,6 +2219,8 @@ def main() -> None:
     b.add_argument("--temp", type=float, default=0.7, help="the temperature you actually use (default 0.7)")
     b.add_argument("--context", type=int, default=0, help="fill the prompt with ~N tokens first")
     b.add_argument("--runs", type=int, default=1)
+    b.add_argument("--route", choices=["big", "fast", "auto"], default="big",
+                   help="with the router: which model to measure (default big)")
     b.add_argument("--iface", help="count only these interfaces, e.g. eth0 (default: all but lo)")
     b.set_defaults(fn=cmd_bench)
 
