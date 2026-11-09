@@ -25,7 +25,7 @@ class ClusterWorker {
   /// GPU backend(s) of a PC worker, e.g. "CUDA" or "Vulkan".
   final String? backend;
 
-  /// RPC protocol the worker speaks ("rpc7"), if it said.
+  /// RPC protocol the worker speaks ("rpc9"), if it said.
   final String? version;
 
   const ClusterWorker({
@@ -181,7 +181,7 @@ class LlamaCluster {
 
   /// The llama.cpp RPC protocol this build speaks. PC nodes (linux-node/)
   /// must be built from the same llama.cpp commit.
-  static const rpcVersion = 'rpc7';
+  static const rpcVersion = 'rpc9';
 
   /// Starts serving this phone's CPU to a master, in a foreground service
   /// that keeps running in the background.

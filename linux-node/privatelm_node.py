@@ -11,7 +11,7 @@
 Workers advertise themselves exactly like worker phones do
 (_privatelm._tcp, TXT ram/bw/model/id/v), so the app's "Scan nearby" finds a
 PC like any other phone. Phones and PC must run the same llama.cpp RPC
-protocol (rpc7); build.sh builds the commit the app vendors.
+protocol (rpc9); build.sh builds the commit the app vendors.
 
 The RPC protocol has no authentication: run workers only on a network you
 trust (home LAN, or a VPN such as NetBird/WireGuard with --host set to the
@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-RPC_VERSION = "rpc7"
+RPC_VERSION = "rpc9"
 WORKER_TYPE = "_privatelm._tcp.local."
 SERVER_TYPE = "_privatelm-api._tcp.local."
 HOST_TYPE = "_privatelm-host._tcp.local."  # PCs that load whole models for a master's router
@@ -805,6 +805,57 @@ class MoePlan:
     counts: list[int]  # layers per local GPU, registry order
     n_cpu_moe: int  # experts of the first N layers stay in RAM
     time_s: float
+    cache_mb: int = 0  # >0: all experts in RAM (-cmoe), this much GPU memory caches the most used
+    cpu_share: float = 0.0  # share of cache misses the CPU computes instead of uploading
+    hit_est: float = 0.0
+
+
+# MoE expert cache (llama.cpp b12191+): with the experts in RAM, the GPU keeps
+# the most used ones (LRFU-like) and the CPU computes a share of the misses
+# instead of uploading them. Usage is skewed, so a cache holding a fraction f
+# of all experts serves more than f of the reads; sqrt(f) is a cautious guess
+# (the PR measured 72-89 % hits). privatelm-node tune-moe measures it.
+MOE_CACHE_MARGIN_MB = 256  # per GPU, for compute buffers that grow with the cache
+MOE_CACHE_MIN_MB = 512
+MOE_CPU_SHARE = 0.5  # default until tune-moe measured this PC (mmap'd experts: the CPU often reads faster)
+MOE_TUNE_STATE = CONFIG_DIR / "moe-tune.json"
+
+
+def moe_tuned(model: str) -> dict:
+    try:
+        return json.loads(MOE_TUNE_STATE.read_text()).get(str(Path(model).resolve()), {})
+    except (OSError, ValueError):
+        return {}
+
+
+def moe_cache_plan(m: ModelInfo, gpus: list[Device], budgets: list[float], host_budget: float,
+                   host_speed: float, cpu_share: float, max_mb: Optional[int] = None) -> Optional[MoePlan]:
+    """All experts in RAM, attention/shared weights/KV on the GPU(s), the
+    GPU memory left over as expert cache."""
+    dense = m.layer_mb - m.expert_mb + m.kv_layer_mb
+    counts = [0] * len(gpus)
+    used = [0.0] * len(gpus)
+    g = 0
+    for _ in range(m.n_layer):
+        while g < len(gpus) and used[g] + dense > budgets[g]:
+            g += 1
+        if g == len(gpus):
+            return None
+        used[g] += dense
+        counts[g] += 1
+    if m.n_layer * m.expert_mb + m.embd_mb > host_budget:
+        return None
+    cache = int(sum(max(0.0, b - u - MOE_CACHE_MARGIN_MB) for b, u in zip(budgets, used)))
+    if max_mb is not None:
+        cache = min(cache, max_mb)
+    if cache < MOE_CACHE_MIN_MB:
+        return None
+    hit = min(1.0, (cache / max(1.0, m.n_layer * m.expert_mb)) ** 0.5)
+    active = m.expert_mb * max(1, m.n_expert_used) / m.n_expert
+    sp = min((d.bandwidth or 100.0) for d, c in zip(gpus, counts) if c)
+    t = m.n_layer * ((m.layer_mb - m.expert_mb) / 1024 / sp + active / 1024 * (hit / sp + (1 - hit) / host_speed))
+    t += m.output_mb / 1024 / (gpus[-1].bandwidth or 100.0)
+    return MoePlan(counts, 0, t, cache_mb=cache, cpu_share=cpu_share, hit_est=hit)
 
 
 def moe_local_plan(m: ModelInfo, gpus: list[Device], budgets: list[float], host_budget: float,
@@ -946,6 +997,17 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     if m.is_moe and out_gpu is not None and out_gpu is local_gpus[-1] and args.workers in ("auto", "off"):
         # experts not on the GPU live in RAM: the RAM budget is for them
         moe = moe_local_plan(m, local_gpus, budgets, host_budget, host_speed)
+        mode = str(getattr(args, "moe_cache", "auto") or "auto").lower()
+        if moe and moe.n_cpu_moe and mode != "off":
+            # Some experts have to live in RAM anyway: a cache over all of them
+            # beats a fixed split, since usage is skewed (llama.cpp PR #30112, #30966).
+            tuned = moe_tuned(model)
+            share = getattr(args, "moe_cpu_share", None)
+            share = tuned.get("share", MOE_CPU_SHARE) if share is None else share
+            cap = int(mode) if mode.isdigit() else tuned.get("mib")
+            cached = moe_cache_plan(m, local_gpus, budgets, host_budget, host_speed, share, cap)
+            if cached:
+                moe = cached
 
     workers = _find_workers(args) if not (moe and args.workers == "off") else []
     remote = _remote_units(workers, per_layer)
@@ -1108,7 +1170,11 @@ def _moe_command(args, model: str, m: ModelInfo, gpus: list[Device], moe: MoePla
     for d, c in zip(gpus, moe.counts):
         if c:
             say(f"  {d.name} {d.description:<36} {c:>3} layers ({d.bandwidth:.0f} GB/s)")
-    if moe.n_cpu_moe:
+    if moe.cache_mb:
+        say(f"  All experts in RAM ({m.n_layer * m.expert_mb / 1024:.1f} GB); GPU expert cache "
+            f"{moe.cache_mb / 1024:.1f} GB (est. {moe.hit_est * 100:.0f} % hits), CPU computes "
+            f"{moe.cpu_share:g} of the misses")
+    elif moe.n_cpu_moe:
         say(f"  Experts of the first {moe.n_cpu_moe} layers: this PC's RAM "
             f"({moe.n_cpu_moe * m.expert_mb / 1024:.1f} GB)")
     say(f"  Output head: {gpus[-1].name}")
@@ -1118,13 +1184,18 @@ def _moe_command(args, model: str, m: ModelInfo, gpus: list[Device], moe: MoePla
                 for d, c in zip(gpus, moe.counts) if c]
     info = _plan_info(args, model, m, "moe", 1 / moe.time_s, 0, 0, segments, [],
                       {"machine": "master", "label": gpus[-1].name}, moe.n_cpu_moe)
+    if moe.cache_mb:
+        info["moe_cache"] = {"mib": moe.cache_mb, "cpu_share": moe.cpu_share, "hit_est": round(moe.hit_est, 2),
+                             "tuned": bool(moe_tuned(model))}
     counts = list(moe.counts)
     counts[-1] += 1  # output slot on the last GPU
     cmd = [find_bin("llama-server"), "-m", model, "-c", str(args.ctx), "--fit", "off",
            "-ngl", str(m.n_layer + 1)]
     if len(gpus) > 1:
         cmd += ["--tensor-split", ",".join(str(c) for c in counts)]
-    if moe.n_cpu_moe:
+    if moe.cache_mb:
+        cmd += ["--cpu-moe", "--moe-cache-mib", str(moe.cache_mb), "--moe-cache-cpu-share", f"{moe.cpu_share:g}"]
+    elif moe.n_cpu_moe:
         cmd += ["--n-cpu-moe", str(moe.n_cpu_moe)]
     return _finish_command(args, cmd, model, 1 / moe.time_s, info)
 
@@ -1240,6 +1311,51 @@ def cmd_serve(args) -> None:
         log("Rebalancing on: new or lost workers lead to a new plan when the server is idle "
             "(--rebalance off or the dashboard switches it off)")
     sup.run([adv] if adv else [], [fast_proc] if fast_proc else [])
+
+
+def cmd_tune_moe(args) -> None:
+    """Runs llama.cpp's moe-cache-tune.py on the plan serve would use here:
+    it starts the server a few times at two cache sizes and three CPU shares,
+    fits this PC's upload and CPU speeds, and recommends both values. serve
+    uses them from then on (moe-tune.json)."""
+    script = find_bin("moe-cache-tune.py")
+    if not Path(script).is_file():
+        die("moe-cache-tune.py not found next to llama-server; run build.sh again")
+    args.host, args.no_advertise, args.workers = "127.0.0.1", True, "off"
+    args.moe_cache, args.moe_cpu_share = "auto", None
+    try:
+        sp = build_server(args)
+    except PlanTooBig as e:
+        die(str(e), PLAN_FAILED)
+    cmd, skip = [], 0
+    for i, a in enumerate(sp.cmd):  # the script sets cache, share, host and port itself
+        if skip:
+            skip -= 1
+            continue
+        if a in ("--moe-cache-mib", "--moe-cache-cpu-share", "--host", "--port", "--api-key"):
+            skip = 1
+            continue
+        cmd.append(a)
+    if "--cpu-moe" not in cmd:
+        die("This model doesn't need the MoE cache here: it fits on the GPU(s), or it isn't MoE.")
+    out = CONFIG_DIR / "moe-tune-runs"
+    out.mkdir(parents=True, exist_ok=True)
+    log("Tuning the MoE cache: the server starts 6 times, this takes a few minutes (mostly loading)...")
+    r = subprocess.run([sys.executable, script, "--out", str(out)] + (["--max-mib", str(args.max_mib)]
+                       if args.max_mib else []) + ["--"] + cmd, capture_output=True, text=True)
+    print(r.stdout[-4000:])
+    found = re.search(r"--moe-cache-mib (\d+) --moe-cache-cpu-share ([0-9.]+)", r.stdout)
+    if r.returncode != 0 or not found:
+        die("Tuning failed:\n" + r.stderr[-2000:])
+    mib, share = int(found.group(1)), float(found.group(2))
+    try:
+        data = json.loads(MOE_TUNE_STATE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    data[str(Path(args.model).expanduser().resolve())] = {"mib": mib, "share": share, "at": int(time.time())}
+    MOE_TUNE_STATE.write_text(json.dumps(data, indent=1))
+    print(f"\nSaved: cache {mib} MiB, CPU share {share:g}. serve uses them for this model from now on "
+          "(restart the service).")
 
 
 def cmd_tune_mtp(args) -> None:
@@ -4441,6 +4557,11 @@ def main() -> None:
     s.add_argument("--router-mode", choices=["heuristic", "model"],
                    help="heuristic: rules on the request; model: the fast model judges (default: last setting)")
     s.add_argument("--model-name", default="privatelm", help="model name clients see with the router")
+    s.add_argument("--moe-cache", default="auto",
+                   help="MoE models whose experts don't all fit on the GPU: auto (GPU memory left over caches "
+                        "the most used experts), MIB (at most this much), or off (fixed split, --n-cpu-moe)")
+    s.add_argument("--moe-cpu-share", type=float,
+                   help=f"share of expert-cache misses the CPU computes (default: from tune-moe, else {MOE_CPU_SHARE})")
     s.add_argument("--draft-model", default="off",
                    help="small model of the same family for speculative decoding: PATH, auto (find or "
                         "download one), or off (default)")
@@ -4477,6 +4598,15 @@ def main() -> None:
                    help="with the router: which model to measure (default big)")
     b.add_argument("--iface", help="count only these interfaces, e.g. eth0 (default: all but lo)")
     b.set_defaults(fn=cmd_bench)
+
+    tm = sub.add_parser("tune-moe", help="measure the best MoE expert cache and CPU share here (stop the server first)")
+    tm.add_argument("-m", "--model", required=True)
+    tm.add_argument("--ctx", type=int, default=8192)
+    tm.add_argument("--ram-limit", type=float)
+    tm.add_argument("--max-mib", type=int, help="largest cache to try (default: what fits)")
+    tm.add_argument("--port", type=int, default=18080)
+    tm.add_argument("--scan-timeout", type=float, default=1.0)
+    tm.set_defaults(fn=cmd_tune_moe, api_key="", extra=[], mtp=0)
 
     t = sub.add_parser("tune-mtp", help="find the best MTP depth at your temperature (stop the server first)")
     t.add_argument("-m", "--model", required=True)

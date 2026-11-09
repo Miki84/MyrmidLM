@@ -1,24 +1,22 @@
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index c24caad77..f1adc9f03 100644
+index ffa9118f7..8edbe12f9 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -2142,8 +2142,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
-         printf("Accepted client connection\n");
-         fflush(stdout);
+@@ -3021,7 +3021,8 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+         }
+         LOG_INFO("Accepted client connection\n");
          rpc_serve_client(backends, cache_dir, client_socket);
--        printf("Client connection closed\n");
--        fflush(stdout);
-+        // PrivateLM patch: through ggml's logger, which the app reads
-+        // (stdout goes nowhere on Android).
-+        GGML_LOG_INFO("RPC client disconnected\n");
+-        LOG_INFO("Client connection closed\n");
++        // PrivateLM patch: the app looks for this line in ggml's log.
++        LOG_INFO("RPC client disconnected\n");
      }
      rpc_transport_shutdown();
      for (auto backend : backends) {
 diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
-index 5ec15dc80..0d8cf9be7 100644
+index c7d9f5321..35a4535b0 100644
 --- a/ggml/src/ggml-rpc/transport.cpp
 +++ b/ggml/src/ggml-rpc/transport.cpp
-@@ -642,7 +642,20 @@ static bool set_reuse_addr(sockfd_t sockfd) {
+@@ -724,7 +724,20 @@ static bool set_reuse_addr(sockfd_t sockfd) {
  }
  
  socket_ptr socket_t::accept() {
@@ -39,8 +37,8 @@ index 5ec15dc80..0d8cf9be7 100644
      if (!is_valid_fd(client_socket_fd)) {
          return nullptr;
      }
-@@ -650,6 +663,12 @@ socket_ptr socket_t::accept() {
-         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+@@ -732,6 +745,12 @@ socket_ptr socket_t::accept() {
+         LOG_ERROR("Failed to set TCP_NODELAY\n");
          return nullptr;
      }
 +#if defined(__APPLE__) && defined(SO_NET_SERVICE_TYPE)
@@ -49,6 +47,6 @@ index 5ec15dc80..0d8cf9be7 100644
 +    int service = NET_SERVICE_TYPE_VO;
 +    setsockopt(client_socket_fd, SOL_SOCKET, SO_NET_SERVICE_TYPE, &service, sizeof(service));
 +#endif
+     LOG_DBG("[%s] accepted client connection\n", __func__);
      return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
  }
- 

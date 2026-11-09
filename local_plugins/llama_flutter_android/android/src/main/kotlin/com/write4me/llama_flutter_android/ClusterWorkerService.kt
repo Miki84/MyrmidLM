@@ -179,7 +179,7 @@ class ClusterWorkerService : Service() {
             setAttribute("ram", ramMb.toString())
             setAttribute("bw", "%.1f".format(java.util.Locale.US, bandwidth))
             setAttribute("model", Build.MODEL)
-            setAttribute("v", "rpc7")
+            setAttribute("v", "rpc9")
             setAttribute("id", workerId(this@ClusterWorkerService))
         }
         val listener = object : NsdManager.RegistrationListener {

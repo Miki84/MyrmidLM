@@ -405,6 +405,7 @@ function renderLive(s) {
     [nf(met.tokens_predicted_total || 0, 0), "Tokens erzeugt"],
     [p.hops ? `${p.hops}` : "keine", p.hops === 1 ? "Netzwerk-Übergang pro Token" : "Netzwerk-Übergänge pro Token"],
   ];
+  if (p.moe_cache) facts.push([gb(p.moe_cache.mib), `Experten-Cache auf der GPU (${p.moe_cache.tuned ? "gemessen" : `geschätzt ${nf(p.moe_cache.hit_est * 100, 0)} % Treffer`}, CPU rechnet ${nf(p.moe_cache.cpu_share * 100, 0)} % der Fehlgriffe)`]);
   if (p.draft) facts.push([p.draft.model, `Entwurfsmodell (${p.draft.device}, bis ${p.draft.n_max} Tokens voraus)`]);
   $("facts").innerHTML = facts.map(([v, k]) => `<div class="fact"><div class="v num">${esc(v)}</div><div class="k">${esc(k)}</div></div>`).join("");
 }

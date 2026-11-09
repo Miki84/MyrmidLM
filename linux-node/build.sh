@@ -154,6 +154,8 @@ cmake --build "$BUILD" -j "$JOBS" --target ggml-rpc-server llama-server privatel
 # Architectures this llama.cpp knows, for 'privatelm-node models'.
 grep -oE '\{ LLM_ARCH_[A-Z0-9_]+, *"[^"]+"' "$SRC/src/llama-arch.cpp" | sed -E 's/.*"([^"]+)"/\1/' \
     | sort -u > "$BUILD/bin/supported-archs.txt"
+# llama.cpp's MoE cache tuner, for 'privatelm-node tune-moe'.
+cp "$SRC/scripts/moe-cache-tune.py" "$BUILD/bin/" && chmod 755 "$BUILD/bin/moe-cache-tune.py"
 echo "==> Built in $BUILD/bin"
 "$BUILD/bin/privatelm-probe" --no-bench || true
 
@@ -163,7 +165,7 @@ if [[ -n "$INSTALL_DIR" ]]; then
     # into a busy binary fails with "Text file busy", into a loaded .so
     # crashes the process); the installer restarts the services afterwards.
     cp -a --remove-destination "$BUILD"/bin/*.so* "$BUILD"/bin/ggml-rpc-server "$BUILD"/bin/llama-server \
-          "$BUILD"/bin/privatelm-probe "$INSTALL_DIR/bin/"
+          "$BUILD"/bin/privatelm-probe "$BUILD"/bin/moe-cache-tune.py "$INSTALL_DIR/bin/"
     install -m 755 "$HERE/privatelm_node.py" "$INSTALL_DIR/bin/privatelm-node"
     install -m 644 "$HERE/dashboard.html" "$INSTALL_DIR/bin/dashboard.html"
     install -m 644 "$BUILD/bin/supported-archs.txt" "$INSTALL_DIR/bin/supported-archs.txt"
