@@ -49,9 +49,15 @@ gpu_vendors() {
 }
 
 need_vulkan_dev() {
-    if ! have glslc || ! { pkg-config --exists vulkan 2>/dev/null || [[ -f /usr/include/vulkan/vulkan.h ]]; }; then
-        echo "Vulkan backend needs: sudo apt install libvulkan-dev glslc mesa-vulkan-drivers" >&2
-        echo "(Fedora: vulkan-loader-devel glslc mesa-vulkan-drivers)" >&2
+    local spirv=""
+    for d in /usr/share/cmake/SPIRV-Headers /usr/lib/cmake/SPIRV-Headers /usr/lib/x86_64-linux-gnu/cmake/SPIRV-Headers \
+             /usr/lib64/cmake/SPIRV-Headers /usr/local/share/cmake/SPIRV-Headers; do
+        [[ -f "$d/SPIRV-HeadersConfig.cmake" ]] && spirv="$d"
+    done
+    if ! have glslc || [[ -z "$spirv" ]] || ! { pkg-config --exists vulkan 2>/dev/null || [[ -f /usr/include/vulkan/vulkan.h ]]; }; then
+        echo "Vulkan backend needs: sudo apt install libvulkan-dev glslc spirv-headers mesa-vulkan-drivers" >&2
+        echo "(Fedora: vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers;" >&2
+        echo " Arch: vulkan-icd-loader vulkan-headers shaderc spirv-headers)" >&2
         exit 1
     fi
 }

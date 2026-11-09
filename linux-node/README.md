@@ -17,9 +17,9 @@ Voraussetzungen: `cmake`, `g++`, `git`, Python 3.9+, plus das Toolkit der jeweil
 | GPU | Pakete (Debian/Ubuntu) | Build |
 |---|---|---|
 | NVIDIA | CUDA Toolkit (`nvcc`) | `./build.sh --backends cuda` |
-| AMD (alle, auch ältere 4-GB-Karten wie RX 470/570/580) | `libvulkan-dev glslc mesa-vulkan-drivers` | `./build.sh --backends vulkan` |
+| AMD (alle, auch ältere 4-GB-Karten wie RX 470/570/580) | `libvulkan-dev glslc spirv-headers mesa-vulkan-drivers` | `./build.sh --backends vulkan` |
 | AMD, neuere Karten (RDNA2/3, Vega) | ROCm (`hipcc`, `rocminfo`) | `./build.sh --backends rocm` |
-| Intel (Arc, iGPU) | `libvulkan-dev glslc mesa-vulkan-drivers` | `./build.sh --backends vulkan` (oder `sycl` mit oneAPI) |
+| Intel (Arc, iGPU) | `libvulkan-dev glslc spirv-headers mesa-vulkan-drivers` | `./build.sh --backends vulkan` (oder `sycl` mit oneAPI) |
 | NVIDIA + AMD im selben PC | CUDA + Vulkan-Pakete | `./build.sh --backends cuda,vulkan` |
 | ohne GPU | – | `./build.sh --backends cpu` |
 
