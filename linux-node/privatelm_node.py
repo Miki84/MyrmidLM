@@ -53,7 +53,7 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / 
 GPU_SHARE = 0.95  # of free VRAM; GPU_RESERVE_MB comes off on top
 PHONE_SHARE = 0.75
 PC_RAM_SHARE = 0.9  # of what a PC RAM worker offers (already minus its reserve)
-HOST_SHARE = 0.8
+HOST_SHARE = 0.9
 UNKNOWN_PHONE_SPEED = 4.0  # GB/s, as in the app
 
 
@@ -466,7 +466,7 @@ def gguf_info(path: str, ctx: int) -> ModelInfo:
 
 GPU_RESERVE_MB = 400  # compute buffers per GPU, beyond weights and KV
 MTP_RESERVE_MB = 1300  # MTP: second context and draft buffers, on the output device
-HOST_RESERVE_MB = 1024
+HOST_RESERVE_MB = 768
 NET_MBPS_PC = 110.0  # 1 Gbit/s Ethernet
 NET_MBPS_PHONE = 25.0  # Wi-Fi
 HOP_OVERHEAD_S = 0.002  # per worker per token: graph upload, sync (conservative)
@@ -666,6 +666,11 @@ def cmd_worker(args) -> None:
         else:
             ram_port = args.ram_port or args.port + 1
             offered = _offered_ram(args)
+            # An integrated GPU lends the same RAM: offer only what's left.
+            offered -= sum(d.free_mb for d in chosen if d.type == "igpu")
+        if gpu and cpu is not None and offered < 1024:
+            log("--ram: the integrated GPU already lends this PC's RAM; no separate RAM worker")
+        elif gpu and cpu is not None:
             log(f"Offering {offered} MB RAM at {cpu.bandwidth:.1f} GB/s on {address}:{ram_port}")
             procs.append(_rpc_server(args, ram_port, ["CPU"]))
             rpc_info.append({"port": ram_port, "kind": "cpu", "offered_mb": offered, "bw": cpu.bandwidth,
@@ -837,7 +842,7 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
         die("This model has no MTP layers (nextn_predict_layers = 0). Use a model with MTP, "
             "or leave out --mtp.")
     per_layer = m.per_layer_mb()
-    logits_mb = m.n_vocab * 4 * 512 / 2**20  # output buffer for a 512-token batch
+    logits_mb = m.n_vocab * 4 * 8 / 2**20  # scores for the last tokens of a batch only
     out_extra = m.output_mb + logits_mb + (MTP_RESERVE_MB if args.mtp else 0)
 
     devices = probe(bench=True)
@@ -858,13 +863,19 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
             break
     budgets = [d.free_mb * GPU_SHARE - GPU_RESERVE_MB - (out_extra if d is out_gpu else 0)
                for d in local_gpus]
+    host_budget = host_available_mb() * HOST_SHARE - HOST_RESERVE_MB
+    if args.ram_limit is not None:
+        host_budget = min(host_budget, args.ram_limit * 1024)
+    # An integrated GPU has no memory of its own: what it reports as free is
+    # the same RAM the CPU uses. Whatever it gets comes off the RAM budget.
+    for i, d in enumerate(local_gpus):
+        if d.type == "igpu":
+            budgets[i] = max(0.0, min(budgets[i], host_budget))
+            host_budget -= budgets[i]
     gpus = [Unit(f"{d.name} {d.description}", max(0, int(b // per_layer)), d.bandwidth or 100.0,
                  [d.name], device_caps=[max(0, int(b // per_layer))],
                  min_layers=m.n_nextn if (args.mtp and d is out_gpu) else 0)
             for d, b in zip(local_gpus, budgets)]
-    host_budget = host_available_mb() * HOST_SHARE - HOST_RESERVE_MB
-    if args.ram_limit is not None:
-        host_budget = min(host_budget, args.ram_limit * 1024)
     host_room = host_budget - m.embd_mb - (0 if out_gpu else out_extra)
     host = Unit("This PC (RAM)", max(0, int(host_room // per_layer)), host_speed, [])
 
@@ -2131,7 +2142,7 @@ def plan_fast(args, devices: list[Device]) -> tuple[list[str], dict, dict]:
     if not Path(model).is_file():
         die(f"No such model: {model}")
     m = gguf_info(model, args.fast_ctx)
-    need = m.size_mb + m.kv_layer_mb * m.n_layer + GPU_RESERVE_MB + m.n_vocab * 4 * 512 / 2**20
+    need = m.size_mb + m.kv_layer_mb * m.n_layer + GPU_RESERVE_MB
     gpus = usable_gpus(devices)
     dev: Optional[Device] = None
     if args.fast_device:
@@ -2153,6 +2164,286 @@ def plan_fast(args, devices: list[Device]) -> tuple[list[str], dict, dict]:
             "size_gb": round(m.size_mb / 1024, 1), "ctx": args.fast_ctx, "port": port,
             "need_gb": round(need / 1024, 1)}
     return cmd, reserve, info
+
+
+# ── Models ───────────────────────────────────────────────────────────────────
+#
+# privatelm-node models   GGUF files on this PC plus a small catalog, each
+#                         rated: fits here / needs workers / too big, and
+#                         whether this build knows its architecture.
+# privatelm-node download fetches a catalog model (or repo[:quant]) from
+#                         Hugging Face, resumable, checked by SHA-256.
+#
+# The catalog names repositories only; file names, sizes and architectures
+# are looked up at run time, so it doesn't go stale with renamed files.
+
+CATALOG = [
+    # key, Hugging Face repo, quantization, description
+    ("qwen3-1.7b", "bartowski/Qwen_Qwen3-1.7B-GGUF", "Q4_K_M", "sehr klein: Router, schwache Rechner"),
+    ("qwen3-4b", "bartowski/Qwen_Qwen3-4B-GGUF", "Q4_K_M", "klein: Alltag, Router"),
+    ("qwen3.5-9b", "unsloth/Qwen3.5-9B-GGUF", "Q4_K_M", "mittel"),
+    ("qwen3-14b", "bartowski/Qwen_Qwen3-14B-GGUF", "Q4_K_M", "mittel bis groß"),
+    ("qwen3.8-27b", "unsloth/Qwen3.8-27B-GGUF", "Q4_K_M", "groß, dicht: lohnt den Verbund"),
+    ("qwen3-32b", "bartowski/Qwen_Qwen3-32B-GGUF", "Q4_K_M", "groß, dicht: lohnt den Verbund"),
+    ("qwen3.6-35b-a3b", "unsloth/Qwen3.6-35B-A3B-GGUF", "UD-Q4_K_M", "MoE: schnell bei viel RAM im Master"),
+]
+MODEL_DIRS = ["~/models", "~/Models", "~/Downloads", "/srv/models", "/opt/models", "~/.cache/llama.cpp",
+              "~/.cache/huggingface/hub", "~/.lmstudio/models", "~/.cache/lm-studio/models"]
+SPLIT_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
+HF_BASE = os.environ.get("PRIVATELM_HF_BASE", "https://huggingface.co").rstrip("/")  # or a mirror
+
+
+def supported_archs() -> Optional[set]:
+    """Architectures this build's llama.cpp knows (written by build.sh)."""
+    for p in (BIN_DIR / "supported-archs.txt", BIN_DIR.parent / "build" / "bin" / "supported-archs.txt"):
+        if p.exists():
+            return {x.strip() for x in p.read_text().splitlines() if x.strip()}
+    return None
+
+
+def _gguf_arch(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return ""
+            _v, _n, n_kv = struct.unpack("<IQQ", f.read(20))
+            for _ in range(min(n_kv, 8)):
+                (kl,) = struct.unpack("<Q", f.read(8))
+                key = f.read(kl).decode("utf-8", "replace")
+                (t,) = struct.unpack("<I", f.read(4))
+                if t != 8:
+                    return ""
+                (vl,) = struct.unpack("<Q", f.read(8))
+                val = f.read(vl).decode("utf-8", "replace")
+                if key == "general.architecture":
+                    return val
+    except (OSError, struct.error):
+        pass
+    return ""
+
+
+def local_models() -> list[dict]:
+    seen, out = set(), []
+    for d in MODEL_DIRS:
+        root = Path(os.path.expanduser(d))
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, files in os.walk(root, followlinks=True):
+            if dirpath.count(os.sep) - str(root).count(os.sep) > 6:
+                dirnames[:] = []
+                continue
+            for fn in files:
+                if not fn.lower().endswith(".gguf") or "mmproj" in fn.lower():
+                    continue
+                m = SPLIT_RE.search(fn)
+                if m and m.group(1) != "00001":
+                    continue
+                p = Path(dirpath) / fn
+                try:
+                    real = p.resolve()
+                    size = real.stat().st_size
+                except OSError:
+                    continue
+                if size < 50 * 2**20 or real in seen:
+                    continue
+                seen.add(real)
+                if m:  # all parts together
+                    size = sum(q.stat().st_size for q in real.parent.glob(SPLIT_RE.sub("-*-of-" + m.group(2) + ".gguf", real.name)))
+                out.append({"source": "local", "name": p.stem, "path": str(real), "size_mb": size // 2**20,
+                            "arch": _gguf_arch(str(real))})
+    return sorted(out, key=lambda x: x["size_mb"])
+
+
+def hf_resolve(repo: str, quant: str) -> dict:
+    """The files of one quantization in a Hugging Face repo, with sizes,
+    SHA-256 and the GGUF architecture."""
+    import urllib.request
+
+    headers = {"User-Agent": "privatelm-node"}
+    if os.environ.get("HF_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
+    req = urllib.request.Request(f"{HF_BASE}/api/models/{repo}?blobs=true", headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read())
+    q = quant.lower()
+    files = []
+    for sib in data.get("siblings", []):
+        fn = sib.get("rfilename", "")
+        low = fn.lower()
+        if not low.endswith(".gguf") or "mmproj" in low:
+            continue
+        base = low.rsplit("/", 1)[-1]
+        if not (base.endswith(f"-{q}.gguf") or base.endswith(f".{q}.gguf") or f"-{q}-0000" in base
+                or f"/{q}/" in f"/{low}" or base == f"{q}.gguf"):
+            continue
+        lfs = sib.get("lfs") or {}
+        files.append({"file": fn, "size": sib.get("size") or lfs.get("size") or 0, "sha256": lfs.get("sha256")})
+    if not files:
+        raise ValueError(f"no {quant} GGUF in {repo}")
+    # One model: a single file, or the parts of one split file.
+    files.sort(key=lambda f: f["file"])
+    first = files[0]
+    m = SPLIT_RE.search(first["file"])
+    if m:
+        stem = SPLIT_RE.sub("", first["file"])
+        files = [f for f in files if SPLIT_RE.sub("", f["file"]) == stem]
+    else:
+        files = [first]
+    arch = (data.get("gguf") or {}).get("architecture", "")
+    return {"repo": repo, "quant": quant, "files": files, "size_mb": sum(f["size"] for f in files) // 2**20,
+            "arch": arch, "name": Path(first["file"]).stem.split("-00001-of-")[0]}
+
+
+def memory_budget(use_workers: bool) -> tuple[int, int]:
+    """MB a model may use on this PC, and on the workers found on the LAN."""
+    devices = probe(bench=False)
+    host = host_available_mb() * HOST_SHARE - HOST_RESERVE_MB
+    local = max(0.0, host)
+    for d in usable_gpus(devices):
+        if d.type == "gpu":
+            local += max(0.0, d.free_mb * GPU_SHARE - GPU_RESERVE_MB)
+    remote = 0.0
+    if use_workers:
+        me = machine_id()
+        for p in scan(3.0):
+            if p.kind == "worker" and p.txt.get("id", "").split("-ram")[0] != me and p.ram_mb:
+                share = GPU_SHARE if p.is_gpu else PC_RAM_SHARE if p.txt.get("kind") == "cpu" else PHONE_SHARE
+                remote += p.ram_mb * share
+    return int(local), int(remote)
+
+
+def _rate(size_mb: int, local: int, remote: int) -> str:
+    need = size_mb * 1.1 + 600  # + KV cache for ~8k tokens and buffers
+    if need <= local:
+        return "here"
+    if need <= local + remote:
+        return "workers"
+    return "too_big"
+
+
+def list_models(use_workers: bool = True, small_only: bool = False) -> dict:
+    local, remote = memory_budget(use_workers)
+    archs = supported_archs()
+    entries = []
+    for m in local_models():
+        entries.append(m)
+    for key, repo, quant, desc in CATALOG:
+        e = {"source": "catalog", "key": key, "repo": repo, "quant": quant, "desc": desc}
+        try:
+            r = hf_resolve(repo, quant)
+            e.update(name=r["name"], size_mb=r["size_mb"], arch=r["arch"])
+        except Exception as ex:  # noqa: BLE001 - offline, renamed repo: show it, don't fail
+            e.update(name=key, size_mb=0, arch="", error=str(ex)[:120])
+        entries.append(e)
+    for e in entries:
+        e["fit"] = _rate(e["size_mb"], local, remote) if e.get("size_mb") else "unknown"
+        e["arch_ok"] = None if not e.get("arch") or archs is None else e["arch"] in archs
+        if e["source"] == "catalog" and any(x["source"] == "local" and x["name"].lower() == e["name"].lower()
+                                              for x in entries):
+            e["have"] = True
+    if small_only:
+        entries = [e for e in entries if 0 < e.get("size_mb", 0) <= 5 * 1024]
+    usable = [e for e in entries if e.get("size_mb") and e["arch_ok"] is not False and not e.get("error")]
+    here = [e for e in usable if e["fit"] == "here"]
+    if small_only:
+        rec = min(here or usable, key=lambda e: e["size_mb"], default=None)
+    else:
+        rec = max(here, key=lambda e: e["size_mb"], default=None) or min(usable, key=lambda e: e["size_mb"], default=None)
+    return {"local_mb": local, "workers_mb": remote, "models": entries,
+            "recommended": entries.index(rec) if rec else None}
+
+
+def cmd_models(args) -> None:
+    res = list_models(not args.no_workers, args.small)
+    if args.json:
+        print(json.dumps(res))
+        return
+    fit = {"here": "passt auf diesen PC", "workers": "nur mit Workern", "too_big": "zu groß",
+           "unknown": "unbekannt"}
+    print(f"Platz für Modelle: {res['local_mb']/1024:.1f} GB auf diesem PC"
+          + (f", {res['workers_mb']/1024:.1f} GB auf Workern im Netz" if res['workers_mb'] else "") + "\n")
+    for i, e in enumerate(res["models"], 1):
+        size = f"{e['size_mb']/1024:5.1f} GB" if e.get("size_mb") else "    –   "
+        state = e.get("error") and "nicht abrufbar" or fit[e["fit"]]
+        if e.get("arch_ok") is False:
+            state = f"Architektur {e['arch']} braucht neuere llama.cpp"
+        where = e.get("path") or f"{e['repo']} ({e['quant']})"
+        mark = " *" if res["recommended"] == i - 1 else ""
+        print(f"{i:>2}. {e['name']:<34} {size}  {state:<26} {where}{mark}")
+    if res["recommended"] is not None:
+        print("\n* Empfehlung. Herunterladen mit: privatelm-node download <Name aus der Liste oder Nummer>")
+
+
+def cmd_download(args) -> None:
+    target = args.model
+    spec = None
+    for key, repo, quant, _d in CATALOG:
+        if target.lower() in (key, repo.lower()):
+            spec = (repo, quant)
+    if spec is None and target.isdigit():
+        res = list_models(False)
+        e = res["models"][int(target) - 1]
+        if e["source"] == "local":
+            print(e["path"])
+            return
+        spec = (e["repo"], e["quant"])
+    if spec is None:
+        repo, _, quant = target.partition(":")
+        if "/" not in repo:
+            die(f"Unknown model {target}: a catalog name (privatelm-node models), or user/repo[:QUANT]")
+        spec = (repo, quant or "Q4_K_M")
+    try:
+        r = hf_resolve(*spec)
+    except Exception as e:  # noqa: BLE001
+        die(f"Could not look up {spec[0]} ({spec[1]}) on Hugging Face: {e}")
+    archs = supported_archs()
+    if r["arch"] and archs is not None and r["arch"] not in archs and not args.force:
+        die(f"{r['name']} uses architecture {r['arch']}, which this llama.cpp build doesn't know. "
+            "Pick another model, or --force.")
+    out_dir = Path(args.dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for f in r["files"]:
+        dest = out_dir / Path(f["file"]).name
+        paths.append(dest)
+        if dest.exists() and (not f["size"] or dest.stat().st_size == f["size"]):
+            log(f"{dest.name} is already there")
+            continue
+        url = f"{HF_BASE}/{r['repo']}/resolve/main/{f['file']}"
+        part = dest.with_suffix(dest.suffix + ".part")
+        log(f"Downloading {dest.name} ({f['size']/2**30:.1f} GB) to {out_dir}")
+        if shutil.which("curl"):
+            cmd = ["curl", "-fL", "--retry", "5", "-C", "-", "-o", str(part), url]
+            if os.environ.get("HF_TOKEN"):
+                cmd[1:1] = ["-H", f"Authorization: Bearer {os.environ['HF_TOKEN']}"]
+            if subprocess.run(cmd).returncode != 0:
+                die(f"Download failed; run the same command again to resume ({part})")
+        else:
+            _download_urllib(url, part)
+        if f.get("sha256"):
+            log("Checking SHA-256...")
+            h = hashlib.sha256()
+            with open(part, "rb") as fh:
+                for chunk in iter(lambda: fh.read(8 << 20), b""):
+                    h.update(chunk)
+            if h.hexdigest() != f["sha256"]:
+                part.unlink(missing_ok=True)
+                die(f"{dest.name}: checksum mismatch, file deleted; please try again")
+        part.rename(dest)
+        dest.chmod(0o644)
+    print(paths[0])
+
+
+def _download_urllib(url: str, part: Path) -> None:
+    import urllib.request
+
+    have = part.stat().st_size if part.exists() else 0
+    headers = {"User-Agent": "privatelm-node", **({"Range": f"bytes={have}-"} if have else {})}
+    if os.environ.get("HF_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r, \
+            open(part, "ab" if have and r.status == 206 else "wb") as out:
+        shutil.copyfileobj(r, out, 8 << 20)
 
 
 def main() -> None:
@@ -2238,6 +2529,18 @@ def main() -> None:
     t.add_argument("--load-timeout", type=float, default=900)
     t.add_argument("--scan-timeout", type=float, default=4.0)
     t.set_defaults(fn=cmd_tune_mtp, api_key="", extra=[], mtp=0)
+
+    mo = sub.add_parser("models", help="models on this PC and to download, rated by fit")
+    mo.add_argument("--json", action="store_true")
+    mo.add_argument("--small", action="store_true", help="only models up to 5 GB (e.g. for the router)")
+    mo.add_argument("--no-workers", action="store_true", help="rate by this PC alone")
+    mo.set_defaults(fn=cmd_models)
+
+    dl = sub.add_parser("download", help="download a model (catalog name, number from 'models', or user/repo[:QUANT])")
+    dl.add_argument("model")
+    dl.add_argument("--dir", default="/srv/models" if os.access("/srv/models", os.W_OK) else "~/models")
+    dl.add_argument("--force", action="store_true", help="download even if the architecture looks unsupported")
+    dl.set_defaults(fn=cmd_download)
 
     sc = sub.add_parser("scan", help="list workers and servers on the LAN")
     sc.add_argument("--timeout", type=float, default=4.0)

@@ -32,6 +32,15 @@ sudo apt install python3-zeroconf          # mDNS (alternativ: avahi-utils)
 pip install qrcode                          # optional: QR-Code im Terminal
 ```
 
+## Modell wählen
+
+```bash
+privatelm-node models                  # vorhandene GGUF-Dateien und Katalog, bewertet nach Speicher
+privatelm-node download qwen3-4b       # Katalogname, Nummer aus der Liste oder user/repo[:QUANT]
+```
+
+`models` sucht GGUF-Dateien in den üblichen Ordnern (`~/models`, `~/Downloads`, `/srv/models`, Hugging-Face- und LM-Studio-Cache) und zeigt einen kleinen Katalog (Qwen3 1.7B bis 32B, Qwen3.5 9B, Qwen3.8 27B, Qwen3.6 35B-A3B). Jeder Eintrag wird bewertet: passt auf diesen PC, nur mit Workern, zu groß; dazu, ob diese llama.cpp-Version die Architektur kennt. Dateinamen, Größen und Architekturen kommen zur Laufzeit von Hugging Face. `download` setzt abgebrochene Downloads fort und prüft die SHA-256-Summe; `HF_TOKEN` für gesperrte Modelle, `PRIVATELM_HF_BASE` für einen Spiegel. Das Installationsskript nutzt beides für seine Auswahl (`--model auto` wählt ohne Rückfrage das größte passende Modell).
+
 ## Nutzung
 
 **PC als GPU-Worker für ein Handy:**

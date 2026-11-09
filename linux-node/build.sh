@@ -151,6 +151,9 @@ cmake -S "$HERE" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DLLAMA_CPP_DIR="$SRC" $
 echo "==> Building with $JOBS jobs (CUDA/ROCm builds take a while)"
 cmake --build "$BUILD" -j "$JOBS" --target ggml-rpc-server llama-server privatelm-probe
 
+# Architectures this llama.cpp knows, for 'privatelm-node models'.
+grep -oE '\{ LLM_ARCH_[A-Z0-9_]+, *"[^"]+"' "$SRC/src/llama-arch.cpp" | sed -E 's/.*"([^"]+)"/\1/' \
+    | sort -u > "$BUILD/bin/supported-archs.txt"
 echo "==> Built in $BUILD/bin"
 "$BUILD/bin/privatelm-probe" --no-bench || true
 
@@ -160,5 +163,6 @@ if [[ -n "$INSTALL_DIR" ]]; then
           "$BUILD"/bin/privatelm-probe "$INSTALL_DIR/bin/"
     install -m 755 "$HERE/privatelm_node.py" "$INSTALL_DIR/bin/privatelm-node"
     install -m 644 "$HERE/dashboard.html" "$INSTALL_DIR/bin/dashboard.html"
+    install -m 644 "$BUILD/bin/supported-archs.txt" "$INSTALL_DIR/bin/supported-archs.txt"
     echo "==> Installed to $INSTALL_DIR (run $INSTALL_DIR/bin/privatelm-node --help)"
 fi
