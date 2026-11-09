@@ -17,6 +17,8 @@ Environment=XDG_CONFIG_HOME=/var/lib/privatelm-node
 SupplementaryGroups=video render
 Restart=on-failure
 RestartSec=5
+# Exit 2 = the model doesn't fit: restarting won't help
+RestartPreventExitStatus=2
 
 [Install]
 WantedBy=multi-user.target

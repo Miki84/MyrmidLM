@@ -61,9 +61,16 @@ def log(msg: str) -> None:
     print(f"[privatelm-node] {msg}", file=sys.stderr, flush=True)
 
 
-def die(msg: str) -> "NoReturn":  # type: ignore[name-defined]
+PLAN_FAILED = 2  # the model doesn't fit: restarting won't help (systemd: RestartPreventExitStatus=2)
+
+
+class PlanTooBig(Exception):
+    pass
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
     log(msg)
-    sys.exit(1)
+    sys.exit(code)
 
 
 def find_bin(name: str) -> str:
@@ -831,6 +838,23 @@ class ServerPlan:
     info: dict = field(default_factory=dict)  # the plan, for the dashboard
 
 
+def build_server_fitting(args, quiet: bool = False) -> ServerPlan:
+    """build_server, halving the context (down to 2048) when the model
+    doesn't fit and no --ctx was given: the KV cache is often what's over."""
+    auto = args.ctx is None
+    if auto:
+        args.ctx = 8192
+    while True:
+        try:
+            return build_server(args, quiet)
+        except PlanTooBig as e:
+            if not auto or args.ctx <= 2048:
+                die(str(e) + ("" if auto else " (--ctx was set; leave it out to shrink it automatically)"),
+                    PLAN_FAILED)
+            log(f"Doesn't fit with -c {args.ctx}; trying -c {args.ctx // 2}.")
+            args.ctx //= 2
+
+
 def build_server(args, quiet: bool = False) -> ServerPlan:
     """Plans the split and returns the llama-server command."""
     say = (lambda *a, **k: None) if quiet else print
@@ -864,6 +888,7 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     budgets = [d.free_mb * GPU_SHARE - GPU_RESERVE_MB - (out_extra if d is out_gpu else 0)
                for d in local_gpus]
     host_budget = host_available_mb() * HOST_SHARE - HOST_RESERVE_MB
+    host_budget -= getattr(args, "reserve_mb", {}).get("__host__", 0)  # router's fast model in RAM
     if args.ram_limit is not None:
         host_budget = min(host_budget, args.ram_limit * 1024)
     # An integrated GPU has no memory of its own: what it reports as free is
@@ -902,9 +927,9 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
         return _moe_command(args, model, m, local_gpus, moe, say)
     if not used:
         total = sum(u.capacity_layers for u in gpus + remote + [host])
-        die(f"Model needs {m.n_layer} layers of ~{per_layer:.0f} MB (weights + KV cache at "
-            f"-c {args.ctx}); all devices together have room for {total}. "
-            "Add workers, lower --ctx, or use a smaller quantization.")
+        raise PlanTooBig(f"Model needs {m.n_layer} layers of ~{per_layer:.0f} MB (weights + KV cache at "
+                         f"-c {args.ctx}); all devices together have room for {total}. "
+                         "Add workers, lower --ctx, or use a smaller quantization.")
     dropped = [u for u in remote if not u.layers]
     if dropped and prune:
         log("Not using (slower with them than without): " + ", ".join(u.label for u in dropped)
@@ -1086,7 +1111,7 @@ def cmd_serve(args) -> None:
         # The big model listens locally; the router takes the public port.
         args.host, args.port = "127.0.0.1", public_port + 1
 
-    sp = build_server(args)
+    sp = build_server_fitting(args)
     big_base = f"http://127.0.0.1:{args.port}"
     log(" ".join(sp.cmd).replace(sp.key, "***") if sp.key else " ".join(sp.cmd))
     proc = subprocess.Popen(sp.cmd)
@@ -1151,7 +1176,10 @@ def cmd_tune_mtp(args) -> None:
     results = []
     for depth in depths:
         args.mtp = depth
-        sp = build_server(args, quiet=depth != depths[0])
+        try:
+            sp = build_server(args, quiet=depth != depths[0])
+        except PlanTooBig as e:
+            die(str(e), PLAN_FAILED)
         base = f"http://127.0.0.1:{args.port}"
         log(f"MTP depth {depth}: starting server...")
         proc = subprocess.Popen(sp.cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2160,6 +2188,8 @@ def plan_fast(args, devices: list[Device]) -> tuple[list[str], dict, dict]:
            "--host", "127.0.0.1", "--port", str(port), "--metrics"]
     cmd += ["-ngl", "999", "--device", dev.name] if dev else ["-ngl", "0", "--device", "none"]
     reserve = {dev.name: need} if dev else {}
+    if dev is None or dev.type == "igpu":
+        reserve["__host__"] = need  # on the CPU or an iGPU it lives in this PC's RAM
     info = {"model": Path(model).stem, "device": f"{dev.name} {dev.description}" if dev else "CPU",
             "size_gb": round(m.size_mb / 1024, 1), "ctx": args.fast_ctx, "port": port,
             "need_gb": round(need / 1024, 1)}
@@ -2478,7 +2508,8 @@ def main() -> None:
                    help="auto (workers only where they pay off), all (every worker with room), off, or host:port,...")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=DEFAULT_API_PORT)
-    s.add_argument("--ctx", type=int, default=8192)
+    s.add_argument("--ctx", type=int, default=None,
+                   help="context length (default 8192, shrunk automatically down to 2048 if it doesn't fit)")
     s.add_argument("--api-key", help="default: generated once, kept in ~/.config/privatelm-node")
     s.add_argument("--mtp", type=int, default=0,
                    help="MTP draft depth (models with MTP layers; find the best with tune-mtp)")
