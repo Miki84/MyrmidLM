@@ -159,7 +159,10 @@ echo "==> Built in $BUILD/bin"
 
 if [[ -n "$INSTALL_DIR" ]]; then
     mkdir -p "$INSTALL_DIR/bin"
-    cp -a "$BUILD"/bin/*.so* "$BUILD"/bin/ggml-rpc-server "$BUILD"/bin/llama-server \
+    # --remove-destination: a running service keeps its old files (writing
+    # into a busy binary fails with "Text file busy", into a loaded .so
+    # crashes the process); the installer restarts the services afterwards.
+    cp -a --remove-destination "$BUILD"/bin/*.so* "$BUILD"/bin/ggml-rpc-server "$BUILD"/bin/llama-server \
           "$BUILD"/bin/privatelm-probe "$INSTALL_DIR/bin/"
     install -m 755 "$HERE/privatelm_node.py" "$INSTALL_DIR/bin/privatelm-node"
     install -m 644 "$HERE/dashboard.html" "$INSTALL_DIR/bin/dashboard.html"
