@@ -40,6 +40,7 @@ from typing import Optional
 RPC_VERSION = "rpc7"
 WORKER_TYPE = "_privatelm._tcp.local."
 SERVER_TYPE = "_privatelm-api._tcp.local."
+HOST_TYPE = "_privatelm-host._tcp.local."  # PCs that load whole models for a master's router
 DEFAULT_RPC_PORT = 50052
 DEFAULT_API_PORT = 8080
 
@@ -286,7 +287,7 @@ def scan(timeout: float = 4.0) -> list[Peer]:
             if not addrs:
                 return
             txt = {k.decode(): (v.decode() if v else "") for k, v in info.properties.items()}
-            kind = "server" if type_ == SERVER_TYPE else "worker"
+            kind = {SERVER_TYPE: "server", HOST_TYPE: "host"}.get(type_, "worker")
             found[(kind, name)] = Peer(kind, name.split("." + type_)[0], addrs[0], info.port, txt)
 
         def update_service(self, *a):
@@ -295,7 +296,7 @@ def scan(timeout: float = 4.0) -> list[Peer]:
         def remove_service(self, *a):
             pass
 
-    browsers = [ServiceBrowser(zc, t, Listener()) for t in (WORKER_TYPE, SERVER_TYPE)]
+    browsers = [ServiceBrowser(zc, t, Listener()) for t in (WORKER_TYPE, SERVER_TYPE, HOST_TYPE)]
     try:
         time.sleep(timeout)
     finally:
@@ -309,7 +310,8 @@ def _scan_avahi() -> list[Peer]:
     if not shutil.which("avahi-browse"):
         die("Scanning needs python3-zeroconf or avahi-utils.")
     peers = []
-    for stype, kind in (("_privatelm._tcp", "worker"), ("_privatelm-api._tcp", "server")):
+    for stype, kind in (("_privatelm._tcp", "worker"), ("_privatelm-api._tcp", "server"),
+                        ("_privatelm-host._tcp", "host")):
         out = subprocess.run(["avahi-browse", "-rpt", stype], capture_output=True, text=True).stdout
         for line in out.splitlines():
             f = line.split(";")
@@ -1129,8 +1131,6 @@ def _finish_command(args, cmd: list[str], model: str, tps: float, info: Optional
 
 def cmd_serve(args) -> None:
     has_fast = bool(args.fast_model or args.fast_url)
-    if args.router == "on" and not has_fast:
-        die("--router on needs a fast model: --fast-model small.gguf or --fast-url http://host:port/v1")
     public_host, public_port = args.host, args.port
     fast_cmd: Optional[list[str]] = None
     fast_info: dict = {}
@@ -1139,8 +1139,9 @@ def cmd_serve(args) -> None:
             fast_cmd, args.reserve_mb, fast_info = plan_fast(args, probe(bench=True))
         else:
             fast_info = {"model": args.fast_url, "device": "eigener Server", "ctx": args.fast_ctx}
-        # The big model listens locally; the router takes the public port.
-        args.host, args.port = "127.0.0.1", public_port + 1
+    # The router takes the public port; the big model listens locally on +1
+    # (the fast one on +2). The router is always there: hosts may join later.
+    args.host, args.port = "127.0.0.1", public_port + 1
 
     sup = Supervisor(args, _rebalance_initial(args.rebalance))
     if not sup.start_plan(initial=True):
@@ -1149,8 +1150,8 @@ def cmd_serve(args) -> None:
     sp = sup.sp
     big_base = f"http://127.0.0.1:{args.port}"
     fast_proc = None
-    router = None
-    public_name = sp.name
+    backends = [Backend("big", big_base, sp.key, sp.name, group=sp.name, where=socket.gethostname(),
+                        ctx=args.ctx or 0)]
     if has_fast:
         if fast_cmd:
             if sp.key:
@@ -1158,29 +1159,37 @@ def cmd_serve(args) -> None:
             print(f"Fast model: {fast_info['model']} ({fast_info['size_gb']} GB) on {fast_info['device']}, "
                   f"context {args.fast_ctx}\n")
             fast_proc = subprocess.Popen(fast_cmd)
-            fast = Backend("fast", f"http://127.0.0.1:{fast_info['port']}", sp.key, fast_info["model"])
+            backends.append(Backend("fast", f"http://127.0.0.1:{fast_info['port']}", sp.key, fast_info["model"],
+                                    group=fast_info["model"], where=socket.gethostname(), ctx=args.fast_ctx))
         else:
             url = args.fast_url.rstrip("/")
-            fast = Backend("fast", url[:-3] if url.endswith("/v1") else url, args.fast_key or "", url)
-        enabled, mode = _router_initial(args.router, True)
-        if args.router_mode:
-            mode = args.router_mode
-        public_name = args.model_name
-        router = Router(Backend("big", big_base, sp.key, sp.name), fast, args.fast_ctx, enabled, mode,
-                        public_name, sp.key)
+            backends.append(Backend("fast", url[:-3] if url.endswith("/v1") else url, args.fast_key or "", url,
+                                    group="fast-url", where=url, ctx=args.fast_ctx))
         sp.info["fast"] = fast_info
-        if not router.start(public_host, public_port):
-            sup.stop_server()
-            die(f"Port {public_port} is busy.")
-        log(f"Router on port {public_port}: {'on' if enabled else 'off'} ({mode}); "
-            "switch it in the dashboard or with --router on/off")
-        args.host, args.port = public_host, public_port
+    enabled, mode = _router_initial(args.router, True)
+    if args.router_mode:
+        mode = args.router_mode
+    public_name = args.model_name
+    router = Router(backends, args.fast_ctx, enabled, mode, public_name, sp.key)
+    if not router.start(public_host, public_port):
+        sup.stop_server()
+        die(f"Port {public_port} is busy.")
+    log(f"Router on port {public_port}: rules {'on' if enabled else 'off'} ({mode}); model name for clients: "
+        f"{public_name}, or a model's own name")
+    args.host, args.port = public_host, public_port
+    hosts = None
+    if sp.key:
+        hosts = HostManager(args, router, sp.key)
+        hosts.start()
+    elif args.assign or args.hosts:
+        die("Hosts need an API key on the master (it is their cluster key); leave out --api-key \"\".")
 
     address = args.advertise_ip or (args.host if args.host not in ("0.0.0.0", "") else lan_address())
     adv = None
     if not args.no_advertise:
         adv = Advertiser(SERVER_TYPE, f"PrivateLM {socket.gethostname()}", args.port,
-                         {"path": "/v1", "model": public_name, "auth": "1" if sp.key else "0", "v": "1"}, address)
+                         {"path": "/v1", "model": public_name, "auth": "1" if sp.key else "0", "v": "1",
+                          "id": machine_id()}, address)
         adv.start()
     from urllib.parse import urlencode
 
@@ -1189,7 +1198,7 @@ def cmd_serve(args) -> None:
         params["key"] = sp.key
     print(f"\nOpenAI-compatible API: http://{address}:{args.port}/v1  (model: {public_name})")
     if not args.no_dashboard:
-        dash = Dashboard(args, sup, probe(bench=False), router=router, big_base=big_base)
+        dash = Dashboard(args, sup, probe(bench=False), router=router, big_base=big_base, hosts=hosts)
         if dash.start():
             print(f"Dashboard:             http://{address}:{args.dashboard_port}/"
                   + ("  (log in with the API key)" if sp.key else ""))
@@ -2071,10 +2080,11 @@ class Dashboard:
     """Collects the cluster's state every 2 s for the master's dashboard."""
 
     def __init__(self, args, sup: "Supervisor", devices: list[Device],
-                 router: Optional["Router"] = None, big_base: Optional[str] = None):
+                 router: Optional["Router"] = None, big_base: Optional[str] = None,
+                 hosts: Optional["HostManager"] = None):
         import threading
 
-        self.args, self.sup, self.router = args, sup, router
+        self.args, self.sup, self.router, self.hosts = args, sup, router, hosts
         self.base = big_base or f"http://127.0.0.1:{args.port}"
         self._fast_last: Optional[tuple[float, float]] = None
         self._fast_tps_last = 0.0
@@ -2165,7 +2175,7 @@ class Dashboard:
                     self._last_tps = tps
                     self._kb_per_token = (net_total - n0) / dp / 1024
             self._last_metrics = (now, predicted, net_total)
-        self.fast_state = self._fast() if self.router else {}
+        self.fast_state = self._fast() if self.router and self.router.fast else {}
         workers = {}
         for w in self.sp.info.get("machines", []):
             if w["role"] == "worker":
@@ -2179,7 +2189,7 @@ class Dashboard:
             h["t"].append(int(now))
             h["tps"].append(round(tps, 2))
             h.setdefault("tps_fast", [None] * (len(h["t"]) - 1)).append(
-                round(self.fast_state.get("tps_now", 0.0), 2) if self.router else None)
+                round(self.fast_state.get("tps_now", 0.0), 2) if self.fast_state else None)
             h["net_kbps"].append(round(stats["net_rx_kbps"] + stats["net_tx_kbps"], 1))
             gpu_now = {"master": [g.get("util_pct") for g in stats["gpus"]]}
             for wid, w in workers.items():
@@ -2195,6 +2205,14 @@ class Dashboard:
             for k in h["gpu"]:
                 del h["gpu"][k][:-HISTORY_POINTS]
 
+    def _is_me(self, p: Peer) -> bool:
+        """This master's own announcements: its workers (same machine id)
+        and its own API (by id, or by address and port from older versions)."""
+        if p.txt.get("id") == machine_id():
+            return True
+        return p.kind == "server" and p.port == self.args.port and p.host in (
+            "127.0.0.1", self.args.advertise_ip, lan_address())
+
     def scan_lan(self) -> None:
         used = {ep for w in self.sp.info.get("machines", []) for ep in w.get("endpoints", [])}
         try:
@@ -2204,7 +2222,7 @@ class Dashboard:
         lan = [{"kind": p.kind, "name": p.txt.get("model") or p.name, "endpoint": p.endpoint,
                 "ram_mb": p.ram_mb, "bw": p.bandwidth, "type": p.txt.get("kind", "phone" if p.kind == "worker" else ""),
                 "in_use": p.endpoint in used, "compatible": p.txt.get("v", RPC_VERSION) == RPC_VERSION}
-               for p in peers if p.txt.get("id") != machine_id() or p.kind == "server"]
+               for p in peers if not self._is_me(p) and p.kind != "host"]  # hosts have their own panel
         with self.lock:
             self.lan = lan
 
@@ -2257,7 +2275,9 @@ class Dashboard:
         if self.router:
             router = {**self.router.info(), **{"fast_live": self.fast_state}}
         with self.lock:
-            return {"router": router or {"available": False}, "rebalance": self.sup.info(), "plan": self.sp.info, "master": {**self.state, "uptime_s": int(time.time() - self.started),
+            return {"router": router or {"available": False}, "rebalance": self.sup.info(),
+                    "hosts": self.hosts.info() if self.hosts else {"hosts": [], "catalog": [], "off": True},
+                    "plan": self.sp.info, "master": {**self.state, "uptime_s": int(time.time() - self.started),
                                                       "host": socket.gethostname()},
                     "workers": self.workers, "lan": self.lan, "history": self.history,
                     "bench": self.bench}
@@ -2294,11 +2314,326 @@ class Dashboard:
                                  "/api/status": self.status},
                                 {"/api/bench": lambda body: self.run_bench(),
                                  "/api/router": self.set_router,
-                                 "/api/rebalance": self.sup.api}, key=self.sp.key, public=("/",))
+                                 "/api/rebalance": self.sup.api,
+                                 "/api/hosts": self.hosts.api if self.hosts else (lambda b: {"error": "no hosts"})},
+                                key=self.sp.key, public=("/",))
         if not _start_http(self.args.host, self.args.dashboard_port, handler):
             return None
         threading.Thread(target=self.loop, daemon=True).start()
         return f"{self.args.dashboard_port}"
+
+
+# ── Hosts ────────────────────────────────────────────────────────────────────
+#
+# A host is a PC that loads a whole model on its own devices and answers for
+# a master's router: three PCs with one A4000 each serve three models, or
+# the same model three times with the requests spread over them. The master
+# decides which host loads what (dashboard or --assign); the host downloads
+# the model itself, plans it on its own GPUs and RAM, and starts llama-server
+# with the cluster key (the master's API key). Its control API needs the
+# same key: whoever has it can make the host download and run models.
+
+HOST_CTL_PORT = 50070
+HOST_API_PORT = 8081
+HOST_STATE = CONFIG_DIR / "host.json"
+
+
+def read_cluster_key(key: Optional[str], key_file: Optional[str]) -> str:
+    """--key, --key-file, or the systemd credential cluster_key."""
+    if key:
+        return key.strip()
+    paths = [Path(key_file).expanduser()] if key_file else []
+    if os.environ.get("CREDENTIALS_DIRECTORY"):
+        paths.append(Path(os.environ["CREDENTIALS_DIRECTORY"]) / "cluster_key")
+    for p in paths:
+        try:
+            k = p.read_text().strip()
+            if k:
+                return k
+        except OSError:
+            continue
+    return ""
+
+
+def host_id(port: int) -> str:
+    return machine_id() if port == HOST_CTL_PORT else f"{machine_id()}-{port}"
+
+
+class HostAgent:
+    """Loads the model the master assigned and keeps it running."""
+
+    def __init__(self, args, key: str):
+        import threading
+
+        self.args, self.key = args, key
+        self.models_dir = Path(args.models_dir).expanduser()
+        self.lock = threading.RLock()
+        self.id = host_id(args.port)
+        self.state, self.error = "idle", ""
+        self.assignment: Optional[dict] = None  # model, name, role, ctx
+        self.proc: Optional[subprocess.Popen] = None
+        self.model_path: Optional[Path] = None
+        self.ctx: Optional[int] = None
+        self.estimate_tps: Optional[float] = None
+        self.download: Optional[dict] = None  # files being fetched, for the progress
+        self.job = 0  # a newer assignment makes older jobs stop
+        self.restarts = 0
+        self.paths: dict[str, str] = {}  # assigned model -> file, so a restart needs no lookup
+        self.stats = SystemStats(probe(bench=False))
+
+    # State -------------------------------------------------------------------
+
+    def _set(self, state: str, error: str = "") -> None:
+        with self.lock:
+            self.state, self.error = state, error
+        log(f"Host: {state}{': ' + error if error else ''}")
+
+    def _save(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            HOST_STATE.write_text(json.dumps({"assignment": self.assignment, "paths": self.paths}))
+        except OSError as e:
+            log(f"Host: could not save the assignment ({e})")
+
+    def restore(self) -> None:
+        """Loads the last assignment again after a restart, without the master."""
+        try:
+            saved = json.loads(HOST_STATE.read_text())
+        except (OSError, ValueError):
+            return
+        a, self.paths = saved.get("assignment"), saved.get("paths") or {}
+        if a and a.get("model"):
+            log(f"Host: loading the last assigned model again ({a['model']})")
+            self.assign(a)
+
+    def budget_mb(self) -> int:
+        local, _ = memory_budget(False)
+        return local
+
+    def _metrics(self) -> dict:
+        import urllib.request
+
+        out: dict = {}
+        if not self.proc or self.proc.poll() is not None:
+            return out
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{self.args.api_port}/metrics",
+                                         headers={"Authorization": f"Bearer {self.key}"})
+            with urllib.request.urlopen(req, timeout=2) as r:
+                for line in r.read().decode().splitlines():
+                    if line.startswith("llamacpp:") and " " in line:
+                        k, _, v = line.rpartition(" ")
+                        out[k.replace("llamacpp:", "")] = _num(v)
+        except OSError:
+            pass
+        return out
+
+    def _progress(self) -> Optional[dict]:
+        d = self.download
+        if not d:
+            return None
+        done = 0
+        for f in d["files"]:
+            dest = Path(d["dir"]) / Path(f["file"]).name
+            part = dest.with_suffix(dest.suffix + ".part")
+            done += dest.stat().st_size if dest.exists() else part.stat().st_size if part.exists() else 0
+        return {"name": d["name"], "total_mb": d["size_mb"], "done_mb": done // 2**20}
+
+    def status(self) -> dict:
+        with self.lock:
+            st = {"id": self.id, "host": socket.gethostname(), "v": 1, "state": self.state, "error": self.error,
+                  "assignment": self.assignment, "model": self.model_path.stem if self.model_path else None,
+                  "ctx": self.ctx, "estimate_tps": self.estimate_tps, "api_port": self.args.api_port,
+                  "progress": self._progress() if self.state == "downloading" else None}
+        st["metrics"] = self._metrics()
+        st["stats"] = self.stats.sample()
+        st["models"] = sorted({p.stem.split("-00001-of-")[0] for p in self.models_dir.glob("*.gguf")}) \
+            if self.models_dir.is_dir() else []
+        return st
+
+    # Commands ------------------------------------------------------------------
+
+    def assign(self, body: dict) -> dict:
+        import threading
+
+        model = str(body.get("model") or "").strip()
+        if not model:
+            return {"error": "model missing"}
+        a = {"model": model, "name": str(body.get("name") or "").strip(),
+             "role": body.get("role") if body.get("role") in ("big", "fast", "extra") else "big",
+             "ctx": int(body["ctx"]) if str(body.get("ctx") or "").isdigit() else None}
+        with self.lock:
+            self.job += 1
+            self.assignment, self.restarts = a, 0
+            job = self.job
+        self._save()
+        threading.Thread(target=self._run, args=(job, a), daemon=True).start()
+        return self.status()
+
+    def unload(self, _body: Optional[dict] = None) -> dict:
+        with self.lock:
+            self.job += 1
+            self.assignment = None
+        self._save()
+        self.stop_server()
+        with self.lock:
+            self.model_path, self.ctx, self.estimate_tps, self.download = None, None, None, None
+        self._set("idle")
+        return self.status()
+
+    def stop_server(self) -> None:
+        p = self.proc
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        self.proc = None
+
+    def _local(self, spec: str) -> Optional[Path]:
+        """An assigned model that is already on this PC: a path, or the name
+        of a GGUF in the models folder or the usual places."""
+        p = Path(spec).expanduser()
+        if p.is_file():
+            return p.resolve()
+        known = self.paths.get(spec)
+        if known and Path(known).is_file():
+            return Path(known)
+        want = spec.lower().removesuffix(".gguf")
+        cands = list(self.models_dir.glob("*.gguf")) if self.models_dir.is_dir() else []
+        cands += [Path(m["path"]) for m in local_models()]
+        for c in cands:
+            if c.stem.lower().split("-00001-of-")[0] == want:
+                return c.resolve()
+        return None
+
+    def _run(self, job: int, a: dict) -> None:
+        def current() -> bool:
+            return job == self.job
+
+        try:
+            self._set("preparing")
+            self.stop_server()
+            path = self._local(a["model"])
+            if path is None:
+                self._set("downloading")
+
+                def resolved(info: dict) -> None:
+                    with self.lock:
+                        self.download = info
+
+                path = fetch_model(a["model"], self.models_dir, quiet=True, on_resolved=resolved,
+                                   max_mb=self.budget_mb())
+                with self.lock:
+                    self.paths[a["model"]] = str(path)
+                self._save()
+            if not current():
+                return
+            self._set("loading")
+            ns = argparse.Namespace(model=str(path), ctx=a.get("ctx"), mtp=0, workers="off", ram_limit=None,
+                                    api_key=self.key, host=self.args.host, port=self.args.api_port,
+                                    extra=list(self.args.extra or []), scan_timeout=1.0)
+            sp = build_server_fitting(ns, quiet=True, exit_on_fail=False)
+            if not current():
+                return
+            log(" ".join(sp.cmd).replace(self.key, "***"))
+            proc = subprocess.Popen(sp.cmd)
+            with self.lock:
+                self.proc, self.model_path, self.ctx, self.estimate_tps = proc, path, ns.ctx, round(sp.estimate_tps, 1)
+                self.download = None
+            if _wait_healthy(f"http://127.0.0.1:{self.args.api_port}", proc, timeout=3600) and current():
+                self._set("ready")
+            elif current():
+                self._set("error", f"llama-server did not start (code {proc.poll()}); see the log")
+        except (ModelError, PlanTooBig) as e:
+            if current():
+                self._set("error", str(e))
+        except Exception as e:  # noqa: BLE001 - report it to the master instead of dying
+            if current():
+                self._set("error", f"{type(e).__name__}: {e}")
+
+    def watch(self) -> None:
+        """Restarts llama-server if it ends on its own (up to 3 times in a row)."""
+        while True:
+            time.sleep(5)
+            with self.lock:
+                dead = self.state == "ready" and self.proc is not None and self.proc.poll() is not None
+                a = self.assignment
+            if dead and a:
+                code = self.proc.poll()
+                self.restarts += 1
+                if self.restarts > 3:
+                    self._set("error", f"llama-server keeps ending (code {code}); not restarting again")
+                    continue
+                self._set("error", f"llama-server ended (code {code}); restarting in 30 s")
+                time.sleep(30)
+                with self.lock:
+                    same = self.assignment is a
+                    if same:
+                        self.job += 1
+                        job = self.job
+                if same:
+                    self._run(job, a)
+
+
+def cmd_host(args) -> None:
+    import threading
+
+    key = read_cluster_key(args.key, args.key_file)
+    if not key:
+        die("A host needs the cluster key (the master's API key): --key, --key-file, or the systemd "
+            "credential cluster_key. On the master: privatelm-node key")
+    agent = HostAgent(args, key)
+    handler = _json_handler({"/status": agent.status},
+                            {"/assign": agent.assign, "/unload": agent.unload}, key=key)
+    if not _start_http(args.host, args.port, handler):
+        die(f"Port {args.port} is busy.")
+    devices = probe(bench=True)
+    gpus = usable_gpus(devices)
+    address = args.advertise_ip or (args.host if args.host not in ("0.0.0.0", "") else lan_address())
+    vram = sum(d.total_mb for d in gpus if d.type == "gpu")
+    gpu_txt = ", ".join(sorted({d.description for d in gpus})) or "CPU"
+    log(f"Host {socket.gethostname()}: control API on {address}:{args.port}, models in {agent.models_dir}, "
+        f"llama-server on port {args.api_port}; {gpu_txt}")
+    advs = []
+    if not args.no_advertise:
+        adv = Advertiser(HOST_TYPE, f"PrivateLM Host {socket.gethostname()}", args.port,
+                         {"id": agent.id, "host": socket.gethostname(), "api": str(args.api_port),
+                          "gpu": gpu_txt[:120], "vram": str(vram), "v": "1"}, address)
+        adv.start()
+        advs.append(adv)
+    threading.Thread(target=agent.watch, daemon=True).start()
+    agent.restore()
+
+    stopping = False
+
+    def stop(*_):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while not stopping:
+        time.sleep(0.5)
+    agent.job += 1
+    agent.stop_server()
+    for a in advs:
+        a.stop()
+
+
+def cmd_key(args) -> None:
+    """Prints the master's API key, which hosts use as the cluster key: the
+    service's (installed with the script) if there is one, else this user's."""
+    service = Path("/var/lib/privatelm-node/privatelm-node/api_key")
+    try:
+        if service.is_file():
+            print(service.read_text().strip())
+            return
+    except OSError:
+        die(f"{service} is the service's key; read it with sudo: sudo {sys.argv[0]} key")
+    print(_api_key())
 
 
 # ── Router ───────────────────────────────────────────────────────────────────
@@ -2344,26 +2679,63 @@ def _message_text(content) -> tuple[str, bool]:
 
 @dataclass
 class Backend:
-    name: str  # "fast" or "big"
+    name: str  # role: "big", "fast", or "extra" (only by its model name)
     base: str  # http://host:port
     key: str
     label: str  # model name for display
     healthy: bool = False
     status: str = "starting"
+    group: str = ""  # name clients can ask for (model field or header)
+    where: str = "Master"  # machine
+    source: str = "local"  # "local" or the host's id
+    ctx: int = 0
+    inflight: int = 0  # requests running now
+    served: int = 0
+
+
+ROLE_WORDS = {"fast": ("fast", "schnell", "small"), "big": ("big", "large", "groß", "gross")}
 
 
 class Router:
-    def __init__(self, big: Backend, fast: Backend, fast_ctx: int, enabled: bool, mode: str,
+    """One endpoint in front of every model: the master's own (big, and the
+    optional fast one) and those the hosts load. Requests go by model name
+    when they ask for one, else by the rules (fast or big); within a group
+    the backend with the fewest running requests gets the next one."""
+
+    def __init__(self, backends: list[Backend], fast_ctx: int, enabled: bool, mode: str,
                  public_name: str, key: str):
         import threading
 
-        self.big, self.fast = big, fast
+        self.backends = list(backends)
         self.fast_ctx = fast_ctx
         self.enabled, self.mode = enabled, mode
         self.public_name, self.key = public_name, key
         self.lock = threading.Lock()
-        self.counts = {"fast": 0, "big": 0}
+        self.counts = {"fast": 0, "big": 0, "extra": 0}
         self.recent: list[dict] = []
+
+    @property
+    def big(self) -> Backend:
+        return next((b for b in self.backends if b.name == "big" and b.source == "local"), self.backends[0])
+
+    @property
+    def fast(self) -> Optional[Backend]:
+        return next((b for b in self.backends if b.name == "fast" and b.source == "local"), None)
+
+    def set_hosts(self, hosts: list[Backend]) -> None:
+        """Replaces the hosts' backends, keeping health and counters of the
+        ones that stay."""
+        with self.lock:
+            old = {(b.source, b.base): b for b in self.backends if b.source != "local"}
+            keep = [b for b in self.backends if b.source == "local"]
+            for h in hosts:
+                prev = old.get((h.source, h.base))
+                if prev:
+                    prev.name, prev.label, prev.group, prev.where, prev.ctx = h.name, h.label, h.group, h.where, h.ctx
+                    keep.append(prev)
+                else:
+                    keep.append(h)
+            self.backends = keep
 
     # State -----------------------------------------------------------------
 
@@ -2385,17 +2757,24 @@ class Router:
         return self.info()
 
     def info(self) -> dict:
+        def brief(b: Optional[Backend]) -> Optional[dict]:
+            return {"model": b.label, "status": b.status, "base": b.base} if b else None
+
         with self.lock:
+            fast = self.fast or next((b for b in self.backends if b.name == "fast"), None)
             return {"available": True, "enabled": self.enabled, "mode": self.mode,
-                    "fast": {"model": self.fast.label, "status": self.fast.status, "base": self.fast.base},
-                    "big": {"model": self.big.label, "status": self.big.status},
-                    "counts": dict(self.counts), "recent": list(self.recent[-12:])}
+                    "fast": brief(fast), "big": brief(self.big),
+                    "has_fast": any(b.name == "fast" for b in self.backends),
+                    "counts": dict(self.counts), "recent": list(self.recent[-12:]),
+                    "backends": [{"role": b.name, "group": b.group, "model": b.label, "where": b.where,
+                                  "source": b.source, "status": b.status, "inflight": b.inflight,
+                                  "served": b.served, "ctx": b.ctx} for b in self.backends]}
 
     def watch_health(self) -> None:
         import urllib.request
 
         while True:
-            for b in (self.big, self.fast):
+            for b in list(self.backends):
                 try:
                     with urllib.request.urlopen(b.base + "/health", timeout=2) as r:
                         b.healthy, b.status = r.status == 200, "ready"
@@ -2406,28 +2785,48 @@ class Router:
 
     # Decision ----------------------------------------------------------------
 
+    def choose(self, cands: list[Backend]) -> Optional[Backend]:
+        """The healthy backend with the fewest running requests (then the
+        fewest served, so equal ones take turns)."""
+        ok = [b for b in cands if b.healthy]
+        return min(ok, key=lambda b: (b.inflight, b.served)) if ok else None
+
+    def role(self, role: str) -> list[Backend]:
+        return [b for b in self.backends if b.name == role]
+
+    def _pick_role(self, role: str, reason: str) -> tuple[Backend, str]:
+        b = self.choose(self.role(role))
+        if b:
+            return b, reason
+        other = "big" if role == "fast" else "fast"
+        b = self.choose(self.role(other))
+        if b:
+            return b, f"{reason}, aber {'schnelles' if role == 'fast' else 'großes'} Modell nicht bereit"
+        b = self.choose(self.backends)
+        return (b or self.big), reason + ", nichts anderes bereit"
+
     def decide(self, body: dict, headers) -> tuple[Backend, str]:
-        forced = (headers.get("X-PrivateLM-Route") or "").lower() or str(body.get("model", "")).lower()
-        if forced in ("fast", "schnell", "small"):
-            return self._pick(self.fast, "angefordert")
-        if forced in ("big", "large", "groß", "gross"):
-            return self._pick(self.big, "angefordert")
+        forced = ((headers.get("X-PrivateLM-Route") or "").strip() or str(body.get("model", "")).strip()).lower()
+        if forced and forced != self.public_name.lower():
+            group = [b for b in self.backends if forced in (b.group.lower(), b.label.lower())]
+            if group:
+                b = self.choose(group)
+                if b:
+                    return b, "Modell angefordert"
+                return group[0], "Modell angefordert, aber nicht bereit"
+            for role, words in ROLE_WORDS.items():
+                if forced in words:
+                    return self._pick_role(role, "angefordert")
         if not self.enabled:
-            return self._pick(self.big, "Router aus")
-        if not self.big.healthy and self.fast.healthy:
-            return self.fast, "großes Modell nicht bereit"
-        if not self.fast.healthy:
-            return self.big, "schnelles Modell nicht bereit"
+            return self._pick_role("big", "Router aus")
+        if not self.choose(self.role("fast")):
+            return self._pick_role("big", "kein schnelles Modell bereit")
+        if not self.choose(self.role("big")):
+            return self._pick_role("fast", "großes Modell nicht bereit")
         route, reason = self.classify(body)
         if route == "fast" and self.mode == "model":
             route, reason = self.ask_fast_model(body, reason)
-        return (self.fast if route == "fast" else self.big), reason
-
-    def _pick(self, b: Backend, reason: str) -> tuple[Backend, str]:
-        other = self.big if b is self.fast else self.fast
-        if not b.healthy and other.healthy:
-            return other, f"{reason}, aber {'schnelles' if b is self.fast else 'großes'} Modell nicht bereit"
-        return b, reason
+        return self._pick_role(route, reason)
 
     def classify(self, body: dict) -> tuple[str, str]:
         """Rules first (what the small model can't do), then the shape of the
@@ -2446,7 +2845,8 @@ class Router:
         if image:
             return "big", "Bild in der Anfrage"
         total = sum(len(t) for t in texts)
-        if total / 3.5 > self.fast_ctx * 0.6:
+        fast_ctx = min((b.ctx for b in self.role("fast") if b.ctx), default=self.fast_ctx)
+        if total / 3.5 > fast_ctx * 0.6:
             return "big", "langer Kontext"
         max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or 0
         if isinstance(max_tokens, int) and max_tokens > 1024:
@@ -2467,15 +2867,18 @@ class Router:
         """Lets the fast model judge the request (one token, a few ms)."""
         import urllib.request
 
+        fast = self.choose(self.role("fast"))
+        if fast is None:
+            return "fast", reason
         msgs = body.get("messages") or [{"role": "user", "content": body.get("prompt", "")}]
         users = [_message_text(m.get("content"))[0] for m in msgs if m.get("role", "user") == "user"]
         q = (users[-1] if users else "")[:1500]
         req = {"messages": [{"role": "system", "content": ROUTER_PROMPT}, {"role": "user", "content": q}],
                "max_tokens": 1, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}
         try:
-            r = urllib.request.Request(self.fast.base + "/v1/chat/completions", data=json.dumps(req).encode(),
+            r = urllib.request.Request(fast.base + "/v1/chat/completions", data=json.dumps(req).encode(),
                                        headers={"Content-Type": "application/json",
-                                                **({"Authorization": f"Bearer {self.fast.key}"} if self.fast.key else {})})
+                                                **({"Authorization": f"Bearer {fast.key}"} if fast.key else {})})
             with urllib.request.urlopen(r, timeout=3) as resp:
                 ans = json.loads(resp.read())["choices"][0]["message"].get("content", "").strip().upper()
         except (OSError, ValueError, KeyError, IndexError):
@@ -2488,8 +2891,9 @@ class Router:
 
     def record(self, backend: Backend, reason: str, chars: int, stream: bool) -> None:
         with self.lock:
-            self.counts[backend.name] += 1
+            self.counts[backend.name] = self.counts.get(backend.name, 0) + 1
             self.recent.append({"t": int(time.time()), "route": backend.name, "reason": reason,
+                                "model": backend.group or backend.label, "where": backend.where,
                                 "chars": chars, "stream": stream})
             del self.recent[:-50]
 
@@ -2528,14 +2932,24 @@ class Router:
                 path = self.path.split("?", 1)[0]
                 if path in ("/v1/models", "/models"):
                     now = int(time.time())
-                    data = [{"id": router.public_name, "object": "model", "owned_by": "privatelm", "created": now},
-                            {"id": "fast", "object": "model", "owned_by": "privatelm", "created": now,
-                             "meta": {"model": router.fast.label}},
-                            {"id": "big", "object": "model", "owned_by": "privatelm", "created": now,
-                             "meta": {"model": router.big.label}}]
+                    data = [{"id": router.public_name, "object": "model", "owned_by": "privatelm", "created": now}]
+                    for role in ("fast", "big"):
+                        bs = router.role(role)
+                        if bs:
+                            data.append({"id": role, "object": "model", "owned_by": "privatelm", "created": now,
+                                         "meta": {"models": sorted({b.label for b in bs})}})
+                    seen = set()
+                    for b in router.backends:
+                        g = b.group or b.label
+                        if g.lower() in seen or g.lower() in (router.public_name.lower(), "fast", "big"):
+                            continue
+                        seen.add(g.lower())
+                        where = sorted({x.where for x in router.backends if (x.group or x.label) == g})
+                        data.append({"id": g, "object": "model", "owned_by": "privatelm", "created": now,
+                                     "meta": {"model": b.label, "hosts": where}})
                     return self._json(200, {"object": "list", "data": data})
                 if path == "/health":
-                    ok = router.big.healthy or router.fast.healthy
+                    ok = any(b.healthy for b in router.backends)
                     return self._json(200 if ok else 503, {"status": "ok" if ok else "loading"})
                 self._forward(router.big, "GET", None, "")
 
@@ -2556,7 +2970,7 @@ class Router:
                     chars = len(json.dumps(body.get("messages") or body.get("prompt") or ""))
                     router.record(backend, reason, chars, bool(body.get("stream")))
                 else:
-                    backend, reason = router.big, "keine Chat-Anfrage"
+                    backend, reason = router._pick_role("big", "keine Chat-Anfrage")
                 self._forward(backend, "POST", raw, reason)
 
             def _forward(self, backend: Backend, method: str, raw: Optional[bytes], reason: str) -> None:
@@ -2568,29 +2982,38 @@ class Router:
                 if backend.key:
                     headers["Authorization"] = f"Bearer {backend.key}"
                 path = (u.path.rstrip("/") + self.path) if u.path not in ("", "/") else self.path
+                with router.lock:
+                    backend.inflight += 1
+                    backend.served += 1
                 try:
-                    conn.request(method, path, body=raw, headers=headers)
-                    resp = conn.getresponse()
-                except OSError as e:
-                    return self._json(502, {"error": {"message": f"{backend.name} model unreachable: {e}"}})
-                try:
-                    self.send_response(resp.status)
-                    self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
-                    self.send_header("X-PrivateLM-Route", backend.name)
-                    self.send_header("X-PrivateLM-Reason", reason.encode("ascii", "replace").decode())
-                    self.send_header("Transfer-Encoding", "chunked")
-                    self.end_headers()
-                    while True:
-                        chunk = resp.read1(65536)
-                        if not chunk:
-                            break
-                        self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
-                        self.wfile.flush()
-                    self.wfile.write(b"0\r\n\r\n")
-                except (BrokenPipeError, ConnectionResetError):
-                    pass  # client went away; closing the backend stops its generation
+                    try:
+                        conn.request(method, path, body=raw, headers=headers)
+                        resp = conn.getresponse()
+                    except OSError as e:
+                        return self._json(502, {"error": {"message": f"{backend.where} ({backend.label}) "
+                                                                     f"unreachable: {e}"}})
+                    try:
+                        self.send_response(resp.status)
+                        self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
+                        self.send_header("X-PrivateLM-Route", backend.name)
+                        self.send_header("X-PrivateLM-Backend", f"{backend.group or backend.label}@{backend.where}"
+                                         .encode("ascii", "replace").decode())
+                        self.send_header("X-PrivateLM-Reason", reason.encode("ascii", "replace").decode())
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.end_headers()
+                        while True:
+                            chunk = resp.read1(65536)
+                            if not chunk:
+                                break
+                            self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                            self.wfile.flush()
+                        self.wfile.write(b"0\r\n\r\n")
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass  # client went away; closing the backend stops its generation
                 finally:
                     conn.close()
+                    with router.lock:
+                        backend.inflight -= 1
 
         return H
 
@@ -2599,6 +3022,216 @@ class Router:
 
         threading.Thread(target=self.watch_health, daemon=True).start()
         return _start_http(host, port, self.handler()) is not None
+
+
+# ── Host manager (master) ───────────────────────────────────────────────────
+#
+# Finds the hosts (mDNS, or --hosts), polls their state every 5 s, pushes
+# the model each one should load (from the dashboard or --assign, kept in
+# hosts.json) and gives the router a backend for every host that is ready.
+# A host keeps its model when the master restarts or forgets it.
+
+HOSTS_STATE = CONFIG_DIR / "hosts.json"
+
+
+class HostManager:
+    def __init__(self, args, router: Router, key: str):
+        import threading
+
+        self.args, self.router, self.key = args, router, key
+        self.lock = threading.RLock()
+        self.hosts: dict[str, dict] = {}  # id -> addr, port, name, status, seen, error
+        self.assign: dict[str, Optional[dict]] = {}  # id -> wanted assignment (None: unload)
+        self.pending_cli = [self._parse_assign(x) for x in (args.assign or [])]
+        self.extra = []
+        for ep in (args.hosts or "").split(","):
+            ep = ep.strip()
+            if ep:
+                h, _, p = ep.rpartition(":")
+                self.extra.append((h or ep, int(p) if h else HOST_CTL_PORT))
+        try:
+            self.assign = json.loads(HOSTS_STATE.read_text()).get("assign", {})
+        except (OSError, ValueError):
+            pass
+        self.last_scan = 0.0
+        self.pushed: dict[str, tuple] = {}  # id -> (assignment, time) last sent
+
+    @staticmethod
+    def _parse_assign(text: str) -> dict:
+        """HOST=MODEL[,role=big|fast|extra][,name=NAME][,ctx=N]"""
+        target, _, rest = text.partition("=")
+        parts = [p.strip() for p in rest.split(",")]
+        a = {"match": target.strip(), "model": parts[0], "role": "big", "name": "", "ctx": None}
+        for p in parts[1:]:
+            k, _, v = p.partition("=")
+            if k == "role" and v in ("big", "fast", "extra"):
+                a["role"] = v
+            elif k == "name":
+                a["name"] = v
+            elif k == "ctx" and v.isdigit():
+                a["ctx"] = int(v)
+        if not a["match"] or not a["model"]:
+            die(f"--assign {text}: expected HOST=MODEL[,role=big|fast|extra][,name=NAME][,ctx=N]")
+        return a
+
+    def save(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            HOSTS_STATE.write_text(json.dumps({"assign": self.assign}))
+        except OSError as e:
+            log(f"Hosts: could not save the assignments ({e})")
+
+    # Talking to hosts ----------------------------------------------------------
+
+    def _call(self, h: dict, path: str, body: Optional[dict] = None, timeout: float = 5) -> dict:
+        import urllib.request
+
+        req = urllib.request.Request(f"http://{h['addr']}:{h['port']}{path}",
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Authorization": f"Bearer {self.key}",
+                                              "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+
+    def discover(self) -> None:
+        found = []
+        try:
+            found = [(p.host, p.port) for p in scan(3.0) if p.kind == "host"]
+        except Exception:  # noqa: BLE001 - mDNS trouble: --hosts still works
+            pass
+        for addr, port in found + self.extra:
+            if any(h["addr"] == addr and h["port"] == port for h in self.hosts.values()):
+                continue
+            try:
+                st = self._call({"addr": addr, "port": port}, "/status")
+            except Exception as e:  # noqa: BLE001
+                log(f"Host {addr}:{port} doesn't answer ({e}); a wrong key gives HTTP 401")
+                continue
+            with self.lock:
+                self.hosts[st["id"]] = {"addr": addr, "port": port, "name": st.get("host", addr), "status": st,
+                                        "seen": time.time(), "error": ""}
+            log(f"Host {st.get('host', addr)} ({addr}:{port}) found: {st.get('state')}"
+                + (f", {st.get('model')}" if st.get("model") else ""))
+
+    def poll(self) -> None:
+        for hid, h in list(self.hosts.items()):
+            try:
+                st = self._call(h, "/status")
+                with self.lock:
+                    h.update(status=st, seen=time.time(), error="")
+            except Exception as e:  # noqa: BLE001
+                with self.lock:
+                    h["error"] = str(e)[:160]
+                    if time.time() - h["seen"] > 300:  # gone for 5 minutes: forget it until it's back
+                        del self.hosts[hid]
+                continue
+            self._apply_cli(hid, h)
+            self.ensure(hid)
+
+    def _apply_cli(self, hid: str, h: dict) -> None:
+        for a in list(self.pending_cli):
+            if a["match"] in (hid, h["name"], h["addr"], f"{h['addr']}:{h['port']}"):
+                self.assign[hid] = {k: a[k] for k in ("model", "role", "name", "ctx")}
+                self.pending_cli.remove(a)
+                self.save()
+
+    def ensure(self, hid: str) -> None:
+        """Sends the wanted assignment when the host has another one."""
+        h = self.hosts.get(hid)
+        if not h or hid not in self.assign:
+            return
+        want = self.assign[hid]
+        have = (h["status"] or {}).get("assignment")
+        if want is None:
+            if have:
+                self._send(hid, "/unload", {})
+            return
+        keys = ("model", "role", "name", "ctx")
+        if have and all(have.get(k) == want.get(k) for k in keys):
+            return
+        last = self.pushed.get(hid)
+        if last and last[0] == json.dumps(want, sort_keys=True) and time.time() - last[1] < 60:
+            return  # sent a moment ago; the host reports it soon
+        self._send(hid, "/assign", want)
+
+    def _send(self, hid: str, path: str, body: dict) -> None:
+        h = self.hosts[hid]
+        try:
+            st = self._call(h, path, body, timeout=10)
+            with self.lock:
+                h["status"] = st
+            self.pushed[hid] = (json.dumps(body, sort_keys=True), time.time())
+            log(f"Host {h['name']}: {'load ' + body['model'] if body else 'unload'}")
+        except Exception as e:  # noqa: BLE001
+            h["error"] = f"{path}: {e}"[:160]
+
+    def update_router(self) -> None:
+        backends = []
+        with self.lock:
+            for hid, h in self.hosts.items():
+                st = h.get("status") or {}
+                a = st.get("assignment") or {}
+                if st.get("state") != "ready" or not st.get("model") or h.get("error"):
+                    continue
+                backends.append(Backend(a.get("role") or "big", f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}",
+                                        self.key, st["model"], group=a.get("name") or st["model"],
+                                        where=h["name"], source=hid, ctx=st.get("ctx") or 0))
+        self.router.set_hosts(backends)
+
+    def loop(self) -> None:
+        while True:
+            try:
+                if time.time() - self.last_scan > 30:
+                    self.last_scan = time.time()
+                    self.discover()
+                self.poll()
+                self.update_router()
+            except Exception as e:  # noqa: BLE001 - keep managing
+                log(f"Hosts: {e}")
+            time.sleep(5)
+
+    def start(self) -> None:
+        import threading
+
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    # Dashboard ---------------------------------------------------------------
+
+    def api(self, body: dict) -> dict:
+        import threading
+
+        hid = str(body.get("host") or "")
+        if hid not in self.hosts:
+            return {"error": "unknown host"}
+        if body.get("unload"):
+            self.assign[hid] = None
+        else:
+            model = str(body.get("model") or "").strip()
+            if not model:
+                return {"error": "model missing"}
+            ctx = body.get("ctx")
+            self.assign[hid] = {"model": model, "role": body.get("role") if body.get("role") in ("big", "fast", "extra")
+                                else "big", "name": str(body.get("name") or "").strip(),
+                                "ctx": int(ctx) if str(ctx or "").isdigit() else None}
+        self.save()
+        self.pushed.pop(hid, None)
+        threading.Thread(target=self.ensure, args=(hid,), daemon=True).start()
+        return self.info()
+
+    def info(self) -> dict:
+        with self.lock:
+            hosts = []
+            for hid, h in self.hosts.items():
+                st = h.get("status") or {}
+                hosts.append({"id": hid, "name": h["name"], "addr": f"{h['addr']}:{h['port']}",
+                              "error": h.get("error", ""), "want": self.assign.get(hid, "–"),
+                              **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
+                                                       "estimate_tps", "progress", "models", "stats")},
+                              "busy": (st.get("metrics") or {}).get("requests_processing")})
+                if h.get("error"):
+                    hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]
+        return {"hosts": sorted(hosts, key=lambda x: x["name"]),
+                "catalog": [{"key": k, "desc": d} for k, _r, _q, d in CATALOG]}
 
 
 def _router_initial(arg: str, has_fast: bool) -> tuple[bool, str]:
@@ -2857,34 +3490,41 @@ def cmd_models(args) -> None:
         print("\n* Empfehlung. Herunterladen mit: privatelm-node download <Name aus der Liste oder Nummer>")
 
 
-def cmd_download(args) -> None:
-    target = args.model
-    spec = None
+class ModelError(Exception):
+    pass
+
+
+def resolve_spec(target: str) -> tuple[str, str]:
+    """(repo, quant) for a catalog name, a number from `models`, or user/repo[:QUANT]."""
     for key, repo, quant, _d in CATALOG:
         if target.lower() in (key, repo.lower()):
-            spec = (repo, quant)
-    if spec is None and target.isdigit():
-        res = list_models(False)
-        e = res["models"][int(target) - 1]
-        if e["source"] == "local":
-            print(e["path"])
-            return
-        spec = (e["repo"], e["quant"])
-    if spec is None:
-        repo, _, quant = target.partition(":")
-        if "/" not in repo:
-            die(f"Unknown model {target}: a catalog name (privatelm-node models), or user/repo[:QUANT]")
-        spec = (repo, quant or "Q4_K_M")
+            return repo, quant
+    repo, _, quant = target.partition(":")
+    if "/" not in repo:
+        raise ModelError(f"Unknown model {target}: a catalog name (privatelm-node models), or user/repo[:QUANT]")
+    return repo, quant or "Q4_K_M"
+
+
+def fetch_model(target: str, out_dir: Path, force: bool = False, quiet: bool = False,
+                on_resolved=None, max_mb: Optional[int] = None) -> Path:
+    """Downloads a model (resumable, checked against its SHA-256) and returns
+    the path of its first file. on_resolved(info) is called once the files
+    are known; max_mb refuses models that won't fit before downloading."""
+    spec = resolve_spec(target)
     try:
         r = hf_resolve(*spec)
     except Exception as e:  # noqa: BLE001
-        die(f"Could not look up {spec[0]} ({spec[1]}) on Hugging Face: {e}")
+        raise ModelError(f"Could not look up {spec[0]} ({spec[1]}) on Hugging Face: {e}") from e
     archs = supported_archs()
-    if r["arch"] and archs is not None and r["arch"] not in archs and not args.force:
-        die(f"{r['name']} uses architecture {r['arch']}, which this llama.cpp build doesn't know. "
-            "Pick another model, or --force.")
-    out_dir = Path(args.dir).expanduser()
+    if r["arch"] and archs is not None and r["arch"] not in archs and not force:
+        raise ModelError(f"{r['name']} uses architecture {r['arch']}, which this llama.cpp build doesn't know. "
+                         "Pick another model, or --force.")
+    if max_mb is not None and r["size_mb"] * 1.1 + 600 > max_mb:
+        raise ModelError(f"{r['name']} needs about {(r['size_mb'] * 1.1 + 600) / 1024:.1f} GB, "
+                         f"this PC has {max_mb / 1024:.1f} GB for models")
     out_dir.mkdir(parents=True, exist_ok=True)
+    if on_resolved:
+        on_resolved({**r, "dir": str(out_dir)})
     paths = []
     for f in r["files"]:
         dest = out_dir / Path(f["file"]).name
@@ -2897,10 +3537,12 @@ def cmd_download(args) -> None:
         log(f"Downloading {dest.name} ({f['size']/2**30:.1f} GB) to {out_dir}")
         if shutil.which("curl"):
             cmd = ["curl", "-fL", "--retry", "5", "-C", "-", "-o", str(part), url]
+            if quiet:
+                cmd.insert(1, "-sS")
             if os.environ.get("HF_TOKEN"):
                 cmd[1:1] = ["-H", f"Authorization: Bearer {os.environ['HF_TOKEN']}"]
             if subprocess.run(cmd).returncode != 0:
-                die(f"Download failed; run the same command again to resume ({part})")
+                raise ModelError(f"Download failed; run the same command again to resume ({part})")
         else:
             _download_urllib(url, part)
         if f.get("sha256"):
@@ -2911,10 +3553,24 @@ def cmd_download(args) -> None:
                     h.update(chunk)
             if h.hexdigest() != f["sha256"]:
                 part.unlink(missing_ok=True)
-                die(f"{dest.name}: checksum mismatch, file deleted; please try again")
+                raise ModelError(f"{dest.name}: checksum mismatch, file deleted; please try again")
         part.rename(dest)
         dest.chmod(0o644)
-    print(paths[0])
+    return paths[0]
+
+
+def cmd_download(args) -> None:
+    target = args.model
+    if target.isdigit():
+        e = list_models(False)["models"][int(target) - 1]
+        if e["source"] == "local":
+            print(e["path"])
+            return
+        target = f"{e['repo']}:{e['quant']}"
+    try:
+        print(fetch_model(target, Path(args.dir).expanduser(), args.force))
+    except ModelError as e:
+        die(str(e))
 
 
 def _download_urllib(url: str, part: Path) -> None:
@@ -2955,6 +3611,23 @@ def main() -> None:
     w.add_argument("--no-status", action="store_true")
     w.set_defaults(fn=cmd_worker)
 
+    h = sub.add_parser("host", help="load whole models for a master's router (the master picks the model)")
+    h.add_argument("--key", help="cluster key: the master's API key (better: --key-file)")
+    h.add_argument("--key-file", help="file with the cluster key")
+    h.add_argument("--host", default="0.0.0.0", help="address to listen on (default all)")
+    h.add_argument("--port", type=int, default=HOST_CTL_PORT, help=f"control API (default {HOST_CTL_PORT})")
+    h.add_argument("--api-port", type=int, default=HOST_API_PORT,
+                   help=f"llama-server for the master (default {HOST_API_PORT})")
+    h.add_argument("--models-dir", default="/srv/models" if os.access("/srv/models", os.W_OK) else "~/models",
+                   help="where downloaded models go")
+    h.add_argument("--advertise-ip")
+    h.add_argument("--no-advertise", action="store_true")
+    h.add_argument("extra", nargs=argparse.REMAINDER, help="-- further llama-server options")
+    h.set_defaults(fn=cmd_host)
+
+    k = sub.add_parser("key", help="print the master's API key (the cluster key for hosts)")
+    k.set_defaults(fn=cmd_key)
+
     s = sub.add_parser("serve", help="run a model here and serve an OpenAI-compatible API")
     s.add_argument("-m", "--model", required=True)
     s.add_argument("--workers", default="auto",
@@ -2978,6 +3651,11 @@ def main() -> None:
     s.add_argument("--router-mode", choices=["heuristic", "model"],
                    help="heuristic: rules on the request; model: the fast model judges (default: last setting)")
     s.add_argument("--model-name", default="privatelm", help="model name clients see with the router")
+    s.add_argument("--assign", action="append", metavar="HOST=MODEL[,role=..][,name=..][,ctx=N]",
+                   help="have a host load a whole model (repeatable): HOST is its name or IP, MODEL a catalog "
+                        "name, user/repo[:QUANT] or a file on the host; role big (default), fast, or extra "
+                        "(only by name); name is what clients ask for")
+    s.add_argument("--hosts", help="hosts mDNS doesn't find: IP[:PORT],... (default port 50070)")
     s.add_argument("--rebalance", choices=["auto", "on", "off"], default="auto",
                    help="re-plan when workers come or go, and wait for workers if the model doesn't fit "
                         "(auto: last setting from the dashboard, else on; off: plan once, exit 2 if it doesn't fit)")

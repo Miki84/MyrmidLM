@@ -110,16 +110,31 @@ privatelm-node serve -m gross.gguf --fast-model klein.gguf --router off
 privatelm-node serve -m gross.gguf --fast-url http://10.0.0.5:8080/v1 --fast-key KEY   # vorhandener Server als schnelles Modell
 ```
 
-- Clients sehen einen Endpunkt und den Modellnamen `privatelm` (`--model-name`). Der Router läuft auf dem API-Port, die beiden llama-server lokal auf Port+1 (groß) und Port+2 (schnell).
+- Clients sehen einen Endpunkt und den Modellnamen `privatelm` (`--model-name`), dazu jedes Modell unter seinem eigenen Namen. Der Router läuft immer auf dem API-Port, auch ohne Zweitmodell (Hosts können später dazukommen); die llama-server laufen lokal auf Port+1 (groß) und Port+2 (schnell).
 - Das schnelle Modell läuft auf einem Gerät: `--fast-device CUDA0` oder `CPU`, sonst auf der lokalen GPU, auf die es am besten passt. Sein Speicher (Gewichte, KV-Cache für `--fast-ctx`, Puffer) wird bei der Planung des großen Modells freigehalten.
 - **Entscheidung „Regeln“** (Standard): an das große Modell gehen Anfragen mit Werkzeugen, Bildern, langem Kontext, langer gewünschter Antwort, strukturierter Ausgabe, langen Gesprächen, langen Fragen und Begriffen wie Code, Skript, Analyse, Vergleich, Berechnung, Docker, SQL. Alles andere geht an das schnelle. **„Schnelles Modell“**: Das kleine Modell bewertet jede Anfrage mit einem Token (einfach/schwer); die festen Regeln (Werkzeuge, Bilder, langer Kontext) gelten weiter.
 - Gezielt ansprechen: Modellname `fast` oder `big`, oder Header `X-PrivateLM-Route: fast|big`. Jede Antwort trägt `X-PrivateLM-Route` und `X-PrivateLM-Reason`.
 - **Ein- und ausschalten:** im Dashboard (Schalter und Wahl der Entscheidungsart, wirkt sofort und bleibt über Neustarts gespeichert) oder per `--router on|off`; `--router auto` (Standard) nimmt die letzte Einstellung aus dem Dashboard. Aus heißt: alles an das große Modell.
 - `bench` misst mit Router standardmäßig das große Modell (`--route fast` für das schnelle).
 
+**Hosts (mehrere ganze Modelle, ein Endpunkt):** Ein Host ist ein PC, der ein ganzes Modell auf seine eigene GPU lädt, etwa drei PCs mit je einer A4000. Der Router des Masters verteilt die Anfragen auf sie. Anders als Worker (ein Modell über mehrere Rechner verteilt) rechnet jeder Host für sich, ohne Netzwerk-Runden pro Token.
+
+```bash
+# auf jedem Host (der Schlüssel ist der API-Key des Masters: dort privatelm-node key)
+privatelm-node host --key-file /etc/privatelm-node/cluster_key
+# auf dem Master: welcher Host was lädt (oder im Dashboard, Bereich Hosts)
+privatelm-node serve -m gross.gguf --assign "pc2=qwen3-32b,name=qwen32" --assign "pc3=qwen3-32b,name=qwen32" \
+                     --assign "pc4=bartowski/Qwen2.5-Coder-14B-Instruct-GGUF:Q4_K_M,name=coder,role=extra"
+```
+
+- **Zuweisen:** im Dashboard (Modell, Name, Rolle, Kontext, „Laden“/„Entladen“) oder mit `--assign HOST=MODELL[,role=big|fast|extra][,name=NAME][,ctx=N]`. HOST ist Rechnername, IP oder IP:Port; MODELL ein Katalogname, `user/repo:QUANT` oder eine Datei auf dem Host. Der Host lädt das Modell selbst herunter (fortsetzbar, SHA-256 geprüft) nach `--models-dir`, plant es auf seinen GPUs und startet llama-server auf Port 8081. Passt es nicht, meldet er das, bevor er herunterlädt. Die Zuweisung merken sich Master (`hosts.json`) und Host; nach einem Neustart lädt der Host sein Modell wieder, auch ohne Master.
+- **Verteilen:** Hosts mit demselben Namen bilden eine Gruppe; jede Anfrage geht an das Mitglied mit den wenigsten laufenden Anfragen. Clients wählen per Modellname (`"model": "qwen32"`, `/v1/models` listet alle) oder schicken `privatelm`: Dann entscheiden die Regeln zwischen den Rollen „schnell“ und „groß“; „nur per Name“ (`extra`) bekommt nur Anfragen, die es beim Namen nennen. Das eigene Modell des Masters ist ein Mitglied der Rolle „groß“. Jede Antwort trägt `X-PrivateLM-Backend: name@rechner`.
+- **Sicherheit:** Die Steuerung der Hosts (Port 50070) und ihre Modell-API (8081) verlangen den API-Key des Masters; wer ihn hat, kann Modelle laden lassen. Das Installationsskript (Rolle 3) legt den Schlüssel root-lesbar in `/etc/privatelm-node/cluster_key` ab und öffnet beide Ports nur für den Master.
+- Hosts brauchen eigenen Speicher für ihr Modell; Worker brauchen kein Modell (der Master schickt ihnen ihre Layer).
+
 **Dashboard:** `serve` startet auf Port 8090 eine Weboberfläche (`http://<Master-IP>:8090/`, Anmeldung mit dem API-Key). Sie zeigt die Modell-Aufteilung Layer für Layer in Ausführungsreihenfolge, Live-Token/s, Netzwerkverkehr pro Token, den Verlauf der letzten zehn Minuten und für Master und jeden Worker CPU, RAM, Netz sowie je GPU Auslastung, VRAM, Temperatur und Leistung (NVIDIA über `nvidia-smi`, AMD über die Treiberwerte). Die Worker liefern ihre Messwerte über einen kleinen Nur-Lese-Endpunkt auf Port 50060, den nur der Master erreichen muss. Handys haben keinen Status-Endpunkt: Ihre Karte zeigt, ob der Master mit ihnen verbunden ist und ob sie im Netz zu sehen sind. Ein Knopf startet einen Kurztest. Optionen: `--dashboard-port`, `--no-dashboard` (serve), `--status-port`, `--no-status` (worker).
 
-**Als Dienst:** `systemd/privatelm-worker.service` bzw. `privatelm-server.service` nach `/etc/systemd/system/` kopieren, Pfade anpassen, `systemctl enable --now …`.
+**Als Dienst:** `systemd/privatelm-worker.service`, `privatelm-host.service` bzw. `privatelm-server.service` nach `/etc/systemd/system/` kopieren, Pfade anpassen, `systemctl enable --now …`.
 
 ## Netzwerk und Sicherheit
 

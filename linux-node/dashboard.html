@@ -98,6 +98,21 @@
   #reb-events li { grid-template-columns: 62px 1fr; }
   @media (max-width: 900px) { .router, .rebalance { grid-template-columns: 1fr; } }
   .router-off { margin-bottom: 16px; color: var(--muted); font-size: 0.9rem; }
+  .backends { margin-top: 4px; }
+  .backends td.role { font-weight: 600; white-space: nowrap; }
+  .hosts { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; }
+  .host { background: var(--surface-2); border-radius: var(--radius-s); padding: 14px 16px; display: grid; gap: 10px; }
+  .host h3 { margin: 0; font-size: 1rem; }
+  .host .sub { color: var(--muted); font-size: 0.84rem; }
+  .host-top { display: flex; justify-content: space-between; gap: 10px; align-items: start; }
+  .host form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .host form .wide { grid-column: 1 / -1; }
+  .host label { display: grid; gap: 3px; font-size: 0.8rem; color: var(--muted); }
+  .host input, .host select { font: inherit; font-size: 0.9rem; padding: 7px 9px; border-radius: 7px; border: 1px solid var(--line);
+                              background: var(--surface); color: var(--text); min-width: 0; }
+  .host .acts { display: flex; gap: 8px; grid-column: 1 / -1; }
+  .progress { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+  .progress i { display: block; height: 100%; background: var(--c0); }
 
   /* Split strip */
   .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-l); padding: 20px 22px; }
@@ -241,13 +256,20 @@
       </div>
     </div>
     <div>
-      <div class="routes" id="routes"></div>
+      <table class="lan backends"><thead><tr><th>Rolle</th><th>Name für Clients</th><th>Modell</th><th>Rechner</th><th>Status</th><th class="num">aktiv</th><th class="num">Anfragen</th></tr></thead><tbody id="backends"></tbody></table>
       <div class="share" id="share" aria-hidden="true"></div>
       <div class="muted" style="font-size:.84rem" id="share-text"></div>
       <ul class="decisions" id="decisions" aria-label="Letzte Entscheidungen"></ul>
     </div>
   </section>
-  <p class="router-off" id="router-off" hidden>Router nicht aktiv: Es läuft nur ein Modell. Mit <code>--fast-model klein.gguf</code> beantwortet ein zweites, schnelles Modell einfache Anfragen.</p>
+  <p class="router-off" id="router-off" hidden></p>
+
+  <section class="panel" id="hosts-panel" aria-labelledby="hosts-title" style="margin-bottom:16px">
+    <div class="panel-head"><h2 id="hosts-title">Hosts</h2><span class="muted" id="hosts-sub"></span></div>
+    <p class="note" id="hosts-note"></p>
+    <div class="hosts" id="hosts"></div>
+    <datalist id="model-list"></datalist>
+  </section>
 
   <section class="panel" aria-labelledby="split-title">
     <div class="panel-head">
@@ -553,38 +575,109 @@ function renderLan(s) {
     <td>${d.compatible ? (d.kind === "worker" ? "frei, nicht im Plan" : "eigener Server") : "andere Version"}</td></tr>`).join("");
 }
 
+const ROLE_TEXT = { big: "groß", fast: "schnell", extra: "nur per Name" };
+const STATUS_TEXT = { ready: "bereit", loading: "lädt", down: "nicht erreichbar", starting: "startet" };
+
 function renderRouter(s) {
   const r = s.router || {};
   $("router").hidden = !r.available;
-  $("router-off").hidden = !!r.available;
   if (!r.available) return;
   const sw = $("router-switch");
   if (!sw.dataset.busy) sw.setAttribute("aria-checked", String(!!r.enabled));
-  document.querySelectorAll(".seg-ctl button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === r.mode)));
-  const fastName = r.fast.model, bigName = r.big.model;
-  $("router-explain").textContent = r.enabled
+  sw.disabled = !r.has_fast;
+  document.querySelectorAll(".seg-ctl button").forEach((b) => { b.setAttribute("aria-pressed", String(b.dataset.mode === r.mode)); b.disabled = !r.has_fast; });
+  const bs = r.backends || [];
+  const names = (role) => [...new Set(bs.filter((b) => b.role === role).map((b) => b.model))].join(", ") || "–";
+  const fastName = names("fast"), bigName = names("big");
+  $("router-explain").textContent = !r.has_fast
+    ? `Kein schnelles Modell: Anfragen gehen an die großen Modelle (${bigName}), jeweils an das mit den wenigsten laufenden Anfragen. Mit dem Namen aus der Tabelle lässt sich jedes Modell gezielt ansprechen.`
+    : r.enabled
     ? (r.mode === "model"
-      ? `Das schnelle Modell schätzt jede Anfrage ein. Einfache beantwortet ${fastName} selbst, alles andere ${bigName}.`
+      ? `Das schnelle Modell schätzt jede Anfrage ein. Einfache beantwortet ${fastName}, alles andere ${bigName}.`
       : `Kurze, einfache Anfragen beantwortet ${fastName}, alles mit Code, Analyse, Werkzeugen, Bildern oder langem Kontext ${bigName}.`)
     : `Aus: Alle Anfragen gehen an ${bigName}. Mit dem Modellnamen „fast“ lässt sich das schnelle Modell trotzdem gezielt ansprechen.`;
-  const fl = r.fast_live || {}, plan = s.plan || {}, fi = plan.fast || {};
-  const statusText = (st) => ({ ready: "bereit", loading: "lädt", down: "nicht erreichbar", starting: "startet" }[st] || st || "–");
-  const n = r.counts || { fast: 0, big: 0 }, total = (n.fast || 0) + (n.big || 0);
+  const fl = r.fast_live || {};
   const fastTps = fl.tps_now > 0 ? fl.tps_now : fl.tps_last;
-  $("routes").innerHTML = `
-    <div class="route" style="--rc:var(--c1)"><div class="m">Schnell</div><div class="n num">${nf(n.fast, 0)}</div>
-      <div class="m">${esc(fastName)}${fi.device ? `, ${esc(fi.device)}` : ""}</div>
-      <div class="m">${statusText(r.fast.status)}${fastTps ? `, ${nf(fastTps, 1)} Token/s` : ""}</div></div>
-    <div class="route" style="--rc:var(--c0)"><div class="m">Groß</div><div class="n num">${nf(n.big, 0)}</div>
-      <div class="m">${esc(bigName)}</div><div class="m">${statusText(r.big.status)}</div></div>`;
-  const pf = total ? 100 * n.fast / total : 0;
-  $("share").innerHTML = total ? `<i style="width:${pf}%;background:var(--c1)"></i><i style="width:${100 - pf}%;background:var(--c0)"></i>` : "";
-  $("share-text").textContent = total ? `${nf(pf, 0)} % der ${nf(total, 0)} Anfragen seit dem Start gingen an das schnelle Modell.` : "Noch keine Anfragen seit dem Start.";
+  $("backends").innerHTML = bs.map((b) => `<tr><td class="role" style="color:${b.role === "fast" ? "var(--c1)" : b.role === "big" ? "var(--c0)" : "var(--c3)"}">${ROLE_TEXT[b.role] || esc(b.role)}</td>
+    <td><code>${esc(b.group || b.model)}</code></td><td>${esc(b.model)}${b.ctx ? `<div class="note">Kontext ${b.ctx.toLocaleString("de-DE")}</div>` : ""}</td>
+    <td>${esc(b.where)}${b.source === "local" ? ' <span class="muted">(Master)</span>' : ""}</td>
+    <td>${STATUS_TEXT[b.status] || esc(b.status)}${b.role === "fast" && b.source === "local" && fastTps ? `, ${nf(fastTps, 1)} Token/s` : ""}</td>
+    <td class="num">${b.inflight}</td><td class="num">${nf(b.served, 0)}</td></tr>`).join("");
+  const n = r.counts || {}, total = (n.fast || 0) + (n.big || 0) + (n.extra || 0);
+  const pf = total ? 100 * (n.fast || 0) / total : 0, pe = total ? 100 * (n.extra || 0) / total : 0;
+  $("share").innerHTML = total ? `<i style="width:${pf}%;background:var(--c1)"></i><i style="width:${100 - pf - pe}%;background:var(--c0)"></i><i style="width:${pe}%;background:var(--c3)"></i>` : "";
+  $("share-text").textContent = total ? `${nf(pf, 0)} % der ${nf(total, 0)} Anfragen seit dem Start gingen an ein schnelles Modell.` : "Noch keine Anfragen seit dem Start.";
   $("decisions").innerHTML = (r.recent || []).slice().reverse().map((d) => {
     const t = new Date(d.t * 1000).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    return `<li><span class="muted num">${t}</span><span class="tag" style="color:${d.route === "fast" ? "var(--c1)" : "var(--c0)"}">${d.route === "fast" ? "schnell" : "groß"}</span><span>${esc(d.reason)}</span></li>`;
+    const col = d.route === "fast" ? "var(--c1)" : d.route === "big" ? "var(--c0)" : "var(--c3)";
+    return `<li><span class="muted num">${t}</span><span class="tag" style="color:${col}">${ROLE_TEXT[d.route] === "nur per Name" ? "Name" : ROLE_TEXT[d.route] || ""}</span><span>${esc(d.reason)}${d.model ? ` → ${esc(d.model)}${d.where ? " auf " + esc(d.where) : ""}` : ""}</span></li>`;
   }).join("");
 }
+
+const HOST_STATE = { idle: ["", "frei"], preparing: ["warn", "bereitet vor"], downloading: ["warn", "lädt herunter"],
+  loading: ["warn", "lädt das Modell"], ready: ["ok", "bereit"], error: ["bad", "Fehler"], unreachable: ["bad", "nicht erreichbar"] };
+const hostEdits = {};  // host id -> form values the user is typing, kept across refreshes
+
+function renderHosts(s) {
+  const h = s.hosts || {}, list = h.hosts || [];
+  const models = new Set((h.catalog || []).map((c) => c.key));
+  list.forEach((x) => (x.models || []).forEach((m) => models.add(m)));
+  $("model-list").innerHTML = [...models].map((m) => `<option value="${esc(m)}">`).join("")
+    + (h.catalog || []).map((c) => `<option value="${esc(c.key)}">${esc(c.desc)}</option>`).join("");
+  $("hosts-sub").textContent = list.length ? `${list.length} ${list.length === 1 ? "Host" : "Hosts"} im Netz` : "";
+  $("hosts-note").textContent = h.off
+    ? "Hosts brauchen einen API-Key auf dem Master (er ist ihr Cluster-Schlüssel)."
+    : list.length ? "Jeder Host lädt ein ganzes Modell auf seine eigenen GPUs. Hosts mit demselben Namen teilen sich die Anfragen; Rolle „groß“ und „schnell“ nutzt der Router auch ohne Namen."
+    : "Noch keine Hosts gefunden. Auf einem PC mit GPU das Installationsskript mit der Rolle „Host“ starten (es fragt nach dem API-Key dieses Masters).";
+  const focused = document.activeElement && document.activeElement.closest(".host");
+  if (focused) return;  // don't rebuild the form someone is typing in
+  $("hosts").innerHTML = list.map((x) => {
+    const [cls, txt] = HOST_STATE[x.state] || ["", x.state || "–"];
+    const st = x.stats || {}, gpus = (st.gpus || []).map((g) => `${esc(g.name)} (${gb(g.mem_total_mb)})`).join(", ");
+    const a = x.assignment || {}, e = hostEdits[x.id] || {};
+    const val = (k, d) => esc(e[k] ?? a[k] ?? d ?? "");
+    const pr = x.progress;
+    const prog = x.state === "downloading" && pr ? `<div class="progress"><i style="width:${pr.total_mb ? 100 * pr.done_mb / pr.total_mb : 0}%"></i></div>
+      <div class="note">${esc(pr.name)}: ${gb(pr.done_mb)} von ${gb(pr.total_mb)}</div>` : "";
+    const now = x.model ? `<div><b>${esc(x.model)}</b>${x.ctx ? `, Kontext ${x.ctx.toLocaleString("de-DE")}` : ""}${x.estimate_tps ? `, geschätzt ${nf(x.estimate_tps, 1)} Token/s` : ""}${x.busy ? `, ${x.busy} Anfrage(n) in Arbeit` : ""}</div>` : "";
+    const role = e.role ?? a.role ?? "big";
+    return `<article class="host" data-id="${esc(x.id)}">
+      <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${gpus ? " · " + gpus : ""}</div></div>
+        <div class="pill"><span class="dot ${cls}"></span><span>${txt}</span></div></div>
+      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}
+      <form>
+        <label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>
+        <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
+        <label>Rolle<select name="role">${["big", "fast", "extra"].map((r) => `<option value="${r}"${r === role ? " selected" : ""}>${ROLE_TEXT[r]}</option>`).join("")}</select></label>
+        <label>Kontext<input name="ctx" inputmode="numeric" value="${val("ctx")}" placeholder="automatisch"></label>
+        <div class="acts"><button class="btn" type="submit">Laden</button>${x.assignment ? `<button class="btn quiet" type="button" data-unload>Entladen</button>` : ""}</div>
+      </form></article>`;
+  }).join("");
+}
+
+async function hostAction(body) {
+  try { const r = await api("/api/hosts", { method: "POST", body: JSON.stringify(body) }); if (last && r.hosts) { last.hosts = r; renderHosts(last); } }
+  catch (e) { /* the next poll shows the real state */ }
+}
+
+$("hosts").addEventListener("input", (ev) => {
+  const card = ev.target.closest(".host"); if (!card) return;
+  const id = card.dataset.id;
+  hostEdits[id] = { ...(hostEdits[id] || {}), [ev.target.name]: ev.target.value };
+});
+$("hosts").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const card = ev.target.closest(".host"), f = new FormData(ev.target);
+  delete hostEdits[card.dataset.id];
+  document.activeElement.blur();
+  hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx") });
+});
+$("hosts").addEventListener("click", (ev) => {
+  if (!ev.target.matches("[data-unload]")) return;
+  const card = ev.target.closest(".host");
+  delete hostEdits[card.dataset.id];
+  hostAction({ host: card.dataset.id, unload: true });
+});
 
 async function setRouter(body) {
   const sw = $("router-switch");
@@ -637,7 +730,7 @@ function renderBench(s) {
 function render(s) {
   colors = { master: "var(--c0)" };
   (s.plan.machines || []).filter((m) => m.role === "worker").forEach((m, i) => { colors[m.id] = `var(--c${(i + 1) % 6})`; });
-  renderHeader(s); renderLive(s); renderRouter(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderRebalance(s); renderBench(s);
+  renderHeader(s); renderLive(s); renderRouter(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderRebalance(s); renderHosts(s); renderBench(s);
 }
 
 /* ── Polling, login ──────────────────────────────────────────────────── */
