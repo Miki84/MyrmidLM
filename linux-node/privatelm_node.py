@@ -55,6 +55,11 @@ PHONE_SHARE = 0.75
 PC_RAM_SHARE = 0.9  # of what a PC RAM worker offers (already minus its reserve)
 HOST_SHARE = 0.9
 UNKNOWN_PHONE_SPEED = 4.0  # GB/s, as in the app
+# Phones measure their memory bandwidth with a copy loop, but llama.cpp on a
+# phone CPU is held back by compute and thermal throttling long before that:
+# a phone reaching about half of it is typical. Without this a phone looks
+# faster than a laptop and gets the whole model.
+PHONE_SPEED_FACTOR = 0.5
 
 
 def log(msg: str) -> None:
@@ -491,7 +496,8 @@ class Unit:
     device_caps: list[int] = field(default_factory=list)
     layers: int = 0
     min_layers: int = 0  # e.g. the MTP tail that must stay on this PC
-    status_port: int = 0  # worker's monitoring endpoint
+    status_port: int = 0  # worker's monitoring endpoint (0: none, e.g. phones)
+    mem_mb: list[float] = field(default_factory=list)  # room per device, for re-planning at another -c
 
     @property
     def remote(self) -> bool:
@@ -761,22 +767,26 @@ def _remote_units(workers: list[Peer], per_layer: float) -> list[Unit]:
         if not devs_w:
             log(f"Worker {w.endpoint} reported no devices, leaving it out")
             continue
+        phone = not w.txt.get("kind")  # PC workers say gpu or cpu
         if w.is_gpu:
-            caps = [int((f * GPU_SHARE - GPU_RESERVE_MB) // per_layer) for _, f in devs_w]
+            mem = [f * GPU_SHARE - GPU_RESERVE_MB for _, f in devs_w]
         else:
             offered = sum(f for _, f in devs_w)
             if w.ram_mb:
                 offered = min(offered, w.ram_mb)
-            budget = offered * (PC_RAM_SHARE if w.txt.get("kind") == "cpu" else PHONE_SHARE)
+            budget = offered * (PHONE_SHARE if phone else PC_RAM_SHARE)
             total_f = sum(f for _, f in devs_w) or 1
-            caps = [int(budget * f / total_f // per_layer) for _, f in devs_w]
-        caps = [max(0, c) for c in caps]
-        u = Unit(w.txt.get("model") or w.name, sum(caps), w.bandwidth or UNKNOWN_PHONE_SPEED, [],
+            mem = [budget * f / total_f for _, f in devs_w]
+        mem = [max(0.0, x) for x in mem]
+        caps = [int(x // per_layer) for x in mem]
+        speed = (w.bandwidth * PHONE_SPEED_FACTOR if phone else w.bandwidth) if w.bandwidth else UNKNOWN_PHONE_SPEED
+        u = Unit(w.txt.get("model") or w.name, sum(caps), speed, [],
                  endpoint=w.endpoint, rtt_s=measure_rtt(w.endpoint),
-                 net_mbps=NET_MBPS_PC if w.txt.get("kind") else NET_MBPS_PHONE, device_caps=caps,
-                 status_port=int(w.txt.get("stat") or STATUS_PORT))
+                 net_mbps=NET_MBPS_PHONE if phone else NET_MBPS_PC, device_caps=caps,
+                 status_port=0 if phone else int(w.txt.get("stat") or STATUS_PORT), mem_mb=mem)
         log(f"Worker {u.label} ({w.endpoint}): room for {u.capacity_layers} layers, "
-            f"{u.speed:.0f} GB/s, {u.rtt_s*1000:.1f} ms round trip")
+            f"{u.speed:.0f} GB/s{' (phone: half of the measured %.0f)' % w.bandwidth if phone and w.bandwidth else ''}, "
+            f"{u.rtt_s*1000:.1f} ms round trip")
         remote.append(u)
     return remote
 
@@ -836,19 +846,37 @@ class ServerPlan:
     key: str
     estimate_tps: float
     info: dict = field(default_factory=dict)  # the plan, for the dashboard
+    # For re-planning without touching busy devices: every unit with the
+    # room it had before the server started, the model at this -c, and the
+    # unit that computes the output head.
+    units: list = field(default_factory=list)
+    model_info: Optional["ModelInfo"] = None
+    out_label: str = ""
+    model_path: str = ""
+
+    def endpoints(self) -> list[str]:
+        return [ep for mach in self.info.get("machines", []) for ep in mach.get("endpoints", [])]
 
 
-def build_server_fitting(args, quiet: bool = False) -> ServerPlan:
+CTX_STEPS = (8192, 4096, 2048)  # without --ctx: the first that fits
+
+
+def build_server_fitting(args, quiet: bool = False, exit_on_fail: bool = True) -> ServerPlan:
     """build_server, halving the context (down to 2048) when the model
-    doesn't fit and no --ctx was given: the KV cache is often what's over."""
+    doesn't fit and no --ctx was given: the KV cache is often what's over.
+    exit_on_fail=False raises PlanTooBig instead of ending the program."""
     auto = args.ctx is None
     if auto:
-        args.ctx = 8192
+        args.ctx = CTX_STEPS[0]
     while True:
         try:
             return build_server(args, quiet)
         except PlanTooBig as e:
-            if not auto or args.ctx <= 2048:
+            if not auto or args.ctx <= CTX_STEPS[-1]:
+                if auto:
+                    args.ctx = None  # the next try starts at the top again
+                if not exit_on_fail:
+                    raise
                 die(str(e) + ("" if auto else " (--ctx was set; leave it out to shrink it automatically)"),
                     PLAN_FAILED)
             log(f"Doesn't fit with -c {args.ctx}; trying -c {args.ctx // 2}.")
@@ -899,10 +927,10 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
             host_budget -= budgets[i]
     gpus = [Unit(f"{d.name} {d.description}", max(0, int(b // per_layer)), d.bandwidth or 100.0,
                  [d.name], device_caps=[max(0, int(b // per_layer))],
-                 min_layers=m.n_nextn if (args.mtp and d is out_gpu) else 0)
+                 min_layers=m.n_nextn if (args.mtp and d is out_gpu) else 0, mem_mb=[max(0.0, b)])
             for d, b in zip(local_gpus, budgets)]
     host_room = host_budget - m.embd_mb - (0 if out_gpu else out_extra)
-    host = Unit("This PC (RAM)", max(0, int(host_room // per_layer)), host_speed, [])
+    host = Unit("This PC (RAM)", max(0, int(host_room // per_layer)), host_speed, [], mem_mb=[max(0.0, host_room)])
 
     # MoE on this PC alone (experts in RAM), if it fits and isn't slower.
     moe = None
@@ -1028,7 +1056,9 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     info = _plan_info(args, model, m, "layers", 1 / est, hops, net_kb, segments, used_remote,
                       {"machine": "master" if not out_unit.remote else out_unit.endpoint.rsplit(":", 1)[0],
                        "label": where})
-    return _finish_command(args, cmd, model, 1 / est, info)
+    sp = _finish_command(args, cmd, model, 1 / est, info)
+    sp.units, sp.model_info, sp.out_label, sp.model_path = gpus + remote + [host], m, out_unit.label, model
+    return sp
 
 
 def _plan_info(args, model: str, m: ModelInfo, mode: str, tps: float, hops: int, net_kb: float,
@@ -1040,7 +1070,8 @@ def _plan_info(args, model: str, m: ModelInfo, mode: str, tps: float, hops: int,
         mach = next((x for x in machines if x["id"] == hid), None)
         if mach is None:
             mach = {"id": hid, "role": "worker", "host": hid, "label": u.label, "endpoints": [],
-                    "status_port": u.status_port, "layers": 0, "rtt_ms": round(u.rtt_s * 1000, 2)}
+                    "status_port": u.status_port, "phone": not u.status_port, "layers": 0,
+                    "rtt_ms": round(u.rtt_s * 1000, 2)}
             machines.append(mach)
         mach["endpoints"].append(u.endpoint)
         mach["layers"] += u.layers
@@ -1111,10 +1142,12 @@ def cmd_serve(args) -> None:
         # The big model listens locally; the router takes the public port.
         args.host, args.port = "127.0.0.1", public_port + 1
 
-    sp = build_server_fitting(args)
+    sup = Supervisor(args, _rebalance_initial(args.rebalance))
+    if not sup.start_plan(initial=True):
+        log(f"{sup.reason} Waiting for workers (checking every {REBALANCE_SCAN_S} s; "
+            "the dashboard shows the state).")
+    sp = sup.sp
     big_base = f"http://127.0.0.1:{args.port}"
-    log(" ".join(sp.cmd).replace(sp.key, "***") if sp.key else " ".join(sp.cmd))
-    proc = subprocess.Popen(sp.cmd)
     fast_proc = None
     router = None
     public_name = sp.name
@@ -1137,7 +1170,7 @@ def cmd_serve(args) -> None:
                         public_name, sp.key)
         sp.info["fast"] = fast_info
         if not router.start(public_host, public_port):
-            proc.terminate()
+            sup.stop_server()
             die(f"Port {public_port} is busy.")
         log(f"Router on port {public_port}: {'on' if enabled else 'off'} ({mode}); "
             "switch it in the dashboard or with --router on/off")
@@ -1156,12 +1189,15 @@ def cmd_serve(args) -> None:
         params["key"] = sp.key
     print(f"\nOpenAI-compatible API: http://{address}:{args.port}/v1  (model: {public_name})")
     if not args.no_dashboard:
-        dash = Dashboard(args, sp, proc, probe(bench=False), router=router, big_base=big_base)
+        dash = Dashboard(args, sup, probe(bench=False), router=router, big_base=big_base)
         if dash.start():
             print(f"Dashboard:             http://{address}:{args.dashboard_port}/"
                   + ("  (log in with the API key)" if sp.key else ""))
     show_qr(f"privatelm://server?{urlencode(params)}")
-    _wait([proc], adv, also_stop=[fast_proc] if fast_proc else [])
+    if sup.enabled:
+        log("Rebalancing on: new or lost workers lead to a new plan when the server is idle "
+            "(--rebalance off or the dashboard switches it off)")
+    sup.run([adv] if adv else [], [fast_proc] if fast_proc else [])
 
 
 def cmd_tune_mtp(args) -> None:
@@ -1422,6 +1458,404 @@ def _wait(procs, advs, also_stop: Optional[list] = None) -> None:
     sys.exit(0 if stopping else code)
 
 
+# ── Rebalancing ──────────────────────────────────────────────────────────────
+#
+# The split is planned when llama-server starts. With rebalancing on (the
+# default), serve keeps watching the LAN:
+#   - a new worker that makes the model faster (by REBALANCE_GAIN) or lets
+#     it run with a longer context: new plan as soon as no request runs;
+#   - a worker that drops out (llama-server ends when it loses one, or the
+#     worker stops answering): new plan with the ones left;
+#   - a model that doesn't fit (yet): wait for workers instead of exiting.
+# A new plan means reloading the model: workers without a tensor cache
+# (phones) get their layers sent again, which over Wi-Fi takes minutes.
+# The candidate plan is estimated from the room every device had before the
+# server started, so nothing busy is probed while the model is loaded.
+
+REBALANCE_STATE = CONFIG_DIR / "rebalance.json"
+REBALANCE_GAIN = 1.15  # estimated speed-up a new plan must bring
+REBALANCE_SCAN_S = 30
+REBALANCE_MIN_GAP_S = 300  # between switches for speed (lost workers: at once)
+REBALANCE_LOST_SCANS = 3  # missed scans before a worker counts as gone
+REBALANCE_RETRY_S = 300  # waiting for workers: re-plan at least this often
+
+
+def _rebalance_initial(arg: str) -> bool:
+    if arg in ("on", "off"):
+        return arg == "on"
+    try:
+        return bool(json.loads(REBALANCE_STATE.read_text()).get("enabled", True))
+    except (OSError, ValueError):
+        return True
+
+
+def tcp_connected(endpoint: str) -> bool:
+    """Whether this PC holds an established TCP connection to host:port
+    (llama-server keeps one open to every RPC worker it uses)."""
+    host, _, port = endpoint.rpartition(":")
+    try:
+        want_ip, want_port = socket.inet_aton(socket.gethostbyname(host)), int(port)
+    except (OSError, ValueError):
+        return False
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        for line in _read(Path(path)).splitlines()[1:]:
+            f = line.split()
+            if len(f) < 4 or f[3] != "01":
+                continue
+            ip_hex, _, port_hex = f[2].rpartition(":")
+            if int(port_hex, 16) != want_port:
+                continue
+            if len(ip_hex) == 32 and ip_hex.startswith("0000000000000000FFFF0000"):
+                ip_hex = ip_hex[24:]
+            if len(ip_hex) == 8 and struct.pack("<I", int(ip_hex, 16)) == want_ip:
+                return True
+    return False
+
+
+def estimate_plan(units: list[Unit], model_path: str, ctx: int, out_label: str,
+                  prune: bool) -> Optional[float]:
+    """Tokens/s the planner expects for these units at -c ctx, or None if
+    the model doesn't fit."""
+    import dataclasses
+
+    m = gguf_info(model_path, ctx)
+    per = m.per_layer_mb()
+    trial = []
+    for u in units:
+        caps = [max(0, int(mb // per)) for mb in u.mem_mb] or [u.capacity_layers]
+        trial.append(dataclasses.replace(u, capacity_layers=sum(caps), device_caps=caps, layers=0))
+    used = plan(trial, m, prune)
+    if not used:
+        return None
+    out = next((u for u in trial if u.label == out_label and not u.remote), None)
+    return 1 / token_time(used, m, out)
+
+
+class Supervisor:
+    """Owns llama-server for serve: starts it, re-plans when workers come
+    or go (if enabled), and waits for workers while the model doesn't fit."""
+
+    def __init__(self, args, enabled: bool):
+        import threading
+
+        self.args = args
+        self.ctx_auto = args.ctx is None
+        self.enabled = enabled
+        self.sp: Optional[ServerPlan] = None
+        self.proc: Optional[subprocess.Popen] = None
+        self.state = "starting"  # running | waiting | switching | stopped
+        self.reason = ""
+        self.pending: Optional[dict] = None
+        self.events: list[dict] = []
+        self.lock = threading.RLock()
+        self.stopping = False
+        self.now_requested = False
+        self.last_switch = time.time()
+        self.last_scan = 0.0
+        self.last_try = 0.0
+        self.tried_with: frozenset = frozenset()
+        self.evaluated: set = set()  # sets of new workers found not worth a switch
+        self.missing: dict[str, int] = {}
+        self.lan_seen: set[str] = set()  # worker endpoints in the last scan
+        self.ever_seen: set[str] = set()
+        self.exit_code = 0
+        # llama-server's own address (behind the router, if there is one)
+        self.big_host, self.big_port = args.host, args.port
+
+    # Events and state -------------------------------------------------------
+
+    def event(self, en: str, de: str) -> None:
+        log(en)
+        with self.lock:
+            self.events.append({"t": int(time.time()), "text": de})
+            del self.events[:-20]
+
+    def set_enabled(self, on: bool) -> None:
+        with self.lock:
+            self.enabled = on
+            if not on:
+                self.pending = None
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            REBALANCE_STATE.write_text(json.dumps({"enabled": on}))
+        except OSError:
+            pass
+        self.event(f"Rebalancing {'on' if on else 'off'}", f"Automatische Neuverteilung {'an' if on else 'aus'}")
+
+    def api(self, body: dict) -> dict:
+        if "enabled" in body:
+            self.set_enabled(bool(body["enabled"]))
+        if body.get("now"):
+            with self.lock:
+                if self.state == "waiting":
+                    self.last_try = 0.0
+                    self.tried_with = frozenset({"?"})
+                elif self.state == "running":
+                    self.now_requested = True
+        return self.info()
+
+    def info(self) -> dict:
+        with self.lock:
+            return {"enabled": self.enabled, "state": self.state, "reason": self.reason,
+                    "pending": self.pending, "now_requested": self.now_requested,
+                    "events": list(self.events[-8:]), "ctx_auto": self.ctx_auto,
+                    "gain_pct": round((REBALANCE_GAIN - 1) * 100)}
+
+    # Server ------------------------------------------------------------------
+
+    def placeholder(self) -> ServerPlan:
+        """Plan stand-in while waiting for workers, so router and dashboard run."""
+        a = self.args
+        model = str(Path(a.model).expanduser().resolve())
+        key = a.api_key if a.api_key is not None else _api_key()
+        try:
+            m = gguf_info(model, a.ctx or CTX_STEPS[-1])
+            info = {"model": Path(model).stem, "n_layer": m.n_layer, "kind": "moe" if m.is_moe else "dense",
+                    "n_expert": m.n_expert, "n_expert_used": m.n_expert_used, "mode": "waiting",
+                    "mtp": a.mtp, "ctx": a.ctx or CTX_STEPS[-1], "estimate_tps": 0, "hops": 0, "net_kb_est": 0,
+                    "per_layer_mb": round(m.per_layer_mb()), "size_gb": round(m.size_mb / 1024, 1),
+                    "segments": [], "output": {"machine": "master", "label": ""}, "moe_cpu_layers": 0,
+                    "machines": [{"id": "master", "role": "master", "host": socket.gethostname(), "layers": 0}]}
+        except Exception:  # noqa: BLE001 - a broken file shows up in the log anyway
+            info = {"model": Path(model).stem, "mode": "waiting", "segments": [], "machines": []}
+        return ServerPlan([], Path(model).stem, key, 0.0, info)
+
+    def start_plan(self, quiet: bool = False, initial: bool = False) -> bool:
+        """Plans and starts llama-server; False (state waiting) if the model
+        doesn't fit with the workers there are. Only the first plan with
+        rebalancing off ends the program instead (exit 2)."""
+        a = self.args
+        if self.ctx_auto:
+            a.ctx = None
+        public = (a.host, a.port)
+        a.host, a.port = self.big_host, self.big_port
+        try:
+            sp = build_server_fitting(a, quiet, exit_on_fail=initial and not self.enabled)
+        except PlanTooBig as e:
+            with self.lock:
+                if self.sp is None:
+                    self.sp = self.placeholder()
+                else:
+                    self.sp.info = {**self.placeholder().info}
+                self.state, self.reason, self.proc = "waiting", str(e), None
+            return False
+        finally:
+            a.host, a.port = public
+        log(" ".join(sp.cmd).replace(sp.key, "***") if sp.key else " ".join(sp.cmd))
+        proc = subprocess.Popen(sp.cmd)
+        with self.lock:
+            self.sp, self.proc, self.state, self.reason = sp, proc, "running", ""
+            self.pending, self.now_requested = None, False
+            self.evaluated, self.missing = set(), {}
+        return True
+
+    def stop_server(self) -> None:
+        p = self.proc
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+
+    def busy(self) -> bool:
+        """Whether llama-server is answering a request right now."""
+        import urllib.request
+
+        sp = self.sp
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{self.big_port}/metrics",
+                                         headers={"Authorization": f"Bearer {sp.key}"} if sp and sp.key else {})
+            with urllib.request.urlopen(req, timeout=2) as r:
+                for line in r.read().decode().splitlines():
+                    if line.startswith("llamacpp:requests_processing"):
+                        return (_num(line.rpartition(" ")[2]) or 0) > 0
+        except OSError:
+            pass  # loading or gone: nothing to interrupt
+        return False
+
+    def replan(self, en: str, de: str) -> None:
+        self.event(en, de)
+        with self.lock:
+            self.state = "switching"
+        self.stop_server()
+        self.last_switch = time.time()
+        if self.start_plan():
+            n = len(self.sp.info.get("machines", [])) - 1
+            self.event(f"New plan running: {n} worker(s), ~{self.sp.estimate_tps:.1f} tokens/s estimated, "
+                       f"-c {self.args.ctx}",
+                       f"Neuer Plan läuft: {n} Worker, geschätzt {self.sp.estimate_tps:.1f} Token/s, "
+                       f"Kontext {self.args.ctx}")
+        else:
+            self.event("Model doesn't fit with the workers left; waiting for workers",
+                       "Modell passt mit den verbliebenen Workern nicht. Wartet auf Worker.")
+
+    # Watching the LAN --------------------------------------------------------
+
+    def _lan_workers(self) -> Optional[list[Peer]]:
+        a = self.args
+        try:
+            peers = scan(3.0)
+        except Exception:  # noqa: BLE001 - mDNS trouble: try again next time
+            return None
+        me = machine_id()
+        peers = [p for p in peers if p.kind == "worker" and p.txt.get("id") != me
+                 and p.txt.get("v", RPC_VERSION) == RPC_VERSION]
+        if a.workers not in ("auto", "all", "off"):
+            wanted = set()
+            for ep in a.workers.split(","):
+                h, _, port = ep.strip().rpartition(":")
+                wanted.add(ep.strip() if h else f"{ep.strip()}:{DEFAULT_RPC_PORT}")
+            peers = [p for p in peers if p.endpoint in wanted]
+        with self.lock:
+            self.lan_seen = {p.endpoint for p in peers}
+            self.ever_seen |= self.lan_seen
+        return peers
+
+    def _alive(self, ep: str, machines: list[dict]) -> bool:
+        import urllib.request
+
+        if ep in self.lan_seen:
+            return True
+        mach = next((m for m in machines if ep in m.get("endpoints", [])), {})
+        if mach.get("status_port"):
+            try:
+                with urllib.request.urlopen(f"http://{mach['host']}:{mach['status_port']}/status", timeout=3):
+                    return True
+            except OSError:
+                return False
+        # a phone given by address, mDNS blocked: llama-server's connection
+        return ep not in self.ever_seen and tcp_connected(ep)
+
+    def check_workers(self) -> None:
+        a, sp = self.args, self.sp
+        if a.workers == "off" or sp is None:
+            return
+        peers = self._lan_workers()
+        if peers is None:
+            return
+        used = set(sp.endpoints())
+        machines = sp.info.get("machines", [])
+        for ep in used:
+            if self._alive(ep, machines):
+                self.missing.pop(ep, None)
+            else:
+                self.missing[ep] = self.missing.get(ep, 0) + 1
+        lost = sorted(ep for ep, n in self.missing.items() if n >= REBALANCE_LOST_SCANS)
+        if lost and not (self.pending and self.pending.get("lost")):
+            with self.lock:
+                self.pending = {"kind": "lost", "lost": lost, "t": int(time.time()),
+                                "text": f"Worker nicht mehr erreichbar: {', '.join(lost)}"}
+            self.event(f"Worker(s) gone: {', '.join(lost)}; re-planning when idle",
+                       f"Worker nicht mehr erreichbar: {', '.join(lost)}. Neuverteilung, sobald der Server frei ist.")
+            return
+        if sp.info.get("mode") != "layers" or not sp.units or self.pending:
+            return
+        new = [p for p in peers if p.endpoint not in used]
+        key = frozenset(p.endpoint for p in new)
+        if not new or key in self.evaluated:
+            return
+        self.evaluated.add(key)
+        self.evaluate(new)
+
+    def evaluate(self, new: list[Peer]) -> None:
+        sp, a = self.sp, self.args
+        extra = [u for u in _remote_units(new, sp.model_info.per_layer_mb()) if u.capacity_layers or any(u.mem_mb)]
+        if not extra:
+            return
+        prune = a.workers == "auto"
+        cur_ctx = a.ctx
+        cur = estimate_plan(sp.units, sp.model_path, cur_ctx, sp.out_label, prune) or sp.estimate_tps
+        names = ", ".join(u.label for u in extra)
+        noun = "Neuer Worker" if len(extra) == 1 else "Neue Worker"
+        for ctx in (CTX_STEPS if self.ctx_auto else (cur_ctx,)):
+            if ctx < cur_ctx:
+                break
+            tps = estimate_plan(sp.units + extra, sp.model_path, ctx, sp.out_label, prune)
+            if tps is None:
+                continue
+            if ctx > cur_ctx:
+                if tps < cur * 0.8:  # a longer context, but much slower: try a shorter one
+                    continue
+                why = f"Kontext {cur_ctx} → {ctx}"
+            elif tps >= cur * REBALANCE_GAIN:
+                why = f"geschätzt {cur:.1f} → {tps:.1f} Token/s"
+            else:
+                log(f"New worker(s) {names}: ~{tps:.1f} vs {cur:.1f} tokens/s now; not worth a reload")
+                return
+            with self.lock:
+                self.pending = {"kind": "gain", "t": int(time.time()), "workers": [u.endpoint for u in extra],
+                                "text": f"{noun} {names}: {why}", "tps": round(tps, 1), "ctx": ctx}
+            self.event(f"New worker(s) {names}: {why}; re-planning when idle",
+                       f"{noun} {names}: {why}. Neuverteilung, sobald der Server frei ist.")
+            return
+
+    # Main loop -----------------------------------------------------------------
+
+    def run(self, advs: list, also_stop: list) -> None:
+        def stop(*_):
+            self.stopping = True
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        try:
+            while not self.stopping:
+                now = time.time()
+                p = self.proc
+                if self.state == "running" and p is not None and p.poll() is not None:
+                    if not self.enabled:
+                        self.exit_code = p.returncode or 1
+                        break
+                    time.sleep(3)  # let a lost worker drop out of the listings
+                    self.replan(f"llama-server ended (code {p.returncode}); planning again",
+                                f"Server beendet (Code {p.returncode}). Plane neu.")
+                    continue
+                if self.state == "waiting":
+                    if now - self.last_scan > REBALANCE_SCAN_S:
+                        self.last_scan = now
+                        peers = self._lan_workers() or []
+                        seen = frozenset(p.endpoint for p in peers)
+                        if seen != self.tried_with or now - self.last_try > REBALANCE_RETRY_S:
+                            self.tried_with, self.last_try = seen, now
+                            if self.start_plan(quiet=True):
+                                n = len(self.sp.info.get("machines", [])) - 1
+                                self.event(f"Model fits now ({n} worker(s)); server started",
+                                           f"Modell passt jetzt ({n} Worker). Server gestartet.")
+                elif self.state == "running" and self.enabled:
+                    if now - self.last_scan > REBALANCE_SCAN_S:
+                        self.last_scan = now
+                        try:
+                            self.check_workers()
+                        except Exception as e:  # noqa: BLE001 - watching must not stop serving
+                            log(f"Rebalance check: {e}")
+                    pend = self.pending
+                    due = self.now_requested or (pend and (pend["kind"] == "lost"
+                                                           or now - self.last_switch > REBALANCE_MIN_GAP_S))
+                    if due and not self.busy():
+                        if self.now_requested:
+                            self.replan("Re-planning (requested)", "Neuverteilung von Hand angestoßen.")
+                        else:
+                            self.replan(f"Re-planning: {pend['text']}", f"Verteile neu: {pend['text']}")
+                elif self.state == "running" and self.now_requested and not self.busy():
+                    self.replan("Re-planning (requested)", "Neuverteilung von Hand angestoßen.")
+                time.sleep(1)
+        finally:
+            self.state = "stopped"
+            for q in [self.proc] + list(also_stop):
+                if q is not None and q.poll() is None:
+                    q.terminate()
+            for q in [self.proc] + list(also_stop):
+                if q is not None:
+                    try:
+                        q.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        q.kill()
+            for adv in advs:
+                adv.stop()
+        sys.exit(0 if self.stopping else self.exit_code)
+
+
 # ── Monitoring ───────────────────────────────────────────────────────────────
 #
 # Workers serve their live stats on a small read-only HTTP endpoint
@@ -1636,11 +2070,11 @@ def start_worker_status(args, rpc_info: list[dict], procs: list[subprocess.Popen
 class Dashboard:
     """Collects the cluster's state every 2 s for the master's dashboard."""
 
-    def __init__(self, args, sp: "ServerPlan", proc: subprocess.Popen, devices: list[Device],
+    def __init__(self, args, sup: "Supervisor", devices: list[Device],
                  router: Optional["Router"] = None, big_base: Optional[str] = None):
         import threading
 
-        self.args, self.sp, self.proc, self.router = args, sp, proc, router
+        self.args, self.sup, self.router = args, sup, router
         self.base = big_base or f"http://127.0.0.1:{args.port}"
         self._fast_last: Optional[tuple[float, float]] = None
         self._fast_tps_last = 0.0
@@ -1657,13 +2091,24 @@ class Dashboard:
         self._kb_per_token: Optional[float] = None
         self.fast_state: dict = {}
 
+    @property
+    def sp(self) -> "ServerPlan":
+        return self.sup.sp
+
+    @property
+    def proc(self) -> Optional[subprocess.Popen]:
+        return self.sup.proc
+
     # Collection ------------------------------------------------------------
 
     def _llama(self) -> dict:
         import urllib.request
 
         out = {"status": "starting", "metrics": {}}
-        if self.proc.poll() is not None:
+        if self.sup.state in ("waiting", "switching"):
+            out["status"] = self.sup.state
+            return out
+        if self.proc is None or self.proc.poll() is not None:
             out["status"] = "stopped"
             return out
         try:
@@ -1687,6 +2132,13 @@ class Dashboard:
     def _worker(self, w: dict) -> dict:
         import urllib.request
 
+        if not w.get("status_port"):
+            # Phones have no status endpoint, and probing their RPC port
+            # doesn't work while the master is connected (it serves one
+            # client at a time). llama-server's connection and mDNS tell.
+            connected = any(tcp_connected(ep) for ep in w["endpoints"])
+            listed = any(ep in self.sup.lan_seen for ep in w["endpoints"])
+            return {"online": connected or listed, "connected": connected, "phone": True, "rtt_ms": None}
         t0 = time.perf_counter()
         try:
             with urllib.request.urlopen(f"http://{w['host']}:{w['status_port']}/status", timeout=1.5) as r:
@@ -1758,7 +2210,7 @@ class Dashboard:
 
     def loop(self) -> None:
         last_scan = 0.0
-        while self.proc.poll() is None:
+        while not self.sup.stopping:
             try:
                 self.collect()
                 if time.time() - last_scan > 30:
@@ -1805,7 +2257,7 @@ class Dashboard:
         if self.router:
             router = {**self.router.info(), **{"fast_live": self.fast_state}}
         with self.lock:
-            return {"router": router or {"available": False}, "plan": self.sp.info, "master": {**self.state, "uptime_s": int(time.time() - self.started),
+            return {"router": router or {"available": False}, "rebalance": self.sup.info(), "plan": self.sp.info, "master": {**self.state, "uptime_s": int(time.time() - self.started),
                                                       "host": socket.gethostname()},
                     "workers": self.workers, "lan": self.lan, "history": self.history,
                     "bench": self.bench}
@@ -1841,7 +2293,8 @@ class Dashboard:
         handler = _json_handler({"/": lambda: (page, "text/html; charset=utf-8"),
                                  "/api/status": self.status},
                                 {"/api/bench": lambda body: self.run_bench(),
-                                 "/api/router": self.set_router}, key=self.sp.key, public=("/",))
+                                 "/api/router": self.set_router,
+                                 "/api/rebalance": self.sup.api}, key=self.sp.key, public=("/",))
         if not _start_http(self.args.host, self.args.dashboard_port, handler):
             return None
         threading.Thread(target=self.loop, daemon=True).start()
@@ -2525,6 +2978,9 @@ def main() -> None:
     s.add_argument("--router-mode", choices=["heuristic", "model"],
                    help="heuristic: rules on the request; model: the fast model judges (default: last setting)")
     s.add_argument("--model-name", default="privatelm", help="model name clients see with the router")
+    s.add_argument("--rebalance", choices=["auto", "on", "off"], default="auto",
+                   help="re-plan when workers come or go, and wait for workers if the model doesn't fit "
+                        "(auto: last setting from the dashboard, else on; off: plan once, exit 2 if it doesn't fit)")
     s.add_argument("--dashboard-port", type=int, default=DASHBOARD_PORT,
                    help=f"web dashboard (default {DASHBOARD_PORT}; same API key as the server)")
     s.add_argument("--no-dashboard", action="store_true")

@@ -93,7 +93,10 @@
   .decisions { list-style: none; margin: 10px 0 0; padding: 0; font-size: 0.85rem; max-height: 170px; overflow: auto; }
   .decisions li { display: grid; grid-template-columns: 62px 74px 1fr; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--line); }
   .tag { font-weight: 600; }
-  @media (max-width: 900px) { .router { grid-template-columns: 1fr; } }
+  .rebalance { margin-bottom: 16px; display: grid; grid-template-columns: minmax(260px, 1fr) 1.4fr; gap: 26px; }
+  .reb-state { margin: 0; font-size: 0.92rem; }
+  #reb-events li { grid-template-columns: 62px 1fr; }
+  @media (max-width: 900px) { .router, .rebalance { grid-template-columns: 1fr; } }
   .router-off { margin-bottom: 16px; color: var(--muted); font-size: 0.9rem; }
 
   /* Split strip */
@@ -260,6 +263,22 @@
     <p class="split-note" id="split-note"></p>
   </section>
 
+  <section class="panel rebalance" aria-labelledby="reb-title">
+    <div class="router-controls">
+      <div class="panel-head" style="margin:0"><h2 id="reb-title">Neuverteilung</h2></div>
+      <div class="switch-row">
+        <button class="switch" id="reb-switch" role="switch" aria-checked="false" aria-labelledby="reb-switch-label" type="button"></button>
+        <span id="reb-switch-label">Automatisch neu verteilen</span>
+      </div>
+      <p class="muted" id="reb-explain" style="margin:0"></p>
+      <div><button class="btn" id="reb-now" type="button">Jetzt neu verteilen</button></div>
+    </div>
+    <div>
+      <p class="reb-state" id="reb-state"></p>
+      <ul class="decisions" id="reb-events" aria-label="Letzte Ereignisse"></ul>
+    </div>
+  </section>
+
   <section class="charts" aria-label="Verlauf der letzten 10 Minuten">
     <div class="panel chart">
       <div class="chart-head"><h3>Token pro Sekunde</h3><span class="now num" id="c-tps-now">–</span></div>
@@ -330,7 +349,8 @@ function renderHeader(s) {
   $("model").innerHTML = `<strong>${esc(p.model)}</strong> &nbsp; ${nf(p.size_gb, 1)} GB, ${p.n_layer} Layer, ${kind}, Kontext ${p.ctx.toLocaleString("de-DE")}${p.mtp ? `, MTP-Tiefe ${p.mtp}` : ""} &nbsp;<span class="muted">auf ${esc(m.host)}</span>`;
   const st = m.llama?.status, busy = (m.llama?.metrics?.requests_processing || 0) > 0;
   const map = { ready: busy ? ["busy", "Generiert"] : ["ok", "Bereit"], loading: ["warn", "Lädt das Modell"],
-                starting: ["warn", "Startet"], stopped: ["bad", "Server beendet"] };
+                starting: ["warn", "Startet"], stopped: ["bad", "Server beendet"],
+                waiting: ["bad", "Wartet auf Worker"], switching: ["warn", "Verteilt neu"] };
   const [cls, txt] = map[st] || ["", "Unbekannt"];
   const up = m.uptime_s || 0;
   const upText = up >= 3600 ? `${Math.floor(up / 3600)} Std. ${Math.floor(up % 3600 / 60)} Min.` : `${Math.floor(up / 60)} Min.`;
@@ -342,7 +362,8 @@ function renderLive(s) {
   const busy = (met.requests_processing || 0) > 0;
   const shown = busy && m.tps_now > 0 ? m.tps_now : m.tps_last;
   $("rate").innerHTML = `${shown ? nf(shown, 1) : "–"}<small>Token/s</small>`;
-  $("rate-note").textContent = busy ? `Generiert gerade. Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s.`
+  $("rate-note").textContent = p.mode === "waiting" ? "Das Modell passt noch nicht: Es fehlen Worker."
+    : busy ? `Generiert gerade. Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s.`
     : shown ? `Letzte Generierung. Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s.`
     : `Wartet auf die erste Anfrage. Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s.`;
   const workers = Object.values(s.workers || {});
@@ -405,7 +426,8 @@ function renderSplit(s) {
   } else cover.hidden = true;
 
   let note;
-  if (p.mode === "moe") note = p.moe_cpu_layers > 0
+  if (p.mode === "waiting") note = "Noch kein Plan: Das Modell passt mit den vorhandenen Geräten nicht. Sobald genug Worker im Netz sind, startet der Server von selbst.";
+  else if (p.mode === "moe") note = p.moe_cpu_layers > 0
     ? `MoE auf dem Master: Die Experten der ersten ${p.moe_cpu_layers} Layer (schraffiert) liegen im Arbeitsspeicher. Pro Token rechnen nur wenige Experten, deshalb kostet das wenig.`
     : "MoE vollständig auf der GPU des Masters.";
   else if (outRemote) note = "Die Ausgabeschicht liegt auf einem Worker: Ihre Werte gehen bei jedem Token übers Netz.";
@@ -491,11 +513,19 @@ function renderMachines(s) {
   const cards = [];
   const m = s.master;
   const st = m.llama?.status;
+  const mState = { ready: ["ok", "Bereit"], stopped: ["bad", "Beendet"], waiting: ["bad", "Wartet auf Worker"],
+                   switching: ["warn", "Verteilt neu"] }[st] || ["warn", "Lädt"];
   cards.push(machineCard(s, "master", { title: m.host, role: "Master, stellt das Modell bereit", stats: m.stats,
-    dot: st === "ready" ? "ok" : st === "stopped" ? "bad" : "warn", stateText: st === "ready" ? "Bereit" : st === "stopped" ? "Beendet" : "Lädt" }));
+    dot: mState[0], stateText: mState[1] }));
   for (const [id, w] of Object.entries(s.workers || {})) {
     let dot = "ok", stateText = "Online", extra = "";
-    if (!w.online) { dot = "bad"; stateText = "Nicht erreichbar"; extra = `<div class="note bad">Keine Verbindung zu ${esc((w.endpoints || []).join(", "))}. Läuft der Worker, und ist die Firewall offen?</div>`; }
+    if (w.phone) {
+      const loading = st !== "ready";
+      if (w.connected) { stateText = loading ? "Bekommt Layer" : "Verbunden"; dot = loading ? "warn" : "ok"; }
+      else if (w.online) { stateText = "Im Netz"; dot = "warn"; extra = `<div class="note">Das Handy ist im Netz, der Server ist gerade nicht mit ihm verbunden.</div>`; }
+      else { dot = "bad"; stateText = "Nicht gefunden"; extra = `<div class="note bad">Das Handy ist nicht mehr im Netz zu sehen. Läuft der Worker-Modus in der App? Akku-Optimierung für PrivateLM ausschalten, Bildschirm an lassen.</div>`; }
+      if (loading && w.connected) extra = `<div class="note">Der Master schickt dem Handy seine Layer. Über WLAN dauert das einige Minuten.</div>`;
+    } else if (!w.online) { dot = "bad"; stateText = "Nicht erreichbar"; extra = `<div class="note bad">Keine Verbindung zu ${esc((w.endpoints || []).join(", "))}. Läuft der Worker, und ist die Firewall offen?</div>`; }
     else if (w.status_missing) { dot = "warn"; stateText = "Ohne Messwerte"; extra = `<div class="note">Der Worker rechnet, meldet aber keine Messwerte (Port ${w.status_port}). Worker mit neuer Version starten.</div>`; }
     else {
       const rpc = (w.rpc || []).map((r) => {
@@ -507,7 +537,7 @@ function renderMachines(s) {
       if ((w.rpc || []).some((r) => !r.alive)) { dot = "bad"; stateText = "Fehler"; }
     }
     const title = (w.stats && w.stats.host) || (w.label || w.host).split(" · ")[0];
-    cards.push(machineCard(s, id, { title, role: `Worker, ${(w.endpoints || []).join(", ")}`, stats: w.stats, dot, stateText, rtt: w.rtt_ms }, extra));
+    cards.push(machineCard(s, id, { title, role: `${w.phone ? "Handy" : "Worker"}, ${(w.endpoints || []).join(", ")}`, stats: w.stats, dot, stateText, rtt: w.rtt_ms }, extra));
   }
   $("machines").innerHTML = cards.join("");
   const n = Object.keys(s.workers || {}).length;
@@ -564,6 +594,35 @@ async function setRouter(body) {
   delete sw.dataset.busy;
 }
 
+function renderRebalance(s) {
+  const r = s.rebalance || {};
+  const sw = $("reb-switch");
+  if (!sw.dataset.busy) sw.setAttribute("aria-checked", String(!!r.enabled));
+  $("reb-explain").textContent = r.enabled
+    ? `Kommt ein Worker dazu, der das Modell um mindestens ${r.gain_pct || 15} % schneller macht${r.ctx_auto ? " oder einen längeren Kontext erlaubt" : ""}, oder fällt einer weg, plant der Master neu, sobald keine Anfrage läuft. Das Modell wird dabei neu geladen.`
+    : "Aus: Die Aufteilung bleibt, bis du neu verteilst oder den Dienst neu startest.";
+  let state;
+  if (r.state === "waiting") state = `Wartet auf Worker. ${r.reason || ""}`;
+  else if (r.state === "switching") state = "Verteilt gerade neu, der Server lädt das Modell.";
+  else if (r.now_requested) state = "Neuverteilung angefordert, sobald keine Anfrage mehr läuft.";
+  else if (r.pending) state = `Geplant: ${r.pending.text}. Sobald keine Anfrage läuft.`;
+  else state = r.enabled ? "Beobachtet das Netz alle 30 Sekunden." : "";
+  $("reb-state").textContent = state;
+  $("reb-now").disabled = r.state === "switching" || !!r.now_requested;
+  $("reb-events").innerHTML = (r.events || []).slice().reverse().map((e) => {
+    const t = new Date(e.t * 1000).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    return `<li><span class="muted num">${t}</span><span>${esc(e.text)}</span></li>`;
+  }).join("");
+}
+
+async function setRebalance(body) {
+  const sw = $("reb-switch");
+  sw.dataset.busy = "1";
+  try { const r = await api("/api/rebalance", { method: "POST", body: JSON.stringify(body) }); if (last) { last.rebalance = r; renderRebalance(last); } }
+  catch (e) { /* the next poll shows the real state */ }
+  delete sw.dataset.busy;
+}
+
 function renderBench(s) {
   const b = s.bench || {}, btn = $("bench-btn"), ready = s.master.llama?.status === "ready";
   btn.disabled = !!b.running || !ready;
@@ -578,7 +637,7 @@ function renderBench(s) {
 function render(s) {
   colors = { master: "var(--c0)" };
   (s.plan.machines || []).filter((m) => m.role === "worker").forEach((m, i) => { colors[m.id] = `var(--c${(i + 1) % 6})`; });
-  renderHeader(s); renderLive(s); renderRouter(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderBench(s);
+  renderHeader(s); renderLive(s); renderRouter(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderRebalance(s); renderBench(s);
 }
 
 /* ── Polling, login ──────────────────────────────────────────────────── */
@@ -630,6 +689,13 @@ document.querySelectorAll(".seg-ctl button").forEach((b) => b.addEventListener("
   document.querySelectorAll(".seg-ctl button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
   setRouter({ mode: b.dataset.mode });
 }));
+
+$("reb-switch").addEventListener("click", () => {
+  const on = $("reb-switch").getAttribute("aria-checked") !== "true";
+  $("reb-switch").setAttribute("aria-checked", String(on));
+  setRebalance({ enabled: on });
+});
+$("reb-now").addEventListener("click", () => { $("reb-now").disabled = true; setRebalance({ now: true }); });
 
 window.addEventListener("resize", () => { if (last) renderSplit(last); });
 tick();
