@@ -500,6 +500,8 @@ class Unit:
     min_layers: int = 0  # e.g. the MTP tail that must stay on this PC
     status_port: int = 0  # worker's monitoring endpoint (0: none, e.g. phones)
     mem_mb: list[float] = field(default_factory=list)  # room per device, for re-planning at another -c
+    key: str = ""  # identity for calibration (see Calibration)
+    base_speed: float = 0.0  # speed before calibration
 
     @property
     def remote(self) -> bool:
@@ -665,6 +667,9 @@ def cmd_worker(args) -> None:
     txt = {"ram": str(ram_mb), "bw": f"{bw:.1f}", "model": f"{host} · {label}", "v": RPC_VERSION,
            "id": wid, "kind": "gpu" if gpu else "cpu",
            "backend": ",".join(sorted({d.backend for d in chosen}))}
+    mac, bcast = iface_info(address)
+    if mac:  # for Wake-on-LAN by the master
+        txt.update(mac=mac, bcast=bcast)
     if not args.no_status:
         txt["stat"] = str(args.status_port)
     _advertise(args, advs, f"PrivateLM {host}", args.port, txt, address)
@@ -692,7 +697,8 @@ def cmd_worker(args) -> None:
                              "devices": [{"name": "CPU", "description": cpu.description,
                                           "free_mb": offered, "bandwidth": cpu.bandwidth}]})
             rtxt = {"ram": str(offered), "bw": f"{cpu.bandwidth:.1f}", "model": f"{host} · RAM",
-                    "v": RPC_VERSION, "id": f"{wid}-ram", "kind": "cpu", "backend": "CPU"}
+                    "v": RPC_VERSION, "id": f"{wid}-ram", "kind": "cpu", "backend": "CPU",
+                    **({"mac": mac, "bcast": bcast} if mac else {})}
             if not args.no_status:
                 rtxt["stat"] = str(args.status_port)
             _advertise(args, advs, f"PrivateLM {host} RAM", ram_port, rtxt, address)
@@ -785,7 +791,8 @@ def _remote_units(workers: list[Peer], per_layer: float) -> list[Unit]:
         u = Unit(w.txt.get("model") or w.name, sum(caps), speed, [],
                  endpoint=w.endpoint, rtt_s=measure_rtt(w.endpoint),
                  net_mbps=NET_MBPS_PHONE if phone else NET_MBPS_PC, device_caps=caps,
-                 status_port=0 if phone else int(w.txt.get("stat") or STATUS_PORT), mem_mb=mem)
+                 status_port=0 if phone else int(w.txt.get("stat") or STATUS_PORT), mem_mb=mem,
+                 key=f"worker/{w.txt.get('id') or w.host}/{w.port}")
         log(f"Worker {u.label} ({w.endpoint}): room for {u.capacity_layers} layers, "
             f"{u.speed:.0f} GB/s{' (phone: half of the measured %.0f)' % w.bandwidth if phone and w.bandwidth else ''}, "
             f"{u.rtt_s*1000:.1f} ms round trip")
@@ -942,6 +949,11 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
 
     workers = _find_workers(args) if not (moe and args.workers == "off") else []
     remote = _remote_units(workers, per_layer)
+    me = socket.gethostname()
+    for d, u in zip(local_gpus, gpus):
+        u.key = f"{me}/{d.description}/{d.device_id or d.name}"
+    host.key = f"{me}/cpu"
+    apply_calibration(gpus + remote + [host], Calibration())
     prune = args.workers == "auto"
     used = plan(gpus + remote + [host], m, prune)
     layer_time = token_time(used, m, host if out_gpu is None else gpus[local_gpus.index(out_gpu)]) \
@@ -1121,6 +1133,10 @@ def _finish_command(args, cmd: list[str], model: str, tps: float, info: Optional
     cmd += ["--metrics"]  # for the dashboard
     if args.mtp:
         cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(args.mtp)]
+    elif getattr(args, "draft_opts", None):
+        cmd += args.draft_opts
+        if info is not None:
+            info["draft"] = args.draft_info
     key = args.api_key if args.api_key is not None else _api_key()
     cmd += ["--host", args.host, "--port", str(args.port)]
     if key:
@@ -1139,6 +1155,21 @@ def cmd_serve(args) -> None:
             fast_cmd, args.reserve_mb, fast_info = plan_fast(args, probe(bench=True))
         else:
             fast_info = {"model": args.fast_url, "device": "eigener Server", "ctx": args.fast_ctx}
+    args.draft_opts, args.draft_info = [], {}
+    if args.draft_model and args.draft_model.lower() not in ("off", "none", "no", "0"):
+        if args.mtp:
+            log("--mtp and --draft-model: the model's own MTP layers are used, no draft model")
+        else:
+            draft = find_draft(args, str(Path(args.model).expanduser().resolve()))
+            if draft:
+                opts, res, args.draft_info = plan_draft(args, draft, probe(bench=True))
+                args.draft_opts = opts
+                merged = dict(getattr(args, "reserve_mb", None) or {})
+                for k, v in res.items():
+                    merged[k] = merged.get(k, 0) + v
+                args.reserve_mb = merged
+                log(f"Draft model {args.draft_info['model']} ({args.draft_info['size_gb']} GB) on "
+                    f"{args.draft_info['device']}, up to {args.draft_max} tokens ahead")
     # The router takes the public port; the big model listens locally on +1
     # (the fast one on +2). The router is always there: hosts may join later.
     args.host, args.port = "127.0.0.1", public_port + 1
@@ -1171,6 +1202,7 @@ def cmd_serve(args) -> None:
         mode = args.router_mode
     public_name = args.model_name
     router = Router(backends, args.fast_ctx, enabled, mode, public_name, sp.key)
+    router.on_timings = sup.on_timings
     if not router.start(public_host, public_port):
         sup.stop_server()
         die(f"Port {public_port} is busy.")
@@ -1179,7 +1211,8 @@ def cmd_serve(args) -> None:
     args.host, args.port = public_host, public_port
     hosts = None
     if sp.key:
-        hosts = HostManager(args, router, sp.key)
+        hosts = HostManager(args, router, sp.key, sup.known)
+        router.waker = hosts.wake_and_wait
         hosts.start()
     elif args.assign or args.hosts:
         die("Hosts need an API key on the master (it is their cluster key); leave out --api-key \"\".")
@@ -1396,7 +1429,7 @@ def cmd_bench(args) -> None:
           f"context ~{args.context})")
     if r["acceptance"] is not None:
         print(f"MTP/draft:    {r['acceptance']*100:.0f}% of drafted tokens accepted "
-              "(tune the depth at this temperature: privatelm-node tune-mtp)")
+              "(MTP depth: privatelm-node tune-mtp; draft model: serve --draft-max)")
     print(f"Network:      {per/1024:.0f} KB per token  (in {r['per_rx']/1024:.0f} KB, out {r['per_tx']/1024:.0f} KB)")
     n_vocab, n_embd = r["n_vocab"], r["n_embd"]
     if not n_vocab:
@@ -1467,6 +1500,181 @@ def _wait(procs, advs, also_stop: Optional[list] = None) -> None:
     sys.exit(0 if stopping else code)
 
 
+# ── Calibration ──────────────────────────────────────────────────────────────
+#
+# The planner estimates each device's speed from its memory bandwidth. Real
+# speed differs (compute, drivers, throttling, the phone's CPU), so the
+# master measures: every finished request on its model reports how long one
+# pass of the model took (llama-server's timings; with a draft model or MTP
+# per verified pass). Per plan that gives one equation
+#     measured = network + sum over devices (layers x read / speed) x k
+# with one unknown factor k per device. Several plans (rebalancing adds
+# them) pin the factors down; ridge regression towards 1 keeps a device's
+# factor at its estimate until measurements say otherwise. The planner then
+# uses speed / k. Factors live in calibration.json, per device.
+
+CALIB_STATE = CONFIG_DIR / "calibration.json"
+CALIB_RIDGE = 0.05  # pull towards the estimate (relative units)
+CALIB_MIN_TOKENS = 16  # shorter answers say little
+CALIB_K_RANGE = (0.2, 5.0)
+
+
+def _solve(a: list[list[float]], b: list[float]) -> list[float]:
+    """Gaussian elimination with partial pivoting (small systems)."""
+    n = len(b)
+    m = [row[:] + [b[i]] for i, row in enumerate(a)]
+    for c in range(n):
+        p = max(range(c, n), key=lambda r: abs(m[r][c]))
+        if abs(m[p][c]) < 1e-12:
+            continue
+        m[c], m[p] = m[p], m[c]
+        for r in range(n):
+            if r != c and m[r][c]:
+                f = m[r][c] / m[c][c]
+                m[r] = [x - f * y for x, y in zip(m[r], m[c])]
+    return [m[i][n] / m[i][i] if abs(m[i][i]) > 1e-12 else 1.0 for i in range(n)]
+
+
+class Calibration:
+    def __init__(self, path: Path = CALIB_STATE):
+        import threading
+
+        self.path = path
+        self.lock = threading.Lock()
+        self.k: dict[str, float] = {}  # device key -> time factor (2: twice as slow as estimated)
+        self.labels: dict[str, str] = {}
+        self.plans: dict[str, dict] = {}  # plan signature -> a, other, t (smoothed), n, est
+        try:
+            d = json.loads(path.read_text())
+            self.k, self.labels, self.plans = d.get("k", {}), d.get("labels", {}), d.get("plans", {})
+        except (OSError, ValueError):
+            pass
+
+    def factor(self, key: str) -> float:
+        """Speed multiplier for the planner (1/k)."""
+        return 1.0 / self.k.get(key, 1.0)
+
+    def save(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps({"k": self.k, "labels": self.labels, "plans": self.plans}, indent=1))
+        except OSError as e:
+            log(f"Calibration: could not save ({e})")
+
+    @staticmethod
+    def terms(units: list[Unit], m: ModelInfo, out_label: str) -> tuple[dict[str, float], float]:
+        """Per device key: seconds per pass at the estimated speed (a), and
+        the part that doesn't depend on device speed (network)."""
+        a: dict[str, float] = {}
+        other = 0.0
+        for u in units:
+            if not u.key:
+                continue
+            base = u.base_speed or u.speed
+            if u.layers:
+                a[u.key] = a.get(u.key, 0.0) + u.layers * m.read_mb() / 1024 / base
+                if u.remote:
+                    other += 2 * u.rtt_s + HOP_OVERHEAD_S + 2 * m.n_embd * 4 / 2**20 / u.net_mbps
+            if u.label == out_label:
+                a[u.key] = a.get(u.key, 0.0) + m.output_mb / 1024 / base
+                if u.remote:
+                    other += m.n_vocab * 4 / 2**20 / u.net_mbps
+        return a, other
+
+    @staticmethod
+    def signature(units: list[Unit]) -> str:
+        return ",".join(sorted(f"{u.key}={u.layers}" for u in units if u.layers and u.key))
+
+    def predicted(self, units: list[Unit], m: ModelInfo, out_label: str) -> float:
+        a, other = self.terms(units, m, out_label)
+        return other + sum(v * self.k.get(key, 1.0) for key, v in a.items())
+
+    def observe(self, units: list[Unit], m: ModelInfo, out_label: str, seconds_per_pass: float) -> Optional[dict]:
+        """Adds a measurement of the plan that is running; returns the plan's
+        record (estimate before, measured) when the factors changed."""
+        a, other = self.terms(units, m, out_label)
+        if not a or seconds_per_pass <= 0:
+            return None
+        sig = self.signature(units)
+        with self.lock:
+            for u in units:
+                if u.key:
+                    self.labels[u.key] = u.label
+            rec = self.plans.get(sig) or {"a": a, "other": other, "t": seconds_per_pass, "n": 0}
+            n = rec["n"] + 1
+            rec["t"] = rec["t"] + (seconds_per_pass - rec["t"]) / min(n, 20)  # running mean, then smoothing
+            rec.update(a=a, other=other, n=n, at=int(time.time()))
+            self.plans[sig] = rec
+            if len(self.plans) > 30:
+                oldest = min(self.plans, key=lambda s: self.plans[s].get("at", 0))
+                del self.plans[oldest]
+            self._fit()
+        return rec
+
+    def _fit(self) -> None:
+        keys = sorted({k for rec in self.plans.values() for k in rec["a"]})
+        if not keys:
+            return
+        idx = {k: i for i, k in enumerate(keys)}
+        n = len(keys)
+        ata = [[0.0] * n for _ in range(n)]
+        atb = [0.0] * n
+        for rec in self.plans.values():
+            t = rec["t"]
+            w = min(rec["n"], 10) ** 0.5  # repeated measurements count more, up to a point
+            row = [0.0] * n
+            for k, v in rec["a"].items():
+                row[idx[k]] = v / t
+            r = (t - rec["other"]) / t
+            for i in range(n):
+                if row[i]:
+                    atb[i] += w * row[i] * r
+                    for j in range(n):
+                        ata[i][j] += w * row[i] * row[j]
+        for i in range(n):
+            ata[i][i] += CALIB_RIDGE
+            atb[i] += CALIB_RIDGE * 1.0
+        x = _solve(ata, atb)
+        lo, hi = CALIB_K_RANGE
+        for k, v in zip(keys, x):
+            self.k[k] = round(min(hi, max(lo, v)), 3)
+
+    def measured(self, units: list[Unit]) -> Optional[float]:
+        rec = self.plans.get(self.signature(units))
+        return rec["t"] if rec and rec["n"] >= 3 else None
+
+    def reset(self) -> None:
+        with self.lock:
+            self.k, self.labels, self.plans = {}, {}, {}
+        self.save()
+
+
+def timings_pass_seconds(t: dict) -> Optional[float]:
+    """Seconds per model pass from llama-server's timings: with speculative
+    decoding several tokens come out of one pass."""
+    n = t.get("predicted_n") or 0
+    ms = t.get("predicted_ms") or 0
+    if n < CALIB_MIN_TOKENS or ms <= 0:
+        return None
+    passes = n - (t.get("draft_n_accepted") or 0)
+    return ms / 1000 / max(1, passes)
+
+
+def cmd_calibration(args) -> None:
+    c = Calibration()
+    if args.reset:
+        c.reset()
+        print("Calibration reset: the planner uses the estimated speeds again.")
+        return
+    if not c.k:
+        print("No measurements yet. They come from requests to the model (privatelm-node bench is one).")
+        return
+    print(f"{'Device':<52} {'measured vs. estimate':>22}")
+    for key, k in sorted(c.k.items(), key=lambda x: x[1]):
+        print(f"{c.labels.get(key, key)[:52]:<52} {f'{1/k:.2f}x as fast':>22}")
+    print(f"\n{len(c.plans)} plan(s) measured. Reset with: privatelm-node calibration --reset")
+
+
 # ── Rebalancing ──────────────────────────────────────────────────────────────
 #
 # The split is planned when llama-server starts. With rebalancing on (the
@@ -1521,10 +1729,21 @@ def tcp_connected(endpoint: str) -> bool:
     return False
 
 
-def estimate_plan(units: list[Unit], model_path: str, ctx: int, out_label: str,
-                  prune: bool) -> Optional[float]:
-    """Tokens/s the planner expects for these units at -c ctx, or None if
-    the model doesn't fit."""
+def apply_calibration(units: list[Unit], calib: "Calibration", quiet: bool = False) -> None:
+    """Planner speed = estimated speed x measured factor (see Calibration)."""
+    for u in units:
+        u.base_speed = u.base_speed or u.speed
+        f = calib.factor(u.key) if u.key else 1.0
+        u.speed = u.base_speed * f
+        if abs(f - 1) > 0.05 and not quiet:
+            log(f"Calibration: {u.label} measured at {f:.2f}x its estimate ({u.base_speed:.0f} -> {u.speed:.0f} GB/s)")
+
+
+def estimate_plan_full(units: list[Unit], model_path: str, ctx: int, out_label: str, prune: bool,
+                       calib: Optional["Calibration"] = None) -> Optional[tuple[float, list[Unit], ModelInfo]]:
+    """(tokens/s the planner expects, the units it would use, the model at
+    -c ctx), or None if the model doesn't fit. With calib, speeds use the
+    current factors."""
     import dataclasses
 
     m = gguf_info(model_path, ctx)
@@ -1533,11 +1752,21 @@ def estimate_plan(units: list[Unit], model_path: str, ctx: int, out_label: str,
     for u in units:
         caps = [max(0, int(mb // per)) for mb in u.mem_mb] or [u.capacity_layers]
         trial.append(dataclasses.replace(u, capacity_layers=sum(caps), device_caps=caps, layers=0))
+    if calib is not None:
+        apply_calibration(trial, calib, quiet=True)
     used = plan(trial, m, prune)
     if not used:
         return None
     out = next((u for u in trial if u.label == out_label and not u.remote), None)
-    return 1 / token_time(used, m, out)
+    return 1 / token_time(used, m, out), trial, m
+
+
+def estimate_plan(units: list[Unit], model_path: str, ctx: int, out_label: str,
+                  prune: bool) -> Optional[float]:
+    """Tokens/s the planner expects for these units at -c ctx, or None if
+    the model doesn't fit."""
+    r = estimate_plan_full(units, model_path, ctx, out_label, prune)
+    return r[0] if r else None
 
 
 class Supervisor:
@@ -1568,6 +1797,10 @@ class Supervisor:
         self.lan_seen: set[str] = set()  # worker endpoints in the last scan
         self.ever_seen: set[str] = set()
         self.exit_code = 0
+        self.calib = Calibration()
+        self.known = Known()
+        self.last_calib_check = 0.0
+        self.last_calib_save = 0.0
         # llama-server's own address (behind the router, if there is one)
         self.big_host, self.big_port = args.host, args.port
 
@@ -1700,6 +1933,75 @@ class Supervisor:
             self.event("Model doesn't fit with the workers left; waiting for workers",
                        "Modell passt mit den verbliebenen Workern nicht. Wartet auf Worker.")
 
+    # Measurements --------------------------------------------------------------
+
+    def on_timings(self, timings: dict) -> None:
+        """A request on the big model finished alone: learn from its speed."""
+        sp = self.sp
+        if self.state != "running" or sp is None or not sp.units or sp.model_info is None:
+            return
+        spp = timings_pass_seconds(timings)
+        if spp is None:
+            return
+        rec = self.calib.observe(sp.units, sp.model_info, sp.out_label, spp)
+        if rec is None:
+            return
+        now = time.time()
+        if now - self.last_calib_save > 60:
+            self.last_calib_save = now
+            self.calib.save()
+        if rec["n"] in (3, 10, 30):
+            est = sp.estimate_tps
+            self.event(f"Measured {1/rec['t']:.1f} passes/s on this plan (estimate {est:.1f}, {rec['n']} requests)",
+                       f"Gemessen: {1/rec['t']:.1f} Durchläufe/s mit diesem Plan (Schätzung {est:.1f}, "
+                       f"{rec['n']} Anfragen)")
+        if rec["n"] >= 5 and now - self.last_calib_check > 120:
+            self.last_calib_check = now
+            self.check_calibrated(rec)
+
+    def check_calibrated(self, rec: dict) -> None:
+        """Would another split be faster with what the measurements say?"""
+        sp, a = self.sp, self.args
+        if not self.enabled or self.pending or sp.info.get("mode") != "layers":
+            return
+        r = estimate_plan_full(sp.units, sp.model_path, a.ctx, sp.out_label, a.workers == "auto", self.calib)
+        if r is None:
+            return
+        tps_new, trial, m = r
+        new_sig = Calibration.signature(trial)
+        if new_sig == Calibration.signature(sp.units):
+            return
+        cur = 1 / rec["t"]
+        measured_new = self.calib.measured(trial)
+        if measured_new:
+            tps_new = 1 / measured_new  # tried before: trust the measurement
+        else:
+            # compare model with model: the fit reproduces this plan's measurement
+            tps_new = tps_new * cur * self.calib.predicted(sp.units, sp.model_info, sp.out_label)
+        if tps_new < cur * REBALANCE_GAIN:
+            return
+        with self.lock:
+            self.pending = {"kind": "gain", "t": int(time.time()),
+                            "text": f"Messung: andere Aufteilung schneller ({cur:.1f} → {tps_new:.1f} Durchläufe/s)"}
+        self.event(f"Measurements: another split looks faster ({cur:.1f} -> {tps_new:.1f}); re-planning when idle",
+                   f"Messung: Eine andere Aufteilung ist voraussichtlich schneller ({cur:.1f} → {tps_new:.1f}). "
+                   "Neuverteilung, sobald der Server frei ist.")
+
+    def calib_info(self) -> dict:
+        sp = self.sp
+        if sp is None or not sp.units or sp.model_info is None:
+            return {}
+        a, _ = Calibration.terms(sp.units, sp.model_info, sp.out_label)
+        machines: dict[str, list] = {}
+        for u in sp.units:
+            if u.key in a:
+                mid = u.endpoint.rsplit(":", 1)[0] if u.remote else "master"
+                machines.setdefault(mid, []).append((a[u.key], self.calib.k.get(u.key, 1.0)))
+        rec = self.calib.plans.get(Calibration.signature(sp.units))
+        return {"measured_tps": round(1 / rec["t"], 2) if rec else None, "n": rec["n"] if rec else 0,
+                "machines": {mid: round(sum(w for w, _ in v) / sum(w * k for w, k in v), 2)
+                             for mid, v in machines.items() if sum(w for w, _ in v)}}
+
     # Watching the LAN --------------------------------------------------------
 
     def _lan_workers(self) -> Optional[list[Peer]]:
@@ -1720,7 +2022,22 @@ class Supervisor:
         with self.lock:
             self.lan_seen = {p.endpoint for p in peers}
             self.ever_seen |= self.lan_seen
+        for p in peers:
+            self.known.note(p.txt.get("id") or p.endpoint, "worker", p.txt.get("model") or p.name, p.host,
+                            {**p.txt, "port": p.port, "model": ""})
         return peers
+
+    def wake_workers(self) -> None:
+        """Model doesn't fit: wake the known workers that are not in the LAN."""
+        seen_hosts = {ep.rsplit(":", 1)[0] for ep in self.lan_seen}
+        names = []
+        for mid, rec in list(self.known.machines.items()):
+            if rec.get("kind") == "worker" and rec.get("ip") not in seen_hosts and self.known.wake(mid):
+                names.append(rec.get("name") or rec["ip"])
+                seen_hosts.add(rec.get("ip"))  # a PC's GPU and RAM worker share one wake-up
+        if names:
+            self.event(f"Waking workers (Wake-on-LAN): {', '.join(names)}",
+                       f"Wecke Worker per Wake-on-LAN: {', '.join(names)}")
 
     def _alive(self, ep: str, machines: list[dict]) -> bool:
         import urllib.request
@@ -1824,6 +2141,7 @@ class Supervisor:
                     if now - self.last_scan > REBALANCE_SCAN_S:
                         self.last_scan = now
                         peers = self._lan_workers() or []
+                        self.wake_workers()
                         seen = frozenset(p.endpoint for p in peers)
                         if seen != self.tried_with or now - self.last_try > REBALANCE_RETRY_S:
                             self.tried_with, self.last_try = seen, now
@@ -1851,6 +2169,7 @@ class Supervisor:
                 time.sleep(1)
         finally:
             self.state = "stopped"
+            self.calib.save()
             for q in [self.proc] + list(also_stop):
                 if q is not None and q.poll() is None:
                     q.terminate()
@@ -2223,6 +2542,14 @@ class Dashboard:
                 "ram_mb": p.ram_mb, "bw": p.bandwidth, "type": p.txt.get("kind", "phone" if p.kind == "worker" else ""),
                 "in_use": p.endpoint in used, "compatible": p.txt.get("v", RPC_VERSION) == RPC_VERSION}
                for p in peers if not self._is_me(p) and p.kind != "host"]  # hosts have their own panel
+        seen_ips = {p.host for p in peers}
+        used_ips = {ep.rsplit(":", 1)[0] for ep in used}
+        for mid, rec in self.sup.known.machines.items():
+            if rec.get("kind") == "worker" and rec.get("ip") not in seen_ips and rec.get("ip") not in used_ips:
+                seen_ips.add(rec.get("ip"))  # GPU and RAM worker of one PC: one row, one wake-up
+                lan.append({"kind": "worker", "name": rec.get("name") or rec["ip"], "endpoint": rec["ip"],
+                            "ram_mb": 0, "bw": 0, "type": "off", "in_use": False, "compatible": True,
+                            "wake_id": mid, "waking": self.sup.known.recently_woken(mid)})
         with self.lock:
             self.lan = lan
 
@@ -2276,6 +2603,7 @@ class Dashboard:
             router = {**self.router.info(), **{"fast_live": self.fast_state}}
         with self.lock:
             return {"router": router or {"available": False}, "rebalance": self.sup.info(),
+                    "calibration": self.sup.calib_info(),
                     "hosts": self.hosts.info() if self.hosts else {"hosts": [], "catalog": [], "off": True},
                     "plan": self.sp.info, "master": {**self.state, "uptime_s": int(time.time() - self.started),
                                                       "host": socket.gethostname()},
@@ -2315,12 +2643,145 @@ class Dashboard:
                                 {"/api/bench": lambda body: self.run_bench(),
                                  "/api/router": self.set_router,
                                  "/api/rebalance": self.sup.api,
+                                 "/api/wake": lambda b: {"ok": self.sup.known.wake(str(b.get("id") or ""), force=True)},
                                  "/api/hosts": self.hosts.api if self.hosts else (lambda b: {"error": "no hosts"})},
                                 key=self.sp.key, public=("/",))
         if not _start_http(self.args.host, self.args.dashboard_port, handler):
             return None
         threading.Thread(target=self.loop, daemon=True).start()
         return f"{self.args.dashboard_port}"
+
+
+# ── Wake-on-LAN and sleep ────────────────────────────────────────────────────
+#
+# Workers and hosts announce their MAC address; the master remembers every
+# machine it has seen (known.json), so it can wake one that is off or
+# asleep: a worker when the model doesn't fit without it, a host when a
+# request asks for its model. Hosts can sleep after a while without
+# requests: the master tells them to, they stop llama-server and suspend
+# (through a small root unit, see privatelm-suspend.path), and after
+# waking up they load their model again.
+
+KNOWN_STATE = CONFIG_DIR / "known.json"
+WAKE_WAIT_S = 240  # how long a request waits for a host to wake up and load
+WAKE_REPEAT_S = 300  # don't wake the same machine more often (unless asked)
+SUSPEND_FILE = "/run/privatelm-node/suspend"
+
+
+def iface_info(ip: str) -> tuple[str, str]:
+    """(MAC, broadcast address) of the interface that has this IPv4 address."""
+    import fcntl
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _i, name in socket.if_nameindex():
+            req = struct.pack("256s", name[:15].encode())
+            try:
+                addr = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, req)[20:24])  # SIOCGIFADDR
+            except OSError:
+                continue
+            if addr != ip:
+                continue
+            mac = _read(Path(f"/sys/class/net/{name}/address")).strip()
+            try:
+                bcast = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8919, req)[20:24])  # SIOCGIFBRDADDR
+            except OSError:
+                bcast = ""
+            wired = not Path(f"/sys/class/net/{name}/wireless").exists()
+            return (mac if mac and mac != "00:00:00:00:00:00" and wired else ""), bcast
+    finally:
+        s.close()
+    return "", ""
+
+
+def send_magic(mac: str, ip: str = "", bcast: str = "") -> bool:
+    """Wake-on-LAN: the magic packet to the subnet's broadcast, the global
+    broadcast and the last address (ports 9 and 7)."""
+    hexmac = re.sub(r"[^0-9a-fA-F]", "", mac)
+    if len(hexmac) != 12:
+        return False
+    packet = b"\xff" * 6 + bytes.fromhex(hexmac) * 16
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sent = False
+    for target in [t for t in (bcast, "255.255.255.255", ip) if t]:
+        for port in (9, 7):
+            try:
+                s.sendto(packet, (target, port))
+                sent = True
+            except OSError:
+                pass
+    s.close()
+    return sent
+
+
+class Known:
+    """Machines the master has seen, with what it takes to wake them."""
+
+    def __init__(self):
+        import threading
+
+        self.lock = threading.Lock()
+        self.machines: dict[str, dict] = {}
+        self.woken: dict[str, float] = {}
+        try:
+            self.machines = json.loads(KNOWN_STATE.read_text()).get("machines", {})
+        except (OSError, ValueError):
+            pass
+
+    def note(self, mid: str, kind: str, name: str, ip: str, txt_or_status: dict) -> None:
+        mac = txt_or_status.get("mac") or ""
+        if not mac:
+            return
+        rec = {"kind": kind, "name": name, "ip": ip, "mac": mac, "bcast": txt_or_status.get("bcast") or "",
+               "seen": int(time.time()), "port": txt_or_status.get("port"),
+               "model": txt_or_status.get("model") or "", "api_port": txt_or_status.get("api_port")}
+        with self.lock:
+            old = self.machines.get(mid)
+            changed = not old or any(old.get(k) != rec[k] for k in ("mac", "ip", "name", "bcast", "port", "model"))
+            if changed or rec["seen"] - old.get("seen", 0) > 3600:
+                self.machines[mid] = rec
+                try:
+                    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                    KNOWN_STATE.write_text(json.dumps({"machines": self.machines}, indent=1))
+                except OSError:
+                    pass
+
+    def wake(self, mid: str, force: bool = False) -> bool:
+        rec = self.machines.get(mid)
+        if not rec:
+            return False
+        now = time.time()
+        if not force and now - self.woken.get(mid, 0) < WAKE_REPEAT_S:
+            return False
+        self.woken[mid] = now
+        ok = send_magic(rec["mac"], rec.get("ip", ""), rec.get("bcast", ""))
+        if ok:
+            log(f"Wake-on-LAN sent to {rec['name']} ({rec['mac']})")
+        return ok
+
+    def recently_woken(self, mid: str) -> bool:
+        return time.time() - self.woken.get(mid, 0) < WAKE_WAIT_S
+
+
+def request_suspend() -> tuple[bool, str]:
+    """Suspends this PC: through the root helper unit (a file it watches),
+    or directly when allowed (root, or a desktop session)."""
+    custom = os.environ.get("PRIVATELM_SUSPEND_CMD")  # e.g. "systemctl hibernate"
+    if custom:
+        import shlex
+
+        r = subprocess.run(shlex.split(custom), capture_output=True, text=True)
+        return r.returncode == 0, (r.stderr.strip() or custom)[:200]
+    p = Path(SUSPEND_FILE)
+    if p.parent.is_dir() and os.access(p.parent, os.W_OK) and \
+            Path("/etc/systemd/system/privatelm-suspend.path").exists():
+        p.write_text(str(int(time.time())))
+        return True, "helper"
+    r = subprocess.run(["systemctl", "suspend"], capture_output=True, text=True)
+    if r.returncode == 0:
+        return True, "systemctl"
+    return False, (r.stderr.strip() or "systemctl suspend failed")[:200]
 
 
 # ── Hosts ────────────────────────────────────────────────────────────────────
@@ -2379,6 +2840,7 @@ class HostAgent:
         self.job = 0  # a newer assignment makes older jobs stop
         self.restarts = 0
         self.paths: dict[str, str] = {}  # assigned model -> file, so a restart needs no lookup
+        self.mac, self.bcast = "", ""
         self.stats = SystemStats(probe(bench=False))
 
     # State -------------------------------------------------------------------
@@ -2444,7 +2906,9 @@ class HostAgent:
             st = {"id": self.id, "host": socket.gethostname(), "v": 1, "state": self.state, "error": self.error,
                   "assignment": self.assignment, "model": self.model_path.stem if self.model_path else None,
                   "ctx": self.ctx, "estimate_tps": self.estimate_tps, "api_port": self.args.api_port,
-                  "progress": self._progress() if self.state == "downloading" else None}
+                  "progress": self._progress() if self.state == "downloading" else None,
+                  "mac": self.mac, "bcast": self.bcast,
+                  "can_sleep": os.geteuid() == 0 or Path("/etc/systemd/system/privatelm-suspend.path").exists()}
         st["metrics"] = self._metrics()
         st["stats"] = self.stats.sample()
         st["models"] = sorted({p.stem.split("-00001-of-")[0] for p in self.models_dir.glob("*.gguf")}) \
@@ -2491,6 +2955,35 @@ class HostAgent:
                 p.kill()
                 p.wait()
         self.proc = None
+
+    def sleep(self, _body: Optional[dict] = None) -> dict:
+        """Stops llama-server and suspends this PC (the master wakes it by
+        Wake-on-LAN; the model loads again after waking up)."""
+        with self.lock:
+            if self.state in ("downloading", "loading", "preparing"):
+                return {**self.status(), "error": f"busy ({self.state})"}
+            self.job += 1  # stops a restart in progress
+        self.stop_server()
+        self._set("asleep")
+        ok, how = request_suspend()
+        if not ok:
+            log(f"Host: could not suspend ({how}); loading the model again")
+            if self.assignment:
+                self.assign(self.assignment)
+            return {**self.status(), "error": f"suspend failed: {how}"}
+        log(f"Host: suspending ({how})")
+        return self.status()
+
+    def resumed(self) -> None:
+        """Back from sleep (or suspended by someone else): load the model again."""
+        with self.lock:
+            a = self.assignment
+            dead = self.proc is None or self.proc.poll() is not None
+        log("Host: woke up")
+        if a and (self.state == "asleep" or dead):
+            self.assign(a)
+        elif not a:
+            self._set("idle")
 
     def _local(self, spec: str) -> Optional[Path]:
         """An assigned model that is already on this PC: a path, or the name
@@ -2555,9 +3048,17 @@ class HostAgent:
                 self._set("error", f"{type(e).__name__}: {e}")
 
     def watch(self) -> None:
-        """Restarts llama-server if it ends on its own (up to 3 times in a row)."""
+        """Restarts llama-server if it ends on its own (up to 3 times in a row),
+        and notices waking up (the wall clock jumps, the monotonic one doesn't)."""
+        offset = time.time() - time.monotonic()
         while True:
             time.sleep(5)
+            now_offset = time.time() - time.monotonic()
+            if now_offset - offset > 20:
+                offset = now_offset
+                self.resumed()
+                continue
+            offset = now_offset
             with self.lock:
                 dead = self.state == "ready" and self.proc is not None and self.proc.poll() is not None
                 a = self.assignment
@@ -2587,13 +3088,14 @@ def cmd_host(args) -> None:
             "credential cluster_key. On the master: privatelm-node key")
     agent = HostAgent(args, key)
     handler = _json_handler({"/status": agent.status},
-                            {"/assign": agent.assign, "/unload": agent.unload}, key=key)
+                            {"/assign": agent.assign, "/unload": agent.unload, "/sleep": agent.sleep}, key=key)
     if not _start_http(args.host, args.port, handler):
         die(f"Port {args.port} is busy.")
     devices = probe(bench=True)
     gpus = usable_gpus(devices)
     address = args.advertise_ip or (args.host if args.host not in ("0.0.0.0", "") else lan_address())
     vram = sum(d.total_mb for d in gpus if d.type == "gpu")
+    agent.mac, agent.bcast = iface_info(address)
     gpu_txt = ", ".join(sorted({d.description for d in gpus})) or "CPU"
     log(f"Host {socket.gethostname()}: control API on {address}:{args.port}, models in {agent.models_dir}, "
         f"llama-server on port {args.api_port}; {gpu_txt}")
@@ -2601,7 +3103,8 @@ def cmd_host(args) -> None:
     if not args.no_advertise:
         adv = Advertiser(HOST_TYPE, f"PrivateLM Host {socket.gethostname()}", args.port,
                          {"id": agent.id, "host": socket.gethostname(), "api": str(args.api_port),
-                          "gpu": gpu_txt[:120], "vram": str(vram), "v": "1"}, address)
+                          "gpu": gpu_txt[:120], "vram": str(vram), "v": "1",
+                          **({"mac": agent.mac, "bcast": agent.bcast} if agent.mac else {})}, address)
         adv.start()
         advs.append(adv)
     threading.Thread(target=agent.watch, daemon=True).start()
@@ -2691,6 +3194,7 @@ class Backend:
     ctx: int = 0
     inflight: int = 0  # requests running now
     served: int = 0
+    asleep: bool = False  # a host that sleeps (or is off) and can be woken
 
 
 ROLE_WORDS = {"fast": ("fast", "schnell", "small"), "big": ("big", "large", "groß", "gross")}
@@ -2713,6 +3217,8 @@ class Router:
         self.lock = threading.Lock()
         self.counts = {"fast": 0, "big": 0, "extra": 0}
         self.recent: list[dict] = []
+        self.on_timings = None  # callback(timings) for requests the master's big model ran alone
+        self.waker = None  # callback(backend) -> backend once awake, or None: wake a sleeping host
 
     @property
     def big(self) -> Backend:
@@ -2732,6 +3238,9 @@ class Router:
                 prev = old.get((h.source, h.base))
                 if prev:
                     prev.name, prev.label, prev.group, prev.where, prev.ctx = h.name, h.label, h.group, h.where, h.ctx
+                    if prev.asleep != h.asleep:
+                        prev.asleep, prev.healthy = h.asleep, False
+                        prev.status = "asleep" if h.asleep else "starting"
                     keep.append(prev)
                 else:
                     keep.append(h)
@@ -2767,7 +3276,8 @@ class Router:
                     "has_fast": any(b.name == "fast" for b in self.backends),
                     "counts": dict(self.counts), "recent": list(self.recent[-12:]),
                     "backends": [{"role": b.name, "group": b.group, "model": b.label, "where": b.where,
-                                  "source": b.source, "status": b.status, "inflight": b.inflight,
+                                  "source": b.source, "status": "asleep" if b.asleep else b.status,
+                                  "inflight": b.inflight,
                                   "served": b.served, "ctx": b.ctx} for b in self.backends]}
 
     def watch_health(self) -> None:
@@ -2775,6 +3285,9 @@ class Router:
 
         while True:
             for b in list(self.backends):
+                if b.asleep:
+                    b.healthy, b.status = False, "asleep"
+                    continue
                 try:
                     with urllib.request.urlopen(b.base + "/health", timeout=2) as r:
                         b.healthy, b.status = r.status == 200, "ready"
@@ -2794,10 +3307,17 @@ class Router:
     def role(self, role: str) -> list[Backend]:
         return [b for b in self.backends if b.name == role]
 
+    def sleeper(self, cands: list[Backend]) -> Optional[Backend]:
+        """A sleeping member to wake when none is ready."""
+        return next((b for b in cands if b.asleep), None)
+
     def _pick_role(self, role: str, reason: str) -> tuple[Backend, str]:
         b = self.choose(self.role(role))
         if b:
             return b, reason
+        b = self.sleeper(self.role(role))
+        if b and self.waker:
+            return b, f"{reason}, Host wird geweckt"
         other = "big" if role == "fast" else "fast"
         b = self.choose(self.role(other))
         if b:
@@ -2813,6 +3333,9 @@ class Router:
                 b = self.choose(group)
                 if b:
                     return b, "Modell angefordert"
+                b = self.sleeper(group)
+                if b and self.waker:
+                    return b, "Modell angefordert, Host wird geweckt"
                 return group[0], "Modell angefordert, aber nicht bereit"
             for role, words in ROLE_WORDS.items():
                 if forced in words:
@@ -2971,6 +3494,12 @@ class Router:
                     router.record(backend, reason, chars, bool(body.get("stream")))
                 else:
                     backend, reason = router._pick_role("big", "keine Chat-Anfrage")
+                if backend.asleep and router.waker:
+                    woke = router.waker(backend)
+                    if woke is None:
+                        return self._json(503, {"error": {"message": f"{backend.where} sleeps and did not wake up "
+                                                                     f"within {WAKE_WAIT_S} s"}})
+                    backend = woke
                 self._forward(backend, "POST", raw, reason)
 
             def _forward(self, backend: Backend, method: str, raw: Optional[bytes], reason: str) -> None:
@@ -2983,8 +3512,10 @@ class Router:
                     headers["Authorization"] = f"Bearer {backend.key}"
                 path = (u.path.rstrip("/") + self.path) if u.path not in ("", "/") else self.path
                 with router.lock:
+                    alone = backend.inflight == 0
                     backend.inflight += 1
                     backend.served += 1
+                tail = b""
                 try:
                     try:
                         conn.request(method, path, body=raw, headers=headers)
@@ -3007,13 +3538,22 @@ class Router:
                                 break
                             self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
                             self.wfile.flush()
+                            tail = (tail + chunk)[-16384:]
                         self.wfile.write(b"0\r\n\r\n")
                     except (BrokenPipeError, ConnectionResetError):
                         pass  # client went away; closing the backend stops its generation
                 finally:
                     conn.close()
                     with router.lock:
+                        alone = alone and backend.inflight == 1
                         backend.inflight -= 1
+                    if alone and router.on_timings and backend.source == "local" and backend.name == "big" and tail:
+                        found = re.findall(rb'"timings"\s*:\s*(\{[^{}]*\})', tail)
+                        if found:
+                            try:
+                                router.on_timings(json.loads(found[-1]))
+                            except Exception as e:  # noqa: BLE001 - measuring must never break serving
+                                log(f"Calibration: {e}")
 
         return H
 
@@ -3035,10 +3575,14 @@ HOSTS_STATE = CONFIG_DIR / "hosts.json"
 
 
 class HostManager:
-    def __init__(self, args, router: Router, key: str):
+    def __init__(self, args, router: Router, key: str, known: Optional[Known] = None):
         import threading
 
         self.args, self.router, self.key = args, router, key
+        self.known = known or Known()
+        self.sleep_min: dict[str, int] = {}  # host id -> minutes without requests before it sleeps
+        self.last_active: dict[str, float] = {}
+        self.last_served: dict[str, int] = {}
         self.lock = threading.RLock()
         self.hosts: dict[str, dict] = {}  # id -> addr, port, name, status, seen, error
         self.assign: dict[str, Optional[dict]] = {}  # id -> wanted assignment (None: unload)
@@ -3050,9 +3594,15 @@ class HostManager:
                 h, _, p = ep.rpartition(":")
                 self.extra.append((h or ep, int(p) if h else HOST_CTL_PORT))
         try:
-            self.assign = json.loads(HOSTS_STATE.read_text()).get("assign", {})
+            saved = json.loads(HOSTS_STATE.read_text())
+            self.assign, self.sleep_min = saved.get("assign", {}), saved.get("sleep", {})
         except (OSError, ValueError):
             pass
+        # hosts seen before that are off or asleep now: listed, and woken on demand
+        for mid, rec in self.known.machines.items():
+            if rec.get("kind") == "host" and rec.get("ip") and rec.get("port"):
+                self.hosts[mid] = {"addr": rec["ip"], "port": int(rec["port"]), "name": rec.get("name", rec["ip"]),
+                                   "status": {}, "seen": 0, "error": "", "asleep": True}
         self.last_scan = 0.0
         self.pushed: dict[str, tuple] = {}  # id -> (assignment, time) last sent
 
@@ -3077,7 +3627,7 @@ class HostManager:
     def save(self) -> None:
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            HOSTS_STATE.write_text(json.dumps({"assign": self.assign}))
+            HOSTS_STATE.write_text(json.dumps({"assign": self.assign, "sleep": self.sleep_min}))
         except OSError as e:
             log(f"Hosts: could not save the assignments ({e})")
 
@@ -3109,21 +3659,27 @@ class HostManager:
                 continue
             with self.lock:
                 self.hosts[st["id"]] = {"addr": addr, "port": port, "name": st.get("host", addr), "status": st,
-                                        "seen": time.time(), "error": ""}
+                                        "seen": time.time(), "error": "", "asleep": st.get("state") == "asleep"}
+            self.known.note(st["id"], "host", st.get("host", addr), addr, {**st, "port": port})
             log(f"Host {st.get('host', addr)} ({addr}:{port}) found: {st.get('state')}"
                 + (f", {st.get('model')}" if st.get("model") else ""))
 
     def poll(self) -> None:
         for hid, h in list(self.hosts.items()):
             try:
-                st = self._call(h, "/status")
+                st = self._call(h, "/status", timeout=3)
                 with self.lock:
-                    h.update(status=st, seen=time.time(), error="")
+                    h.update(status=st, seen=time.time(), error="", asleep=st.get("state") == "asleep")
+                self.known.note(hid, "host", h["name"], h["addr"], {**st, "port": h["port"]})
             except Exception as e:  # noqa: BLE001
                 with self.lock:
-                    h["error"] = str(e)[:160]
-                    if time.time() - h["seen"] > 300:  # gone for 5 minutes: forget it until it's back
-                        del self.hosts[hid]
+                    if hid in self.known.machines:
+                        h["asleep"] = True  # off or asleep: it can be woken
+                        h["error"] = ""
+                    else:
+                        h["error"] = str(e)[:160]
+                        if time.time() - h["seen"] > 300:  # gone for 5 minutes: forget it until it's back
+                            del self.hosts[hid]
                 continue
             self._apply_cli(hid, h)
             self.ensure(hid)
@@ -3161,7 +3717,7 @@ class HostManager:
             with self.lock:
                 h["status"] = st
             self.pushed[hid] = (json.dumps(body, sort_keys=True), time.time())
-            log(f"Host {h['name']}: {'load ' + body['model'] if body else 'unload'}")
+            log(f"Host {h['name']}: {path.strip('/')}" + (f" {body['model']}" if body.get("model") else ""))
         except Exception as e:  # noqa: BLE001
             h["error"] = f"{path}: {e}"[:160]
 
@@ -3170,6 +3726,18 @@ class HostManager:
         with self.lock:
             for hid, h in self.hosts.items():
                 st = h.get("status") or {}
+                rec = self.known.machines.get(hid, {})
+                if h.get("asleep"):
+                    # still offered: the router wakes it when a request needs it
+                    a = (st.get("assignment") or self.assign.get(hid) or {})
+                    label = st.get("model") or rec.get("model") or ""
+                    if not a or not label:
+                        continue
+                    backends.append(Backend(a.get("role") or "big",
+                                            f"http://{h['addr']}:{st.get('api_port') or rec.get('api_port') or HOST_API_PORT}",
+                                            self.key, label, group=a.get("name") or label, where=h["name"],
+                                            source=hid, ctx=st.get("ctx") or 0, asleep=True, status="asleep"))
+                    continue
                 a = st.get("assignment") or {}
                 if st.get("state") != "ready" or not st.get("model") or h.get("error"):
                     continue
@@ -3177,6 +3745,58 @@ class HostManager:
                                         self.key, st["model"], group=a.get("name") or st["model"],
                                         where=h["name"], source=hid, ctx=st.get("ctx") or 0))
         self.router.set_hosts(backends)
+
+    # Sleep and wake ------------------------------------------------------------
+
+    def check_sleep(self) -> None:
+        """Hosts with a sleep time that had no request for that long go to sleep."""
+        now = time.time()
+        for hid, h in list(self.hosts.items()):
+            st = h.get("status") or {}
+            mins = int(self.sleep_min.get(hid, self.args.host_sleep or 0) or 0)
+            served = sum(b.served for b in self.router.backends if b.source == hid)
+            busy = any(b.inflight for b in self.router.backends if b.source == hid) or \
+                (st.get("metrics") or {}).get("requests_processing")
+            if busy or served != self.last_served.get(hid) or st.get("state") != "ready":
+                self.last_active[hid] = now
+                self.last_served[hid] = served
+                continue
+            if not mins or h.get("asleep") or not st.get("can_sleep") or hid not in self.known.machines:
+                continue
+            if now - self.last_active.setdefault(hid, now) > mins * 60:
+                self.sleep(hid, f"{mins} min without requests")
+
+    def sleep(self, hid: str, why: str) -> None:
+        h = self.hosts.get(hid)
+        if not h:
+            return
+        log(f"Host {h['name']}: going to sleep ({why})")
+        self._send(hid, "/sleep", {})
+        if (h.get("status") or {}).get("state") == "asleep":
+            with self.lock:
+                h["asleep"] = True
+            self.update_router()
+
+    def wake(self, hid: str, force: bool = False) -> bool:
+        ok = self.known.wake(hid, force)
+        if ok:
+            self.last_active[hid] = time.time()
+        return ok
+
+    def wake_and_wait(self, backend: Backend) -> Optional[Backend]:
+        """For the router: wakes the host behind a backend and waits until its
+        model answers (the request waits that long). Returns the backend to
+        use then (while loading, the host has none, so it is a new one)."""
+        hid = backend.source
+        if not self.wake(hid) and not self.known.recently_woken(hid):
+            return None
+        deadline = time.time() + WAKE_WAIT_S
+        while time.time() < deadline:
+            ready = next((b for b in self.router.backends if b.source == hid and b.healthy and not b.asleep), None)
+            if ready:
+                return ready
+            time.sleep(2)
+        return None
 
     def loop(self) -> None:
         while True:
@@ -3186,6 +3806,7 @@ class HostManager:
                     self.discover()
                 self.poll()
                 self.update_router()
+                self.check_sleep()
             except Exception as e:  # noqa: BLE001 - keep managing
                 log(f"Hosts: {e}")
             time.sleep(5)
@@ -3203,6 +3824,18 @@ class HostManager:
         hid = str(body.get("host") or "")
         if hid not in self.hosts:
             return {"error": "unknown host"}
+        if body.get("wake"):
+            self.wake(hid, force=True)
+            return self.info()
+        if body.get("sleep"):
+            threading.Thread(target=self.sleep, args=(hid, "from the dashboard"), daemon=True).start()
+            return self.info()
+        if "sleep_min" in body:
+            v = str(body.get("sleep_min") or "0")
+            self.sleep_min[hid] = int(v) if v.isdigit() else 0
+            self.last_active[hid] = time.time()
+            self.save()
+            return self.info()
         if body.get("unload"):
             self.assign[hid] = None
         else:
@@ -3225,11 +3858,17 @@ class HostManager:
                 st = h.get("status") or {}
                 hosts.append({"id": hid, "name": h["name"], "addr": f"{h['addr']}:{h['port']}",
                               "error": h.get("error", ""), "want": self.assign.get(hid, "–"),
+                              "asleep": bool(h.get("asleep")), "wakeable": hid in self.known.machines,
+                              "waking": self.known.recently_woken(hid),
+                              "sleep_min": int(self.sleep_min.get(hid, self.args.host_sleep or 0) or 0),
+                              "can_sleep": bool((h.get("status") or {}).get("can_sleep")),
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]
+                elif h.get("asleep"):
+                    hosts[-1]["state"] = "asleep"
         return {"hosts": sorted(hosts, key=lambda x: x["name"]),
                 "catalog": [{"key": k, "desc": d} for k, _r, _q, d in CATALOG]}
 
@@ -3280,6 +3919,153 @@ def plan_fast(args, devices: list[Device]) -> tuple[list[str], dict, dict]:
             "size_gb": round(m.size_mb / 1024, 1), "ctx": args.fast_ctx, "port": port,
             "need_gb": round(need / 1024, 1)}
     return cmd, reserve, info
+
+
+# ── Draft model (speculative decoding) ──────────────────────────────────────
+#
+# A small model of the same family (same tokenizer) writes a few tokens
+# ahead; the big model checks them in one pass and keeps the ones it would
+# have written. Same output, often 1.5-2x the tokens per pass. It pays most
+# when the big model is split over the network: every pass costs network
+# round trips, and the draft runs on the master without any.
+
+DRAFT_CATALOG = [
+    # key, repo, quant, for which architectures (prefix match; vocab is checked anyway)
+    ("qwen3.5-0.8b", "unsloth/Qwen3.5-0.8B-GGUF", "Q8_0", ("qwen35", "qwen36", "qwen37", "qwen38")),
+    ("qwen3-0.6b", "bartowski/Qwen_Qwen3-0.6B-GGUF", "Q8_0", ("qwen3",)),
+    ("llama-3.2-1b", "bartowski/Llama-3.2-1B-Instruct-GGUF", "Q8_0", ("llama",)),
+]
+DRAFT_MAX_SHARE = 0.12  # a draft larger than this share of the big model rarely pays off
+DRAFT_N_MAX = 8
+
+
+def gguf_vocab(path: str) -> Optional[dict]:
+    """Tokenizer type, BOS/EOS and the token list from a GGUF header."""
+    scalar = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+    want = {"tokenizer.ggml.model", "tokenizer.ggml.bos_token_id", "tokenizer.ggml.eos_token_id",
+            "tokenizer.ggml.add_bos_token", "tokenizer.ggml.add_eos_token", "tokenizer.ggml.tokens"}
+    out: dict = {}
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            _v, _nt, n_kv = struct.unpack("<IQQ", f.read(20))
+
+            def read_str() -> str:
+                (n,) = struct.unpack("<Q", f.read(8))
+                return f.read(n).decode("utf-8", "replace")
+
+            def read_val(t: int, keep: bool):
+                if t in scalar:
+                    fmt = "<" + scalar[t]
+                    return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+                if t == 8:
+                    return read_str()
+                if t == 9:
+                    et, n = struct.unpack("<IQ", f.read(12))
+                    if et in scalar and not keep:
+                        f.seek(struct.calcsize("<" + scalar[et]) * n, 1)
+                        return None
+                    vals = [read_val(et, keep) for _ in range(n)]
+                    return vals if keep else None
+                raise ValueError(f"GGUF value type {t}")
+
+            for _ in range(n_kv):
+                key = read_str()
+                (t,) = struct.unpack("<I", f.read(4))
+                v = read_val(t, key in want)
+                if key in want:
+                    out[key] = v
+                if len(out) == len(want):
+                    break
+    except (OSError, struct.error, ValueError):
+        return None
+    return out
+
+
+def vocab_compatible(target: str, draft: str) -> tuple[bool, str]:
+    """llama.cpp's own check (common_speculative_are_compatible): same
+    tokenizer type, same BOS/EOS, sizes within 128, same tokens from id 5."""
+    a, b = gguf_vocab(target), gguf_vocab(draft)
+    if not a or not b:
+        return False, "could not read the tokenizer"
+    if a.get("tokenizer.ggml.model") != b.get("tokenizer.ggml.model"):
+        return False, f"tokenizer {a.get('tokenizer.ggml.model')} vs {b.get('tokenizer.ggml.model')}"
+    for k, d in (("add_bos_token", False), ("add_eos_token", False)):
+        if bool(a.get(f"tokenizer.ggml.{k}", d)) != bool(b.get(f"tokenizer.ggml.{k}", d)):
+            return False, k.replace("_", " ") + " differs"
+    for k, flag in (("bos_token_id", "add_bos_token"), ("eos_token_id", "add_eos_token")):
+        if a.get(f"tokenizer.ggml.{flag}") and a.get(f"tokenizer.ggml.{k}") != b.get(f"tokenizer.ggml.{k}"):
+            return False, k.replace("_", " ") + " differs"
+    ta, tb = a.get("tokenizer.ggml.tokens") or [], b.get("tokenizer.ggml.tokens") or []
+    if not ta or not tb or abs(len(ta) - len(tb)) > 128:
+        return False, f"vocab size {len(ta)} vs {len(tb)}"
+    n = min(len(ta), len(tb))
+    if ta[5:n] != tb[5:n]:
+        return False, "different tokens"
+    return True, ""
+
+
+def find_draft(args, main: str) -> Optional[str]:
+    """The draft model for --draft-model: a path, or auto (a fitting GGUF on
+    this PC, else a small model of the same family from the catalog)."""
+    choice = (args.draft_model or "off").strip()
+    if choice.lower() in ("off", "none", "no", "0", ""):
+        return None
+    if choice.lower() != "auto":
+        p = Path(choice).expanduser()
+        if not p.is_file():
+            log(f"Draft model {choice}: no such file; running without")
+            return None
+        ok, why = vocab_compatible(main, str(p))
+        if not ok:
+            log(f"Draft model {p.name} doesn't match {Path(main).name} ({why}); running without")
+            return None
+        return str(p.resolve())
+    main_mb = os.path.getsize(main) / 2**20
+    cands = [Path(e["path"]) for e in local_models()
+             if e["size_mb"] <= main_mb * DRAFT_MAX_SHARE and Path(e["path"]).resolve() != Path(main).resolve()]
+    for p in sorted(cands, key=lambda c: -c.stat().st_size):  # the largest that is small enough
+        if vocab_compatible(main, str(p))[0]:
+            log(f"Draft model: {p.name} (found on this PC)")
+            return str(p.resolve())
+    arch = _gguf_arch(main)
+    entry = next((e for e in DRAFT_CATALOG if any(arch == a or (a != "qwen3" and arch.startswith(a))
+                                                  or (a == "qwen3" and arch in ("qwen3", "qwen3moe"))
+                                                  for a in e[3])), None)
+    if entry is None:
+        log(f"No draft model known for architecture {arch or '?'}; give one with --draft-model PATH")
+        return None
+    dest = Path(main).parent if os.access(Path(main).parent, os.W_OK) else CONFIG_DIR / "models"
+    try:
+        p = fetch_model(f"{entry[1]}:{entry[2]}", dest, quiet=True)
+    except ModelError as e:
+        log(f"Draft model {entry[0]}: {e}; running without")
+        return None
+    ok, why = vocab_compatible(main, str(p))
+    if not ok:
+        log(f"Draft model {p.name} doesn't match {Path(main).name} ({why}); running without")
+        return None
+    log(f"Draft model: {p.name} (downloaded)")
+    return str(p)
+
+
+def plan_draft(args, path: str, devices: list[Device]) -> tuple[list[str], dict, dict]:
+    """Where the draft runs: the local GPU with the most room (it is small,
+    and every pass needs it), else the CPU. Returns its llama-server
+    options, the memory to keep free for it, and info."""
+    m = gguf_info(path, args.ctx or CTX_STEPS[0])
+    need = m.size_mb + m.kv_layer_mb * m.n_layer + 300
+    gpus = [d for d in usable_gpus(devices) if d.free_mb * GPU_SHARE - (getattr(args, "reserve_mb", None) or {}).get(d.name, 0) >= need]
+    dev = max(gpus, key=lambda d: d.free_mb) if gpus else None
+    opts = ["--spec-type", "draft-simple", "-md", path, "--spec-draft-n-max", str(args.draft_max)]
+    opts += ["-devd", dev.name, "-ngld", "all"] if dev else ["-devd", "none", "-ngld", "0"]
+    reserve = {dev.name: need} if dev else {}
+    if dev is None or dev.type == "igpu":
+        reserve["__host__"] = need
+    info = {"model": Path(path).stem, "device": f"{dev.name} {dev.description}" if dev else "CPU",
+            "size_gb": round(m.size_mb / 1024, 2), "n_max": args.draft_max}
+    return opts, reserve, info
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
@@ -3625,6 +4411,10 @@ def main() -> None:
     h.add_argument("extra", nargs=argparse.REMAINDER, help="-- further llama-server options")
     h.set_defaults(fn=cmd_host)
 
+    c = sub.add_parser("calibration", help="show (or --reset) what the planner learned from measurements")
+    c.add_argument("--reset", action="store_true", help="forget all measurements")
+    c.set_defaults(fn=cmd_calibration)
+
     k = sub.add_parser("key", help="print the master's API key (the cluster key for hosts)")
     k.set_defaults(fn=cmd_key)
 
@@ -3651,11 +4441,19 @@ def main() -> None:
     s.add_argument("--router-mode", choices=["heuristic", "model"],
                    help="heuristic: rules on the request; model: the fast model judges (default: last setting)")
     s.add_argument("--model-name", default="privatelm", help="model name clients see with the router")
+    s.add_argument("--draft-model", default="off",
+                   help="small model of the same family for speculative decoding: PATH, auto (find or "
+                        "download one), or off (default)")
+    s.add_argument("--draft-max", type=int, default=DRAFT_N_MAX,
+                   help=f"tokens the draft writes ahead (default {DRAFT_N_MAX})")
     s.add_argument("--assign", action="append", metavar="HOST=MODEL[,role=..][,name=..][,ctx=N]",
                    help="have a host load a whole model (repeatable): HOST is its name or IP, MODEL a catalog "
                         "name, user/repo[:QUANT] or a file on the host; role big (default), fast, or extra "
                         "(only by name); name is what clients ask for")
     s.add_argument("--hosts", help="hosts mDNS doesn't find: IP[:PORT],... (default port 50070)")
+    s.add_argument("--host-sleep", type=int, default=0, metavar="MIN",
+                   help="hosts sleep after MIN minutes without requests and are woken by Wake-on-LAN "
+                        "when a request needs them (default 0: never; per host in the dashboard)")
     s.add_argument("--rebalance", choices=["auto", "on", "off"], default="auto",
                    help="re-plan when workers come or go, and wait for workers if the model doesn't fit "
                         "(auto: last setting from the dashboard, else on; off: plan once, exit 2 if it doesn't fit)")

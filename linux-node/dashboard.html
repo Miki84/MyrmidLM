@@ -112,6 +112,9 @@
                               background: var(--surface); color: var(--text); min-width: 0; }
   .host .acts { display: flex; gap: 8px; grid-column: 1 / -1; }
   .progress { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+  .btn.small { padding: 4px 10px; font-size: 0.82rem; margin-left: 6px; }
+  .host label.inline { display: inline; font-size: 0.84rem; }
+  .host input.mini { width: 4.2em; padding: 3px 6px; margin: 0 4px; }
   .progress i { display: block; height: 100%; background: var(--c0); }
 
   /* Split strip */
@@ -384,10 +387,13 @@ function renderLive(s) {
   const busy = (met.requests_processing || 0) > 0;
   const shown = busy && m.tps_now > 0 ? m.tps_now : m.tps_last;
   $("rate").innerHTML = `${shown ? nf(shown, 1) : "–"}<small>Token/s</small>`;
+  const cal = s.calibration || {}, spec = p.draft || p.mtp;
+  const est = `Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s${spec ? " ohne Entwurf" : ""}`
+    + (cal.measured_tps ? `, gemessen ${nf(cal.measured_tps, 1)} ${spec ? "Durchläufe/s" : "Token/s"} (${cal.n} Anfragen)` : "") + ".";
   $("rate-note").textContent = p.mode === "waiting" ? "Das Modell passt noch nicht: Es fehlen Worker."
-    : busy ? `Generiert gerade. Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s.`
-    : shown ? `Letzte Generierung. Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s.`
-    : `Wartet auf die erste Anfrage. Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s.`;
+    : busy ? `Generiert gerade. ${est}`
+    : shown ? `Letzte Generierung. ${est}`
+    : `Wartet auf die erste Anfrage. ${est}`;
   const workers = Object.values(s.workers || {});
   const online = workers.filter((w) => w.online).length;
   const kv = met.kv_cache_usage_ratio;
@@ -399,6 +405,7 @@ function renderLive(s) {
     [nf(met.tokens_predicted_total || 0, 0), "Tokens erzeugt"],
     [p.hops ? `${p.hops}` : "keine", p.hops === 1 ? "Netzwerk-Übergang pro Token" : "Netzwerk-Übergänge pro Token"],
   ];
+  if (p.draft) facts.push([p.draft.model, `Entwurfsmodell (${p.draft.device}, bis ${p.draft.n_max} Tokens voraus)`]);
   $("facts").innerHTML = facts.map(([v, k]) => `<div class="fact"><div class="v num">${esc(v)}</div><div class="k">${esc(k)}</div></div>`).join("");
 }
 
@@ -511,6 +518,12 @@ function gpuBlock(g) {
     ${meter("VRAM", memPct, `${gb(g.mem_used_mb)} / ${gb(g.mem_total_mb)}`, 92, 98)}</div>`;
 }
 
+function calText(s, id) {
+  const f = ((s.calibration || {}).machines || {})[id];
+  if (f == null || Math.abs(f - 1) < 0.05) return "";
+  return `<span title="Gemessene Geschwindigkeit im Verhältnis zur Schätzung aus der Speicherbandbreite">gemessen <b class="num">${nf(f, 2)}×</b> der Schätzung</span>`;
+}
+
 function machineCard(s, id, st, extra) {
   const c = machineColor(id);
   const stats = st.stats || {};
@@ -522,7 +535,7 @@ function machineCard(s, id, st, extra) {
     <div class="machine-top"><div><h3>${esc(st.title)}</h3><div class="role">${esc(st.role)}</div></div>
       <div class="pill"><span class="dot ${st.dot}"></span><span>${esc(st.stateText)}</span></div></div>
     <div class="machine-body">
-      <div class="kv"><span><b class="num">${layers}</b> Layer</span>${isOut ? "<span>Ausgabeschicht</span>" : ""}${st.rtt != null ? `<span>Antwortzeit <b class="num">${nf(st.rtt, 1)} ms</b></span>` : ""}</div>
+      <div class="kv"><span><b class="num">${layers}</b> Layer</span>${isOut ? "<span>Ausgabeschicht</span>" : ""}${st.rtt != null ? `<span>Antwortzeit <b class="num">${nf(st.rtt, 1)} ms</b></span>` : ""}${calText(s, id)}</div>
       ${gpus || (stats.host ? `<div class="note">Keine GPU-Messwerte (Intel-GPU oder ohne Treiberwerkzeug).</div>` : "")}
       ${stats.host ? meter("CPU", stats.cpu_pct, nf(stats.cpu_pct, 0) + " %") : ""}
       ${stats.host ? meter("RAM", ramPct, `${gb(stats.ram_used_mb)} / ${gb(stats.ram_total_mb)}`, 90, 97) : ""}
@@ -569,10 +582,12 @@ function renderMachines(s) {
 function renderLan(s) {
   const rows = (s.lan || []).filter((d) => !d.in_use);
   $("lan-section").hidden = rows.length === 0;
-  const kind = (d) => d.kind === "server" ? "Server" : d.type === "gpu" ? "GPU-Worker" : d.type === "cpu" ? "RAM-Worker" : "Handy";
+  const kind = (d) => d.kind === "server" ? "Server" : d.type === "gpu" ? "GPU-Worker" : d.type === "cpu" ? "RAM-Worker" : d.type === "off" ? "PC-Worker" : "Handy";
+  const status = (d) => d.wake_id ? (d.waking ? "wird geweckt …" : `aus oder schläft <button class="btn quiet small" data-wake="${esc(d.wake_id)}" type="button">Aufwecken</button>`)
+    : d.compatible ? (d.kind === "worker" ? "frei, nicht im Plan" : "eigener Server") : "andere Version";
   $("lan").innerHTML = rows.map((d) => `<tr><td>${esc(d.name)}</td><td>${kind(d)}</td><td class="num">${esc(d.endpoint)}</td>
     <td class="num">${d.ram_mb ? gb(d.ram_mb) : "–"}${d.bw ? `, ${nf(d.bw, 0)} GB/s` : ""}</td>
-    <td>${d.compatible ? (d.kind === "worker" ? "frei, nicht im Plan" : "eigener Server") : "andere Version"}</td></tr>`).join("");
+    <td>${status(d)}</td></tr>`).join("");
 }
 
 const ROLE_TEXT = { big: "groß", fast: "schnell", extra: "nur per Name" };
@@ -615,7 +630,8 @@ function renderRouter(s) {
 }
 
 const HOST_STATE = { idle: ["", "frei"], preparing: ["warn", "bereitet vor"], downloading: ["warn", "lädt herunter"],
-  loading: ["warn", "lädt das Modell"], ready: ["ok", "bereit"], error: ["bad", "Fehler"], unreachable: ["bad", "nicht erreichbar"] };
+  loading: ["warn", "lädt das Modell"], ready: ["ok", "bereit"], error: ["bad", "Fehler"], unreachable: ["bad", "nicht erreichbar"],
+  asleep: ["", "schläft oder aus"] };
 const hostEdits = {};  // host id -> form values the user is typing, kept across refreshes
 
 function renderHosts(s) {
@@ -641,10 +657,15 @@ function renderHosts(s) {
       <div class="note">${esc(pr.name)}: ${gb(pr.done_mb)} von ${gb(pr.total_mb)}</div>` : "";
     const now = x.model ? `<div><b>${esc(x.model)}</b>${x.ctx ? `, Kontext ${x.ctx.toLocaleString("de-DE")}` : ""}${x.estimate_tps ? `, geschätzt ${nf(x.estimate_tps, 1)} Token/s` : ""}${x.busy ? `, ${x.busy} Anfrage(n) in Arbeit` : ""}</div>` : "";
     const role = e.role ?? a.role ?? "big";
+    const sleepRow = x.asleep
+      ? `<div class="kv"><span>${x.waking ? "Wird geweckt, lädt danach sein Modell …" : "Schläft. Eine Anfrage an sein Modell weckt ihn."}</span>${x.wakeable && !x.waking ? `<button class="btn quiet small" type="button" data-hwake>Aufwecken</button>` : ""}</div>`
+      : `<div class="kv"><label class="inline">Schlafen nach <input name="sleep_min" class="mini" inputmode="numeric" value="${esc(String(e.sleep_min ?? x.sleep_min ?? 0))}"> Min. ohne Anfrage (0 = nie)</label>${x.can_sleep && x.state === "ready" ? `<button class="btn quiet small" type="button" data-hsleep>Jetzt schlafen</button>` : ""}</div>
+         ${x.sleep_min && !x.can_sleep ? `<div class="note">Schlafen braucht den Helfer des Installationsskripts (Rolle Host) auf diesem PC.</div>` : ""}
+         ${x.sleep_min && !x.wakeable ? `<div class="note">Keine MAC-Adresse bekannt (WLAN?): Aufwecken per Wake-on-LAN geht nur über Kabel.</div>` : ""}`;
     return `<article class="host" data-id="${esc(x.id)}">
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${gpus ? " · " + gpus : ""}</div></div>
         <div class="pill"><span class="dot ${cls}"></span><span>${txt}</span></div></div>
-      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}
+      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${sleepRow}
       <form>
         <label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
@@ -673,10 +694,22 @@ $("hosts").addEventListener("submit", (ev) => {
   hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx") });
 });
 $("hosts").addEventListener("click", (ev) => {
-  if (!ev.target.matches("[data-unload]")) return;
+  const card = ev.target.closest(".host"); if (!card) return;
+  if (ev.target.matches("[data-unload]")) { delete hostEdits[card.dataset.id]; hostAction({ host: card.dataset.id, unload: true }); }
+  if (ev.target.matches("[data-hwake]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, wake: true }); }
+  if (ev.target.matches("[data-hsleep]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, sleep: true }); }
+});
+$("hosts").addEventListener("change", (ev) => {
+  if (ev.target.name !== "sleep_min") return;
   const card = ev.target.closest(".host");
-  delete hostEdits[card.dataset.id];
-  hostAction({ host: card.dataset.id, unload: true });
+  if (hostEdits[card.dataset.id]) delete hostEdits[card.dataset.id].sleep_min;
+  hostAction({ host: card.dataset.id, sleep_min: ev.target.value });
+  ev.target.blur();
+});
+$("lan").addEventListener("click", async (ev) => {
+  const id = ev.target.dataset && ev.target.dataset.wake; if (!id) return;
+  ev.target.disabled = true;
+  try { await api("/api/wake", { method: "POST", body: JSON.stringify({ id }) }); } catch (e) { /* next poll */ }
 });
 
 async function setRouter(body) {

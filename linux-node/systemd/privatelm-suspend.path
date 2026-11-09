@@ -1,0 +1,10 @@
+[Unit]
+Description=PrivateLM: suspend when the host asks
+# The host service runs without root; it asks for standby by creating this
+# file, and privatelm-suspend.service (root) suspends the PC.
+
+[Path]
+PathExists=/run/privatelm-node/suspend
+
+[Install]
+WantedBy=multi-user.target

@@ -7,6 +7,9 @@ Wants=network-online.target
 # The cluster key is the master's API key (on the master: privatelm-node key).
 # Put it in /etc/privatelm-node/cluster_key (root only, chmod 600).
 LoadCredential=cluster_key:/etc/privatelm-node/cluster_key
+# For sleep on the master's request (with privatelm-suspend.path):
+RuntimeDirectory=privatelm-node
+RuntimeDirectoryMode=0755
 ExecStart=/opt/privatelm-node/bin/privatelm-node host --models-dir /var/lib/privatelm-node/models
 DynamicUser=yes
 CacheDirectory=privatelm-node
