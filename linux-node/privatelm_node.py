@@ -1526,7 +1526,7 @@ def measure(base: str, key: str, ifaces: Optional[list[str]], temp: float, token
         drafted += t.get("draft_n", 0) or 0
         accepted += t.get("draft_n_accepted", 0) or 0
     k = max(1, runs)
-    return {"tps": sum(tps) / len(tps), "per_rx": per_rx / k, "per_tx": per_tx / k, "n": n,
+    return {"tps": sum(tps) / len(tps), "per_rx": per_rx / k, "per_tx": per_tx / k, "n": n, "timings": t,
             "prompt_tokens": None, "acceptance": (accepted / drafted) if drafted else None,
             "n_vocab": meta.get("n_vocab", 0), "n_embd": meta.get("n_embd", 0)}
 
@@ -2737,6 +2737,7 @@ class Dashboard:
         def go():
             try:
                 r = measure(self.base, self.sp.key, None, 0.7, 64, 0, 1)
+                self.sup.on_timings(r.get("timings") or {})  # the test goes past the router: learn from it here
                 res = {"running": False, "finished": int(time.time()), "tps": round(r["tps"], 1),
                        "kb_per_token": round((r["per_rx"] + r["per_tx"]) / 1024, 1),
                        "acceptance": r["acceptance"]}
@@ -4052,6 +4053,7 @@ DRAFT_CATALOG = [
     ("llama-3.2-1b", "bartowski/Llama-3.2-1B-Instruct-GGUF", "Q8_0", ("llama",)),
 ]
 DRAFT_MAX_SHARE = 0.12  # a draft larger than this share of the big model rarely pays off
+DRAFT_MIN_MB = 500  # the smallest catalog drafts (Q8_0) are about this size
 DRAFT_N_MAX = 8
 
 
@@ -4149,6 +4151,11 @@ def find_draft(args, main: str) -> Optional[str]:
     entry = next((e for e in DRAFT_CATALOG if any(arch == a or (a != "qwen3" and arch.startswith(a))
                                                   or (a == "qwen3" and arch in ("qwen3", "qwen3moe"))
                                                   for a in e[3])), None)
+    if entry is not None and main_mb * DRAFT_MAX_SHARE < DRAFT_MIN_MB:
+        # 0.6B drafting for 1.7B: the draft costs nearly as much as it saves
+        log(f"No draft model: {Path(main).name} is small ({main_mb / 1024:.1f} GB); a draft pays off from "
+            f"about {DRAFT_MIN_MB / DRAFT_MAX_SHARE / 1024:.0f} GB on")
+        return None
     if entry is None:
         log(f"No draft model known for architecture {arch or '?'}; give one with --draft-model PATH")
         return None

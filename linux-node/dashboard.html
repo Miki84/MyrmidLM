@@ -756,7 +756,7 @@ function renderBench(s) {
   btn.textContent = b.running ? "Test läuft …" : "Kurztest starten";
   if (b.error) $("bench-out").textContent = b.error;
   else if (b.tps != null) {
-    const acc = b.acceptance != null ? `, MTP-Treffer ${nf(b.acceptance * 100, 0)} %` : "";
+    const acc = b.acceptance != null ? `, ${(last && last.plan && last.plan.mtp) ? "MTP" : "Entwurf"}-Treffer ${nf(b.acceptance * 100, 0)} %` : "";
     $("bench-out").textContent = `Letzter Test: ${nf(b.tps, 1)} Token/s, ${nf(b.kb_per_token, 0)} KB Netz pro Token${acc}.`;
   }
 }
