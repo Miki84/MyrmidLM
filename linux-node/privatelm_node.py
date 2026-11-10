@@ -181,7 +181,16 @@ def machine_id() -> str:
 
 
 def lan_address() -> str:
-    """The address other devices reach this PC at (the default route's)."""
+    """The address other devices reach this PC at: its fastest link into
+    the LAN (cable before Wi-Fi, see best_link)."""
+    try:
+        return best_address()
+    except Exception:  # noqa: BLE001 - odd interfaces: the default route still works
+        return _default_route_address()
+
+
+def _default_route_address() -> str:
+    """The address of the default route's interface."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("192.0.2.1", 9))  # no packet is sent
@@ -190,6 +199,133 @@ def lan_address() -> str:
         return "127.0.0.1"
     finally:
         s.close()
+
+
+# ── Network: the fastest connection ─────────────────────────────────────────
+#
+# A PC with cable and Wi-Fi announces the address of its fastest link:
+# wired before Wi-Fi, the faster wired one first, but only links into the
+# same network as the default route (a second cable to a NAS is no way for
+# the master to reach it). A watcher checks every 20 s; when the best link
+# changes (cable plugged in or pulled), the mDNS announcements move to the
+# new address and the master re-plans onto it.
+
+VIRTUAL_IFACE = re.compile(r"^(lo|docker|br-|virbr|veth|vnet|tun|tap|wg|wt\d|tailscale|zt|ham|vmnet|vboxnet|"
+                           r"cni|flannel|cali|kube|lxc|lxd|incus|podman)")
+NET_WATCH_S = 20
+NET_STATE: dict = {"address": "", "link": ""}  # what this PC announces now, for status pages
+
+
+def _ifreq_ip(sock, name: str, req: int) -> Optional[str]:
+    import fcntl
+
+    try:
+        return socket.inet_ntoa(fcntl.ioctl(sock.fileno(), req, struct.pack("256s", name[:15].encode()))[20:24])
+    except OSError:
+        return None
+
+
+def local_links() -> list[dict]:
+    """IPv4 links that are up: address, interface, wired or Wi-Fi, speed."""
+    import ipaddress
+
+    out = []
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _i, name in socket.if_nameindex():
+            if VIRTUAL_IFACE.match(name):
+                continue
+            base = Path(f"/sys/class/net/{name}")
+            if _read(base / "operstate").strip() not in ("up", "unknown") or _read(base / "carrier").strip() == "0":
+                continue
+            ip = _ifreq_ip(s, name, 0x8915)  # SIOCGIFADDR
+            mask = _ifreq_ip(s, name, 0x891B)  # SIOCGIFNETMASK
+            if not ip or ip.startswith("127."):
+                continue
+            wifi = (base / "wireless").exists() or (base / "phy80211").exists()
+            try:
+                speed = max(0, int(_read(base / "speed").strip() or 0)) if not wifi else 0
+            except ValueError:
+                speed = 0
+            net = ipaddress.ip_network(f"{ip}/{mask or '255.255.255.0'}", strict=False)
+            out.append({"ip": ip, "iface": name, "kind": "wifi" if wifi else "wired", "speed": speed, "net": net})
+    finally:
+        s.close()
+    return out
+
+
+def link_label(link: Optional[dict]) -> str:
+    if not link:
+        return ""
+    if link["kind"] == "wifi":
+        return f"WLAN ({link['iface']})"
+    sp = link["speed"]
+    return f"Kabel ({link['iface']}" + (f", {sp // 1000} Gbit/s)" if sp >= 1000 else f", {sp} Mbit/s)" if sp else ")")
+
+
+def best_link() -> Optional[dict]:
+    """The fastest link into the default route's network."""
+    import ipaddress
+
+    links = local_links()
+    default = _default_route_address()
+    if not links:
+        return None
+    dnet = next((ln["net"] for ln in links if ln["ip"] == default), None)
+    same = [ln for ln in links if dnet is None or ipaddress.ip_address(ln["ip"]) in dnet] or links
+    return max(same, key=lambda ln: (ln["kind"] == "wired", ln["speed"], ln["ip"] == default))
+
+
+def best_address() -> str:
+    ln = best_link()
+    return ln["ip"] if ln else _default_route_address()
+
+
+def all_lan_addresses() -> list[str]:
+    """Every address of this PC in its LAN (for firewalls on the workers)."""
+    import ipaddress
+
+    links = local_links()
+    default = _default_route_address()
+    dnet = next((ln["net"] for ln in links if ln["ip"] == default), None)
+    return [ln["ip"] for ln in links if dnet is None or ipaddress.ip_address(ln["ip"]) in dnet]
+
+
+class NetWatch:
+    """Moves this PC's mDNS announcements to its fastest link when that changes."""
+
+    def __init__(self, advs: list, fixed: bool, on_change=None):
+        self.advs, self.fixed, self.on_change = advs, fixed, on_change
+        ln = best_link()
+        NET_STATE.update(address=ln["ip"] if ln else _default_route_address(), link=link_label(ln))
+
+    def start(self) -> None:
+        import threading
+
+        if self.fixed:  # --advertise-ip or --host set: the user chose the address
+            return
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self) -> None:
+        while True:
+            time.sleep(NET_WATCH_S)
+            try:
+                ln = best_link()
+            except Exception:  # noqa: BLE001 - try again next round
+                continue
+            if not ln or ln["ip"] == NET_STATE["address"]:
+                continue
+            old = f"{NET_STATE['address']} ({NET_STATE['link'] or '?'})"
+            NET_STATE.update(address=ln["ip"], link=link_label(ln))
+            log(f"Network: now {ln['ip']} over {NET_STATE['link']} (was {old}); moving the announcements")
+            mac, bcast = iface_info(ln["ip"])
+            for adv in self.advs:
+                txt = dict(adv.txt, link=ln["kind"])
+                if mac:  # Wake-on-LAN needs the wired card's MAC
+                    txt.update(mac=mac, bcast=bcast)
+                adv.move(ln["ip"], txt)
+            if self.on_change:
+                self.on_change(ln["ip"])
 
 
 # ── mDNS ─────────────────────────────────────────────────────────────────────
@@ -238,6 +374,18 @@ class Advertiser:
                 self._zc.close()
         if self._proc:
             self._proc.terminate()
+        self._zc = self._info = self._proc = None
+
+    def move(self, address: str, txt: Optional[dict] = None) -> None:
+        """Announces the service on another address (and TXT) from now on."""
+        try:
+            self.stop()
+        except Exception:  # noqa: BLE001 - the old interface may be gone already
+            self._zc = self._info = self._proc = None
+        self.address = address
+        if txt is not None:
+            self.txt = txt
+        self.start()
 
 
 @dataclass
@@ -670,6 +818,10 @@ def cmd_worker(args) -> None:
     mac, bcast = iface_info(address)
     if mac:  # for Wake-on-LAN by the master
         txt.update(mac=mac, bcast=bcast)
+    ln = next((x for x in local_links() if x["ip"] == address), None)
+    if ln:
+        txt["link"] = ln["kind"]
+        log(f"Network: {address} over {link_label(ln)}")
     if not args.no_status:
         txt["stat"] = str(args.status_port)
     _advertise(args, advs, f"PrivateLM {host}", args.port, txt, address)
@@ -706,6 +858,7 @@ def cmd_worker(args) -> None:
                               f"{wid}-ram", "cpu"))
     if not args.no_status:
         start_worker_status(args, rpc_info, procs, devices)
+    NetWatch(advs, fixed=bool(args.advertise_ip) or args.host not in ("0.0.0.0", "")).start()
     _wait(procs, advs)
 
 
@@ -1293,8 +1446,9 @@ def cmd_serve(args) -> None:
     if not args.no_advertise:
         adv = Advertiser(SERVER_TYPE, f"PrivateLM {socket.gethostname()}", args.port,
                          {"path": "/v1", "model": public_name, "auth": "1" if sp.key else "0", "v": "1",
-                          "id": machine_id()}, address)
+                          "id": machine_id(), "addrs": ",".join(all_lan_addresses())[:200]}, address)
         adv.start()
+        NetWatch([adv], fixed=bool(args.advertise_ip) or args.host not in ("0.0.0.0", "")).start()
     from urllib.parse import urlencode
 
     params = {"url": f"http://{address}:{args.port}/v1", "model": public_name, "name": socket.gethostname()}
@@ -1421,6 +1575,10 @@ def _wait_healthy(base: str, proc: subprocess.Popen, timeout: float) -> bool:
 
 def cmd_scan(args) -> None:
     peers = scan(args.timeout)
+    if args.json:
+        print(json.dumps([{"kind": p.kind, "name": p.name, "host": p.host, "port": p.port, "txt": p.txt}
+                          for p in peers]))
+        return
     if not peers:
         print("Nothing found. mDNS may be blocked (guest Wi-Fi, client isolation, VPN).")
         return
@@ -2179,6 +2337,23 @@ class Supervisor:
             return
         used = set(sp.endpoints())
         machines = sp.info.get("machines", [])
+        # A worker that now announces another address (cable plugged in):
+        # re-plan onto it as soon as the server is idle.
+        moved = []
+        for u in sp.units:
+            if not (u.remote and u.layers and u.key.startswith("worker/")):
+                continue
+            wid, port = u.key.split("/")[1], u.endpoint.rsplit(":", 1)[1]
+            peer = next((p for p in peers if (p.txt.get("id") or p.host) == wid and str(p.port) == port), None)
+            if peer and peer.endpoint != u.endpoint:
+                link = {"wired": "Kabel", "wifi": "WLAN"}.get(peer.txt.get("link", ""), "neue Adresse")
+                moved.append(f"{u.label}: {u.endpoint} → {peer.endpoint} ({link})")
+        if moved and not self.pending:
+            with self.lock:
+                self.pending = {"kind": "moved", "t": int(time.time()), "text": "Verbindung gewechselt: " + "; ".join(moved)}
+            self.event(f"Worker connection changed: {'; '.join(moved)}; re-planning when idle",
+                       f"Verbindung gewechselt: {'; '.join(moved)}. Neuverteilung, sobald der Server frei ist.")
+            return
         for ep in used:
             if self._alive(ep, machines):
                 self.missing.pop(ep, None)
@@ -2273,7 +2448,7 @@ class Supervisor:
                         except Exception as e:  # noqa: BLE001 - watching must not stop serving
                             log(f"Rebalance check: {e}")
                     pend = self.pending
-                    due = self.now_requested or (pend and (pend["kind"] == "lost"
+                    due = self.now_requested or (pend and (pend["kind"] in ("lost", "moved")
                                                            or now - self.last_switch > REBALANCE_MIN_GAP_S))
                     if due and not self.busy():
                         if self.now_requested:
@@ -2505,7 +2680,7 @@ def start_worker_status(args, rpc_info: list[dict], procs: list[subprocess.Popen
         for info, p in zip(rpc_info, procs):
             rpc.append(dict(info, alive=p.poll() is None, peers=tcp_peers(info["port"])))
         return {"role": "worker", "host": socket.gethostname(), "version": RPC_VERSION,
-                "rpc": rpc, "stats": stats.sample()}
+                "rpc": rpc, "stats": stats.sample(), "address": NET_STATE["address"], "link": NET_STATE["link"]}
 
     if _start_http(args.host, args.status_port, _json_handler({"/status": status})):
         log(f"Status for the master's dashboard on port {args.status_port}")
@@ -3224,6 +3399,7 @@ def cmd_host(args) -> None:
                           **({"mac": agent.mac, "bcast": agent.bcast} if agent.mac else {})}, address)
         adv.start()
         advs.append(adv)
+    NetWatch(advs, fixed=bool(args.advertise_ip) or args.host not in ("0.0.0.0", "")).start()
     threading.Thread(target=agent.watch, daemon=True).start()
     agent.restore()
 
@@ -4644,6 +4820,7 @@ def main() -> None:
 
     sc = sub.add_parser("scan", help="list workers and servers on the LAN")
     sc.add_argument("--timeout", type=float, default=4.0)
+    sc.add_argument("--json", action="store_true")
     sc.set_defaults(fn=cmd_scan)
 
     args = ap.parse_args()
