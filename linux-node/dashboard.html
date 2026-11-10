@@ -99,6 +99,12 @@
   @media (max-width: 900px) { .router, .rebalance { grid-template-columns: 1fr; } }
   .router-off { margin-bottom: 16px; color: var(--muted); font-size: 0.9rem; }
   .backends { margin-top: 4px; }
+  .model-switch { margin-top: 8px; font-size: 0.88rem; }
+  .model-switch summary { cursor: pointer; color: var(--muted); }
+  .model-switch form { display: flex; gap: 8px; margin-top: 8px; max-width: 560px; }
+  .model-switch input { flex: 1; font: inherit; padding: 7px 9px; border-radius: 7px; border: 1px solid var(--line);
+                        background: var(--surface); color: var(--text); min-width: 0; }
+  .role-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; font-size: 0.84rem; }
   .backends td.role { font-weight: 600; white-space: nowrap; }
   .hosts { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; }
   .host { background: var(--surface-2); border-radius: var(--radius-s); padding: 14px 16px; display: grid; gap: 10px; }
@@ -228,6 +234,15 @@
     <div>
       <h1>PrivateLM-Cluster</h1>
       <div class="model" id="model">Verbinde mit dem Master …</div>
+      <details class="model-switch" id="model-switch">
+        <summary>Modell wechseln</summary>
+        <form id="model-form">
+          <input name="model" list="master-models" placeholder="Katalogname, user/repo:QUANT oder Datei" required>
+          <button class="btn" type="submit">Laden</button>
+        </form>
+        <datalist id="master-models"></datalist>
+        <div class="note" id="model-job"></div>
+      </details>
     </div>
     <div class="pill" id="state"><span class="dot"></span><span>Verbinde …</span></div>
   </header>
@@ -367,6 +382,48 @@ async function api(path, opts = {}) {
 }
 
 /* ── Rendering ───────────────────────────────────────────────────────── */
+
+function renderModelSwitch(s) {
+  const ms = s.models || {}, list = $("master-models");
+  if (!list.dataset.filled || list.dataset.n !== String((ms.local || []).length)) {
+    list.innerHTML = (ms.local || []).map((m) => `<option value="${esc(m.path)}">${esc(m.name)} (${nf(m.size_gb, 1)} GB, auf diesem PC)</option>`).join("")
+      + (ms.catalog || []).map((c) => `<option value="${esc(c.key)}">${esc(c.desc)}</option>`).join("");
+    list.dataset.filled = "1"; list.dataset.n = String((ms.local || []).length);
+  }
+  const j = (s.rebalance || {}).model_job, out = $("model-job");
+  if (!j) { out.textContent = "Lokale Modelle oder Katalog; fehlende werden heruntergeladen. Das Modell wird danach neu verteilt."; return; }
+  const name = j.name || j.model;
+  out.className = "note" + (j.state === "error" ? " bad" : "");
+  out.textContent = j.state === "resolving" ? `Suche ${name} …`
+    : j.state === "downloading" ? `Lade ${name} herunter: ${gb(j.done_mb || 0)} von ${gb(j.size_mb || 0)}`
+    : j.state === "loading" ? `Lade ${name} in den Cluster …`
+    : j.state === "error" ? `Fehler: ${j.error}`
+    : `Gewechselt auf ${name}.`;
+  $("model-form").querySelector("button").disabled = ["resolving", "downloading", "loading"].includes(j.state);
+}
+
+$("model-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const model = new FormData(ev.target).get("model");
+  ev.target.querySelector("button").disabled = true;
+  try { await api("/api/model", { method: "POST", body: JSON.stringify({ model }) }); } catch (e) { /* next poll */ }
+});
+
+async function switchRole(ctl, role, btn) {
+  const target = role === "host" ? "Host" : "Worker";
+  if (!confirm(`Diesen Rechner zum ${target} machen? Sein bisheriger Dienst stoppt.`)) return;
+  btn.disabled = true;
+  let r;
+  try { r = await api("/api/role", { method: "POST", body: JSON.stringify({ ctl, role }) }); } catch (e) { r = { ok: false, error: String(e) }; }
+  btn.textContent = r.ok ? `Wird ${target} …` : "Fehler";
+  if (!r.ok) btn.title = r.error || "";
+  if (!r.ok) alert(`Umstellen ging nicht: ${r.error || "unbekannter Fehler"}`);
+}
+
+document.addEventListener("click", (ev) => {
+  const b = ev.target.closest("[data-role-ctl]");
+  if (b) switchRole(b.dataset.roleCtl, b.dataset.role, b);
+});
 
 function renderHeader(s) {
   const p = s.plan, m = s.master;
@@ -570,7 +627,11 @@ function renderMachines(s) {
         return `<span>${what} auf Port ${r.port}: <b>${r.alive ? peer : "Prozess beendet"}</b></span>`;
       }).join("");
       if (rpc) extra = `<div class="kv">${rpc}</div>`;
+      if (w.link) extra += `<div class="kv"><span>Verbindung: <b>${esc(w.link)}</b></span></div>`;
       if ((w.rpc || []).some((r) => !r.alive)) { dot = "bad"; stateText = "Fehler"; }
+      extra += w.switchable && w.ctl
+        ? `<div class="role-row"><span class="muted">Rolle: Worker</span><button class="btn quiet small" type="button" data-role-ctl="${esc(w.ctl)}" data-role="host">Zum Host machen</button></div>`
+        : `<div class="role-row muted">Rollenwechsel: einmal das neue Installationsskript auf diesem PC ausführen.</div>`;
     }
     const title = (w.stats && w.stats.host) || (w.label || w.host).split(" · ")[0];
     cards.push(machineCard(s, id, { title, role: `${w.phone ? "Handy" : "Worker"}, ${(w.endpoints || []).join(", ")}`, stats: w.stats, dot, stateText, rtt: w.rtt_ms }, extra));
@@ -588,7 +649,7 @@ function renderLan(s) {
     : d.compatible ? (d.kind === "worker" ? "frei, nicht im Plan" : "eigener Server") : "andere Version";
   $("lan").innerHTML = rows.map((d) => `<tr><td>${esc(d.name)}</td><td>${kind(d)}</td><td class="num">${esc(d.endpoint)}</td>
     <td class="num">${d.ram_mb ? gb(d.ram_mb) : "–"}${d.bw ? `, ${nf(d.bw, 0)} GB/s` : ""}</td>
-    <td>${status(d)}</td></tr>`).join("");
+    <td>${status(d)}${d.ctl && d.kind === "worker" && (d.type === "gpu" || d.type === "cpu") ? ` <button class="btn quiet small" type="button" data-role-ctl="${esc(d.ctl)}" data-role="host">Zum Host machen</button>` : ""}</td></tr>`).join("");
 }
 
 const ROLE_TEXT = { big: "groß", fast: "schnell", extra: "nur per Name" };
@@ -658,6 +719,9 @@ function renderHosts(s) {
       <div class="note">${esc(pr.name)}: ${gb(pr.done_mb)} von ${gb(pr.total_mb)}</div>` : "";
     const now = x.model ? `<div><b>${esc(x.model)}</b>${x.ctx ? `, Kontext ${x.ctx.toLocaleString("de-DE")}` : ""}${x.estimate_tps ? `, geschätzt ${nf(x.estimate_tps, 1)} Token/s` : ""}${x.busy ? `, ${x.busy} Anfrage(n) in Arbeit` : ""}</div>` : "";
     const role = e.role ?? a.role ?? "big";
+    const roleRow = x.switchable && !x.asleep
+      ? `<div class="role-row"><span class="muted">Rolle: Host</span><button class="btn quiet small" type="button" data-role-ctl="${esc(x.addr)}" data-role="worker">Zum Worker machen</button></div>`
+      : "";
     const sleepRow = x.asleep
       ? `<div class="kv"><span>${x.waking ? "Wird geweckt, lädt danach sein Modell …" : "Schläft. Eine Anfrage an sein Modell weckt ihn."}</span>${x.wakeable && !x.waking ? `<button class="btn quiet small" type="button" data-hwake>Aufwecken</button>` : ""}</div>`
       : `<div class="kv"><label class="inline">Schlafen nach <input name="sleep_min" class="mini" inputmode="numeric" value="${esc(String(e.sleep_min ?? x.sleep_min ?? 0))}"> Min. ohne Anfrage (0 = nie)</label>${x.can_sleep && x.state === "ready" ? `<button class="btn quiet small" type="button" data-hsleep>Jetzt schlafen</button>` : ""}</div>
@@ -666,7 +730,7 @@ function renderHosts(s) {
     return `<article class="host" data-id="${esc(x.id)}">
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${gpus ? " · " + gpus : ""}</div></div>
         <div class="pill"><span class="dot ${cls}"></span><span>${txt}</span></div></div>
-      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${sleepRow}
+      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${sleepRow}${roleRow}
       <form>
         <label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
@@ -764,7 +828,7 @@ function renderBench(s) {
 function render(s) {
   colors = { master: "var(--c0)" };
   (s.plan.machines || []).filter((m) => m.role === "worker").forEach((m, i) => { colors[m.id] = `var(--c${(i + 1) % 6})`; });
-  renderHeader(s); renderLive(s); renderRouter(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderRebalance(s); renderHosts(s); renderBench(s);
+  renderHeader(s); renderLive(s); renderRouter(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderRebalance(s); renderHosts(s); renderBench(s); renderModelSwitch(s);
 }
 
 /* ── Polling, login ──────────────────────────────────────────────────── */

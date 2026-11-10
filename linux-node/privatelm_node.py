@@ -1369,6 +1369,52 @@ def _finish_command(args, cmd: list[str], model: str, tps: float, info: Optional
     return ServerPlan(cmd, Path(model).stem, key, tps, info or {})
 
 
+MODEL_STATE = CONFIG_DIR / "model.json"
+
+
+def restore_model_choice(args) -> None:
+    """The model picked in the dashboard wins over the service's -m, as long
+    as -m is still what it was then (a changed -m is a new decision)."""
+    try:
+        d = json.loads(MODEL_STATE.read_text())
+    except (OSError, ValueError):
+        return
+    cli = str(Path(args.model).expanduser().resolve())
+    if d.get("cli") == cli and d.get("model") and Path(d["model"]).is_file() and d["model"] != cli:
+        log(f"Model chosen in the dashboard: {Path(d['model']).name} (the service's -m is {Path(cli).name})")
+        args.cli_model = cli
+        args.model = d["model"]
+
+
+def save_model_choice(args, path: str) -> None:
+    cli = getattr(args, "cli_model", None) or str(Path(args.model).expanduser().resolve())
+    args.cli_model = cli
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        MODEL_STATE.write_text(json.dumps({"cli": cli, "model": path}))
+    except OSError as e:
+        log(f"Could not save the model choice ({e})")
+
+
+def setup_draft(args) -> None:
+    """(Re)computes the draft model for args.model and its memory reserve."""
+    args.draft_opts, args.draft_info = [], {}
+    reserve = dict(getattr(args, "fast_reserve", None) or {})
+    if args.draft_model and args.draft_model.lower() not in ("off", "none", "no", "0"):
+        if args.mtp:
+            log("--mtp and --draft-model: the model's own MTP layers are used, no draft model")
+        else:
+            draft = find_draft(args, str(Path(args.model).expanduser().resolve()))
+            if draft:
+                opts, res, args.draft_info = plan_draft(args, draft, probe(bench=True))
+                args.draft_opts = opts
+                for k, v in res.items():
+                    reserve[k] = reserve.get(k, 0) + v
+                log(f"Draft model {args.draft_info['model']} ({args.draft_info['size_gb']} GB) on "
+                    f"{args.draft_info['device']}, up to {args.draft_max} tokens ahead")
+    args.reserve_mb = reserve
+
+
 def cmd_serve(args) -> None:
     has_fast = bool(args.fast_model or args.fast_url)
     public_host, public_port = args.host, args.port
@@ -1379,21 +1425,9 @@ def cmd_serve(args) -> None:
             fast_cmd, args.reserve_mb, fast_info = plan_fast(args, probe(bench=True))
         else:
             fast_info = {"model": args.fast_url, "device": "eigener Server", "ctx": args.fast_ctx}
-    args.draft_opts, args.draft_info = [], {}
-    if args.draft_model and args.draft_model.lower() not in ("off", "none", "no", "0"):
-        if args.mtp:
-            log("--mtp and --draft-model: the model's own MTP layers are used, no draft model")
-        else:
-            draft = find_draft(args, str(Path(args.model).expanduser().resolve()))
-            if draft:
-                opts, res, args.draft_info = plan_draft(args, draft, probe(bench=True))
-                args.draft_opts = opts
-                merged = dict(getattr(args, "reserve_mb", None) or {})
-                for k, v in res.items():
-                    merged[k] = merged.get(k, 0) + v
-                args.reserve_mb = merged
-                log(f"Draft model {args.draft_info['model']} ({args.draft_info['size_gb']} GB) on "
-                    f"{args.draft_info['device']}, up to {args.draft_max} tokens ahead")
+    restore_model_choice(args)
+    args.fast_reserve = dict(getattr(args, "reserve_mb", None) or {})
+    setup_draft(args)
     # The router takes the public port; the big model listens locally on +1
     # (the fast one on +2). The router is always there: hosts may join later.
     args.host, args.port = "127.0.0.1", public_port + 1
@@ -1427,6 +1461,11 @@ def cmd_serve(args) -> None:
     public_name = args.model_name
     router = Router(backends, args.fast_ctx, enabled, mode, public_name, sp.key)
     router.on_timings = sup.on_timings
+
+    def new_model(sp_new) -> None:
+        b = router.big
+        b.label = b.group = sp_new.name
+    sup.on_new_model = new_model
     if not router.start(public_host, public_port):
         sup.stop_server()
         die(f"Port {public_port} is busy.")
@@ -2073,6 +2112,8 @@ class Supervisor:
         self.exit_code = 0
         self.calib = Calibration()
         self.known = Known()
+        self.model_job: dict = {}
+        self.on_new_model = None  # callback(sp) after a model change
         self.last_calib_check = 0.0
         self.last_calib_save = 0.0
         # llama-server's own address (behind the router, if there is one)
@@ -2113,6 +2154,7 @@ class Supervisor:
     def info(self) -> dict:
         with self.lock:
             return {"enabled": self.enabled, "state": self.state, "reason": self.reason,
+                    "model_job": self.model_progress(),
                     "pending": self.pending, "now_requested": self.now_requested,
                     "events": list(self.events[-8:]), "ctx_auto": self.ctx_auto,
                     "gain_pct": round((REBALANCE_GAIN - 1) * 100)}
@@ -2206,6 +2248,81 @@ class Supervisor:
         else:
             self.event("Model doesn't fit with the workers left; waiting for workers",
                        "Modell passt mit den verbliebenen Workern nicht. Wartet auf Worker.")
+
+    # Switching the model ---------------------------------------------------------
+
+    def model_api(self, body: dict) -> dict:
+        import threading
+
+        spec = str(body.get("model") or "").strip()
+        if not spec:
+            return {"error": "model missing"}
+        with self.lock:
+            if self.model_job and self.model_job.get("state") in ("resolving", "downloading", "loading"):
+                return {"error": "a model change is already running"}
+            self.model_job = {"state": "resolving", "model": spec, "t": int(time.time())}
+        threading.Thread(target=self._switch_model, args=(spec,), daemon=True).start()
+        return self.info()
+
+    def _local_model(self, spec: str) -> Optional[Path]:
+        p = Path(spec).expanduser()
+        if p.is_file():
+            return p.resolve()
+        want = spec.lower().removesuffix(".gguf")
+        dirs = [CONFIG_DIR / "models"]
+        cands = [c for d in dirs if d.is_dir() for c in d.glob("*.gguf")] + [Path(m["path"]) for m in local_models()]
+        return next((c.resolve() for c in cands if c.stem.lower().split("-00001-of-")[0] == want), None)
+
+    def _switch_model(self, spec: str) -> None:
+        a = self.args
+        try:
+            path = self._local_model(spec)
+            if path is None:
+                dest = Path("/srv/models") if os.access("/srv/models", os.W_OK) else CONFIG_DIR / "models"
+
+                def resolved(info: dict) -> None:
+                    with self.lock:
+                        self.model_job.update(state="downloading", files=info["files"], dir=info["dir"],
+                                              size_mb=info["size_mb"], name=info["name"])
+
+                path = fetch_model(spec, dest, quiet=True, on_resolved=resolved)
+            path = Path(path).resolve()
+            with self.lock:
+                self.model_job.update(state="loading", path=str(path))
+            self.event(f"Switching the model to {path.name}", f"Wechsle das Modell: {path.name}")
+            save_model_choice(a, str(path))
+            a.model = str(path)
+            if a.mtp and not gguf_info(str(path), CTX_STEPS[-1]).n_nextn:
+                log("The new model has no MTP layers: MTP off")
+                a.mtp = 0
+            setup_draft(a)
+            self.replan(f"Loading {path.name}", f"Lade {path.name}.")
+            with self.lock:
+                ok = self.state == "running"
+                self.model_job.update(state="done" if ok else "error",
+                                      error="" if ok else (self.reason or "doesn't fit"))
+            if ok and self.on_new_model:
+                self.on_new_model(self.sp)
+        except (ModelError, PlanTooBig) as e:
+            with self.lock:
+                self.model_job.update(state="error", error=str(e))
+        except Exception as e:  # noqa: BLE001 - report it in the dashboard
+            with self.lock:
+                self.model_job.update(state="error", error=f"{type(e).__name__}: {e}")
+
+    def model_progress(self) -> Optional[dict]:
+        j = self.model_job
+        if not j:
+            return None
+        out = {k: v for k, v in j.items() if k not in ("files",)}
+        if j.get("state") == "downloading" and j.get("files"):
+            done = 0
+            for f in j["files"]:
+                dest = Path(j["dir"]) / Path(f["file"]).name
+                part = dest.with_suffix(dest.suffix + ".part")
+                done += dest.stat().st_size if dest.exists() else part.stat().st_size if part.exists() else 0
+            out["done_mb"] = done // 2**20
+        return out
 
     # Measurements --------------------------------------------------------------
 
@@ -2674,15 +2791,20 @@ def _json_handler(get_routes: dict, post_routes: Optional[dict] = None, key: str
 def start_worker_status(args, rpc_info: list[dict], procs: list[subprocess.Popen],
                         devices: list[Device]) -> None:
     stats = SystemStats(devices)
+    key = read_cluster_key(getattr(args, "key", None), getattr(args, "key_file", None))
 
     def status() -> dict:
         rpc = []
         for info, p in zip(rpc_info, procs):
             rpc.append(dict(info, alive=p.poll() is None, peers=tcp_peers(info["port"])))
         return {"role": "worker", "host": socket.gethostname(), "version": RPC_VERSION,
-                "rpc": rpc, "stats": stats.sample(), "address": NET_STATE["address"], "link": NET_STATE["link"]}
+                "rpc": rpc, "stats": stats.sample(), "address": NET_STATE["address"], "link": NET_STATE["link"],
+                "switchable": bool(key) and can_switch_role()}
 
-    if _start_http(args.host, args.status_port, _json_handler({"/status": status})):
+    # Status stays open (no secrets in it); switching the role needs the cluster key.
+    post = {"/role": lambda body: request_role(str(body.get("role") or ""))} if key else {}
+    if _start_http(args.host, args.status_port, _json_handler({"/status": status}, post, key=key,
+                                                               public=("/status",))):
         log(f"Status for the master's dashboard on port {args.status_port}")
 
 
@@ -2766,7 +2888,8 @@ class Dashboard:
         try:
             with urllib.request.urlopen(f"http://{w['host']}:{w['status_port']}/status", timeout=1.5) as r:
                 data = json.loads(r.read())
-            return {"online": True, "rtt_ms": round((time.perf_counter() - t0) * 1000, 1), **data}
+            return {"online": True, "rtt_ms": round((time.perf_counter() - t0) * 1000, 1), **data,
+                    "ctl": f"{w['host']}:{w['status_port']}"}
         except (OSError, ValueError):
             rpc_ok = any(reachable(ep, 1.0) for ep in w["endpoints"])
             return {"online": rpc_ok, "status_missing": rpc_ok, "rtt_ms": None}
@@ -2834,7 +2957,8 @@ class Dashboard:
             return
         lan = [{"kind": p.kind, "name": p.txt.get("model") or p.name, "endpoint": p.endpoint,
                 "ram_mb": p.ram_mb, "bw": p.bandwidth, "type": p.txt.get("kind", "phone" if p.kind == "worker" else ""),
-                "in_use": p.endpoint in used, "compatible": p.txt.get("v", RPC_VERSION) == RPC_VERSION}
+                "in_use": p.endpoint in used, "compatible": p.txt.get("v", RPC_VERSION) == RPC_VERSION,
+                "ctl": f"{p.host}:{p.txt['stat']}" if p.txt.get("stat") else ""}
                for p in peers if not self._is_me(p) and p.kind != "host"]  # hosts have their own panel
         seen_ips = {p.host for p in peers}
         used_ips = {ep.rsplit(":", 1)[0] for ep in used}
@@ -2903,7 +3027,7 @@ class Dashboard:
                     "plan": self.sp.info, "master": {**self.state, "uptime_s": int(time.time() - self.started),
                                                       "host": socket.gethostname()},
                     "workers": self.workers, "lan": self.lan, "history": self.history,
-                    "bench": self.bench}
+                    "bench": self.bench, "models": self.models_list()}
 
     def run_bench(self) -> dict:
         import threading
@@ -2934,6 +3058,51 @@ class Dashboard:
         threading.Thread(target=go, daemon=True).start()
         return self.bench
 
+    def switch_role(self, body: dict) -> dict:
+        """Asks a worker or host PC to change its role (it needs the
+        installer's switch; the request carries the cluster key)."""
+        import urllib.error
+        import urllib.request
+
+        ctl, role = str(body.get("ctl") or ""), str(body.get("role") or "")
+        allowed = {w.get("ctl") for w in self.workers.values() if w.get("ctl")}
+        allowed |= {d.get("ctl") for d in self.lan if d.get("ctl")}
+        if self.hosts:
+            allowed |= {h["addr"] for h in self.hosts.info()["hosts"]}
+        if ctl not in allowed:
+            return {"ok": False, "error": "unknown machine"}
+        try:
+            req = urllib.request.Request(f"http://{ctl}/role", data=json.dumps({"role": role}).encode(),
+                                         headers={"Authorization": f"Bearer {self.sp.key}",
+                                                  "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                res = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            res = {"ok": False, "error": "the machine has another key (or none): run the install script on it "
+                                         "with this master's key" if e.code in (401, 404) else f"HTTP {e.code}"}
+        except (OSError, ValueError) as e:
+            res = {"ok": False, "error": f"not reachable: {e}"}
+        if res.get("ok"):
+            self.sup.event(f"{ctl} switches to {role}", f"{ctl} wird {'Host' if role == 'host' else 'Worker'}.")
+        return res
+
+    def models_list(self) -> dict:
+        """Models to offer in the dashboard: on this PC and from the catalog (cached for a minute)."""
+        now = time.time()
+        if now - getattr(self, "_models_at", 0) > 60:
+            self._models_at = now
+            try:
+                local = [{"name": Path(m["path"]).stem, "path": m["path"], "size_gb": round(m["size_mb"] / 1024, 1)}
+                         for m in local_models()]
+                extra = CONFIG_DIR / "models"
+                if extra.is_dir():
+                    local += [{"name": p.stem, "path": str(p), "size_gb": round(p.stat().st_size / 2**30, 1)}
+                              for p in extra.glob("*.gguf") if not any(m["path"] == str(p) for m in local)]
+            except Exception:  # noqa: BLE001
+                local = []
+            self._models = {"local": local, "catalog": [{"key": k, "desc": d} for k, _r, _q, d in CATALOG]}
+        return self._models
+
     def _bench_watchdog(self) -> None:
         """A test that hangs (server stuck) frees the button after a while."""
         b = self.bench
@@ -2951,6 +3120,8 @@ class Dashboard:
                                 {"/api/bench": lambda body: self.run_bench(),
                                  "/api/router": self.set_router,
                                  "/api/rebalance": self.sup.api,
+                                 "/api/role": self.switch_role,
+                                 "/api/model": self.sup.model_api,
                                  "/api/wake": lambda b: {"ok": self.sup.known.wake(str(b.get("id") or ""), force=True)},
                                  "/api/hosts": self.hosts.api if self.hosts else (lambda b: {"error": "no hosts"})},
                                 key=self.sp.key, public=("/",))
@@ -3092,6 +3263,33 @@ def request_suspend() -> tuple[bool, str]:
     return False, (r.stderr.strip() or "systemctl suspend failed")[:200]
 
 
+# ── Switching a PC between worker and host ─────────────────────────────────
+#
+# Both services are installed on a node PC; one runs. The master asks the
+# running one (authenticated with the cluster key) to switch; the service has
+# no root rights, so it leaves the wanted role in a file that a small root
+# unit watches (privatelm-role.path): it stops one service and starts the other.
+
+ROLE_FILE = "/run/privatelm-node/role"
+ROLE_HELPER = Path("/etc/systemd/system/privatelm-role.path")
+
+
+def can_switch_role() -> bool:
+    d = Path(ROLE_FILE).parent
+    return ROLE_HELPER.exists() and d.is_dir() and os.access(d, os.W_OK)
+
+
+def request_role(role: str) -> dict:
+    if role not in ("worker", "host"):
+        return {"ok": False, "error": "role must be worker or host"}
+    if not can_switch_role():
+        return {"ok": False, "error": "this PC can't switch roles yet: run the install script on it once "
+                                      "(it sets up both services and the switch)"}
+    Path(ROLE_FILE).write_text(role)
+    log(f"Switching this PC to {role} (the other service starts in a moment)")
+    return {"ok": True, "role": role}
+
+
 # ── Hosts ────────────────────────────────────────────────────────────────────
 #
 # A host is a PC that loads a whole model on its own devices and answers for
@@ -3216,7 +3414,8 @@ class HostAgent:
                   "ctx": self.ctx, "estimate_tps": self.estimate_tps, "api_port": self.args.api_port,
                   "progress": self._progress() if self.state == "downloading" else None,
                   "mac": self.mac, "bcast": self.bcast,
-                  "can_sleep": os.geteuid() == 0 or Path("/etc/systemd/system/privatelm-suspend.path").exists()}
+                  "can_sleep": os.geteuid() == 0 or Path("/etc/systemd/system/privatelm-suspend.path").exists(),
+                  "switchable": can_switch_role()}
         st["metrics"] = self._metrics()
         st["stats"] = self.stats.sample()
         st["models"] = sorted({p.stem.split("-00001-of-")[0] for p in self.models_dir.glob("*.gguf")}) \
@@ -3396,7 +3595,8 @@ def cmd_host(args) -> None:
             "credential cluster_key. On the master: privatelm-node key")
     agent = HostAgent(args, key)
     handler = _json_handler({"/status": agent.status},
-                            {"/assign": agent.assign, "/unload": agent.unload, "/sleep": agent.sleep}, key=key)
+                            {"/assign": agent.assign, "/unload": agent.unload, "/sleep": agent.sleep,
+                             "/role": lambda body: request_role(str(body.get("role") or ""))}, key=key)
     if not _start_http(args.host, args.port, handler):
         die(f"Port {args.port} is busy.")
     devices = probe(bench=True)
@@ -4171,6 +4371,7 @@ class HostManager:
                               "waking": self.known.recently_woken(hid),
                               "sleep_min": int(self.sleep_min.get(hid, self.args.host_sleep or 0) or 0),
                               "can_sleep": bool((h.get("status") or {}).get("can_sleep")),
+                              "switchable": bool((h.get("status") or {}).get("switchable")),
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
@@ -4710,6 +4911,8 @@ def main() -> None:
     w.add_argument("--status-port", type=int, default=STATUS_PORT,
                    help=f"read-only status for the master's dashboard (default {STATUS_PORT})")
     w.add_argument("--no-status", action="store_true")
+    w.add_argument("--key", help="cluster key (the master's API key): lets the master switch this PC to host")
+    w.add_argument("--key-file", help="file with the cluster key")
     w.set_defaults(fn=cmd_worker)
 
     h = sub.add_parser("host", help="load whole models for a master's router (the master picks the model)")
