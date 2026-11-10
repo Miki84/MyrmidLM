@@ -1608,7 +1608,7 @@ def _net_bytes(ifaces: Optional[list[str]]) -> tuple[int, int]:
     return rx, tx
 
 
-def _http(base: str, key: str, route: str = "auto"):
+def _http(base: str, key: str, route: str = "auto", timeout: float = 900):
     import urllib.request
 
     headers = {"Content-Type": "application/json"}
@@ -1623,7 +1623,7 @@ def _http(base: str, key: str, route: str = "auto"):
         req = urllib.request.Request(base + path, headers=headers,
                                      data=json.dumps(body).encode() if body is not None else None)
         try:
-            with urllib.request.urlopen(req, timeout=900) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
@@ -1639,12 +1639,12 @@ FILLER = ("The lighthouse keeper wrote in his log every evening, noting the weat
 
 
 def measure(base: str, key: str, ifaces: Optional[list[str]], temp: float, tokens: int,
-            context: int, runs: int = 1, route: str = "big") -> dict:
+            context: int, runs: int = 1, route: str = "big", timeout: float = 900) -> dict:
     """Generation speed and network traffic per token (both directions:
     the difference between a 1-token and an N-token run, so the prompt's
     traffic drops out). context = rough prompt length in tokens: a full
     context is slower, and that's where workers' extra memory pays off."""
-    call = _http(base, key, route)
+    call = _http(base, key, route, timeout)
     try:
         meta = (call("/v1/models").get("data") or [{}])[0].get("meta") or {}
     except OSError as e:
@@ -2686,6 +2686,9 @@ def start_worker_status(args, rpc_info: list[dict], procs: list[subprocess.Popen
         log(f"Status for the master's dashboard on port {args.status_port}")
 
 
+BENCH_TIMEOUT_S = 120  # the dashboard's test, per request
+
+
 class Dashboard:
     """Collects the cluster's state every 2 s for the master's dashboard."""
 
@@ -2893,6 +2896,7 @@ class Dashboard:
         if self.router:
             router = {**self.router.info(), **{"fast_live": self.fast_state}}
         with self.lock:
+            self._bench_watchdog()
             return {"router": router or {"available": False}, "rebalance": self.sup.info(),
                     "calibration": self.sup.calib_info(),
                     "hosts": self.hosts.info() if self.hosts else {"hosts": [], "catalog": [], "off": True},
@@ -2905,24 +2909,36 @@ class Dashboard:
         import threading
 
         with self.lock:
+            self._bench_watchdog()
             if self.bench.get("running"):
+                return self.bench
+            if self.sup.state != "running" or (self.state.get("llama") or {}).get("status") != "ready":
+                self.bench = {"running": False, "error": "Der Server ist gerade nicht bereit (lädt oder verteilt neu)."}
                 return self.bench
             self.bench = {"running": True, "started": int(time.time())}
 
         def go():
             try:
-                r = measure(self.base, self.sp.key, None, 0.7, 64, 0, 1)
+                r = measure(self.base, self.sp.key, None, 0.7, 64, 0, 1, timeout=BENCH_TIMEOUT_S)
                 self.sup.on_timings(r.get("timings") or {})  # the test goes past the router: learn from it here
                 res = {"running": False, "finished": int(time.time()), "tps": round(r["tps"], 1),
                        "kb_per_token": round((r["per_rx"] + r["per_tx"]) / 1024, 1),
                        "acceptance": r["acceptance"]}
-            except SystemExit:
-                res = {"running": False, "error": "Messung fehlgeschlagen (Server bereit?)"}
+            except BaseException as e:  # noqa: BLE001 - any failure must end "running", or the button stays grey
+                why = "Server antwortet nicht" if isinstance(e, OSError) else "Messung fehlgeschlagen"
+                res = {"running": False, "finished": int(time.time()), "error": f"{why} ({type(e).__name__})."}
+                log(f"Dashboard test: {type(e).__name__}: {e}")
             with self.lock:
                 self.bench = res
 
         threading.Thread(target=go, daemon=True).start()
         return self.bench
+
+    def _bench_watchdog(self) -> None:
+        """A test that hangs (server stuck) frees the button after a while."""
+        b = self.bench
+        if b.get("running") and time.time() - b.get("started", 0) > 3 * BENCH_TIMEOUT_S:
+            self.bench = {"running": False, "finished": int(time.time()), "error": "Test abgebrochen: keine Antwort."}
 
     def start(self) -> Optional[str]:
         import threading
