@@ -1,0 +1,10 @@
+[Unit]
+Description=MyrmidLM: update requests from the services (master dashboard)
+# The services run without root; they ask by creating this file, and
+# myrmid-update-request.service (root) checks, builds or switches.
+
+[Path]
+PathExists=/run/myrmid/update
+
+[Install]
+WantedBy=multi-user.target

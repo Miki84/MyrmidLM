@@ -1,0 +1,14 @@
+[Unit]
+Description=MyrmidLM: check for a new release and build it next to the running one
+# The master's server switches the whole cluster once every PC has it built
+# (dashboard: Version). Log: journalctl -u myrmid-update, build log in
+# /var/lib/myrmid-update/build.log.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/myrmid/current/bin/myrmid update auto
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=3h

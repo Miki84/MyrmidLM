@@ -150,7 +150,7 @@ class UpdateService extends GetxService with WidgetsBindingObserver {
       state.value = UpdateState.idle;
       if (manual && !newer) {
         showToast('You\'re up to date',
-            'PrivateLM ${currentVersion.value} is the latest version.',
+            'MyrmidLM ${currentVersion.value} is the latest version.',
             tone: ToastTone.success);
       }
       return availableUpdate.value;
@@ -179,7 +179,7 @@ class UpdateService extends GetxService with WidgetsBindingObserver {
       version: _normalize(tag),
       name: (json['name'] as String?)?.trim().isNotEmpty == true
           ? json['name'] as String
-          : 'PrivateLM $tag',
+          : 'MyrmidLM $tag',
       notes: json['body'] as String? ?? '',
       pageUrl: json['html_url'] as String? ?? '',
       publishedAt: DateTime.tryParse(json['published_at'] as String? ?? ''),
@@ -336,7 +336,7 @@ class UpdateService extends GetxService with WidgetsBindingObserver {
   // ── Files ─────────────────────────────────────────────────────────────
 
   static String _fileName(String apkName, String version) =>
-      'PrivateLM-$version-$apkName';
+      'MyrmidLM-$version-$apkName';
 
   Future<Directory?> _updatesDir() async {
     final base = await getExternalStorageDirectory();
@@ -359,7 +359,7 @@ class UpdateService extends GetxService with WidgetsBindingObserver {
       await for (final f in dir.list()) {
         if (f is! File) continue;
         final m =
-            RegExp(r'PrivateLM-([\d.]+)-').firstMatch(f.uri.pathSegments.last);
+            RegExp(r'MyrmidLM-([\d.]+)-').firstMatch(f.uri.pathSegments.last);
         if (m == null ||
             compareVersions(m.group(1)!, currentVersion.value) <= 0) {
           await f.delete();

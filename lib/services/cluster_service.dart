@@ -79,7 +79,7 @@ class ClusterService extends GetxService {
   final found = <ClusterWorker>[].obs;
   final isScanning = false.obs;
 
-  /// PCs serving a model over the network (`privatelm-node serve`).
+  /// PCs serving a model over the network (`myrmid serve`).
   final servers = <ClusterServer>[].obs;
   final isScanningServers = false.obs;
 
@@ -128,7 +128,7 @@ class ClusterService extends GetxService {
       refreshWorkerStatus().then((_) {
         if (worker.value.running) _watchWorker();
       });
-      // A worker runs at full speed only while PrivateLM is on screen (it
+      // A worker runs at full speed only while MyrmidLM is on screen (it
       // borrows the app's priority), so keep the screen on while sharing.
       ever<ClusterWorkerStatus>(worker, (_) => _updateKeepScreenOn());
       ever<bool>(serving, (_) => _updateKeepScreenOn());
@@ -158,7 +158,7 @@ class ClusterService extends GetxService {
     if (next == role) return;
     if (next != ClusterRole.worker && role == ClusterRole.worker) {
       if (workerStopsWithApp) {
-        showToast('Still sharing', 'Close PrivateLM to stop sharing this device.');
+        showToast('Still sharing', 'Close MyrmidLM to stop sharing this device.');
         return;
       }
       await stopWorker();
@@ -257,7 +257,7 @@ class ClusterService extends GetxService {
       return connectServerFromQr(uri);
     }
     if (uri == null || uri.scheme != _qrScheme || host == null || port == null) {
-      return 'That isn\'t a PrivateLM worker code';
+      return 'That isn\'t a MyrmidLM worker code';
     }
     return _add(ClusterWorker(
       name: params['name'] ?? host,
@@ -318,8 +318,8 @@ class ClusterService extends GetxService {
   Future<String?> _add(ClusterWorker worker) async {
     if (!worker.isCompatible) {
       return '${worker.model ?? worker.name} speaks ${worker.version}, this app '
-          '${LlamaCluster.rpcVersion}. Update PrivateLM on it, or rebuild the PC '
-          'node with linux-node/build.sh.';
+          '${LlamaCluster.rpcVersion}. Update MyrmidLM on it, or rebuild the PC '
+          'node with node/build.sh.';
     }
     if (!await LlamaCluster.probe(worker.endpoint)) {
       return 'Can\'t reach ${worker.endpoint}. Check that the phone is a worker '
@@ -609,7 +609,7 @@ class ClusterService extends GetxService {
     if (uri == null || uri.host.isEmpty) return 'Invalid server address';
     final port = uri.hasPort ? uri.port : (uri.scheme == 'https' ? 443 : 80);
     if (!await LlamaCluster.probe('${uri.host}:$port')) {
-      return 'Can\'t reach $url. Check that privatelm-node serve is running '
+      return 'Can\'t reach $url. Check that myrmid serve is running '
           'and the PC is on the same network.';
     }
     final settings = Get.find<SettingsController>();

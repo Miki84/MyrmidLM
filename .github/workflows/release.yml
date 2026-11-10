@@ -1,0 +1,96 @@
+# A tag vX.Y.Z (scripts/release.sh) becomes a GitHub release: the node is
+# built once as a check, the Android app is built and attached (the app
+# updates itself from these APKs). PCs update from the tag itself.
+#
+# For the APKs, set these repository secrets (Settings > Secrets > Actions):
+#   ANDROID_KEYSTORE_BASE64  base64 of the release keystore (.jks)
+#   ANDROID_STORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+# Without them the release has no APK (phones keep their app).
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  node-cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches VERSION
+        run: test "v$(cat VERSION)" = "$GITHUB_REF_NAME"
+      - name: Packages
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake git python3-zeroconf
+      - name: Build (CPU)
+        run: bash node/build.sh --backends cpu --install "$RUNNER_TEMP/myrmid"
+      - name: Smoke test
+        run: |
+          "$RUNNER_TEMP/myrmid/bin/myrmid" --version
+          "$RUNNER_TEMP/myrmid/bin/myrmid" detect
+
+  apk:
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: No signing key
+        if: env.KEYSTORE == ''
+        run: echo "::notice::No ANDROID_KEYSTORE_BASE64 secret, so no APK in this release."
+      - uses: actions/setup-java@v4
+        if: env.KEYSTORE != ''
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        if: env.KEYSTORE != ''
+        with:
+          channel: stable
+          cache: true
+      - name: Signing
+        if: env.KEYSTORE != ''
+        run: |
+          echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/release.jks"
+          printf '%s\n' "storeFile=$RUNNER_TEMP/release.jks" \
+            "storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}" \
+            "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" \
+            "keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}" > android/key.properties
+      - name: Build APKs
+        if: env.KEYSTORE != ''
+        run: |
+          flutter pub get
+          flutter build apk --release --split-per-abi
+          mkdir -p out
+          for f in build/app/outputs/flutter-apk/app-*-release.apk; do
+            abi="$(basename "$f" | sed 's/^app-//; s/-release.apk$//')"
+            cp "$f" "out/MyrmidLM-$(cat VERSION)-$abi.apk"
+          done
+      - uses: actions/upload-artifact@v4
+        if: env.KEYSTORE != ''
+        with:
+          name: apk
+          path: out/*.apk
+
+  release:
+    needs: [node-cpu, apk]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        continue-on-error: true  # no APKs without a signing key
+        with:
+          name: apk
+          path: out
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rpc="$(sed -n 's/^RPC_VERSION = "\(.*\)"/\1/p' node/myrmid.py)"
+          printf '%s\n' "MyrmidLM $(cat VERSION), RPC-Protokoll $rpc." "" \
+            "PCs aktualisieren sich selbst (Dashboard, Bereich Version). Neue Installation:" \
+            '`curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash`' > notes.md
+          shopt -s nullglob
+          gh release create "$GITHUB_REF_NAME" --title "MyrmidLM $(cat VERSION)" --notes-file notes.md out/*.apk

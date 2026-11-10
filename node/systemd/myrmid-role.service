@@ -1,0 +1,6 @@
+[Unit]
+Description=MyrmidLM: switch between worker and host
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/myrmid-role

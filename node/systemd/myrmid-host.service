@@ -1,0 +1,26 @@
+[Unit]
+Description=MyrmidLM host (loads a whole model for the master's router)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+# The cluster key is the master's API key (on the master: myrmid key).
+# Put it in /etc/myrmid/cluster_key (root only, chmod 600).
+LoadCredential=cluster_key:/etc/myrmid/cluster_key
+ExecStart=/opt/myrmid/current/bin/myrmid host --models-dir /var/lib/myrmid/models
+DynamicUser=yes
+# Requests to the root helpers (sleep, role switch, update): /run/myrmid
+RuntimeDirectory=myrmid
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+CacheDirectory=myrmid
+Environment=XDG_CACHE_HOME=/var/cache/myrmid
+StateDirectory=myrmid
+Environment=XDG_CONFIG_HOME=/var/lib/myrmid
+# GPU access (NVIDIA /dev/nvidia*, AMD/Intel /dev/dri, /dev/kfd).
+SupplementaryGroups=video render
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

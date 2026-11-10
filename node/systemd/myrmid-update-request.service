@@ -1,0 +1,8 @@
+[Unit]
+Description=MyrmidLM: run an update request (check, build, switch, roll back)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/myrmid/current/bin/myrmid update apply-request
+TimeoutStartSec=3h

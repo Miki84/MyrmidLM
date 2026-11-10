@@ -1,6 +1,6 @@
 import 'package:flutter/services.dart';
 
-/// A cluster worker: a phone, or a PC running `privatelm-node worker` that
+/// A cluster worker: a phone, or a PC running `myrmid worker` that
 /// lends its GPU(s). Found on the local network, scanned from its QR code, or
 /// added by hand.
 class ClusterWorker {
@@ -94,7 +94,7 @@ class ClusterWorker {
 }
 
 /// A PC serving a model over an OpenAI-compatible API
-/// (`privatelm-node serve`), found on the local network.
+/// (`myrmid serve`), found on the local network.
 class ClusterServer {
   final String name;
   final String host;
@@ -179,7 +179,7 @@ class LlamaCluster {
   static const _channel = MethodChannel('llama_flutter_android/cluster');
   static const defaultPort = 50052;
 
-  /// The llama.cpp RPC protocol this build speaks. PC nodes (linux-node/)
+  /// The llama.cpp RPC protocol this build speaks. PC nodes (node/)
   /// must be built from the same llama.cpp commit.
   static const rpcVersion = 'rpc9';
 
@@ -211,7 +211,7 @@ class LlamaCluster {
       _channel.invokeMethod('requestBatteryUnrestricted');
 
   /// Keeps this device's screen on (a worker runs at full speed only while
-  /// PrivateLM is on screen).
+  /// MyrmidLM is on screen).
   static Future<void> setKeepScreenOn(bool on) =>
       _channel.invokeMethod('setKeepScreenOn', {'on': on});
 

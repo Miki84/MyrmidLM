@@ -125,7 +125,7 @@ class ChatView extends GetView<ChatController> {
         if (controller.messages.isEmpty) {
           return Padding(
             padding: const EdgeInsets.only(right: 16),
-            child: Text('PrivateLM',
+            child: Text('MyrmidLM',
                 style: GoogleFonts.inter(
                     fontWeight: FontWeight.w700,
                     fontSize: 18,

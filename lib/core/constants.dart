@@ -60,7 +60,7 @@ class AppConstants {
   static const String keySkippedUpdateVersion = 'skipped_update_version';
 
   /// GitHub repository whose releases ship the Android APKs.
-  static const String githubRepo = 'orailnoor/cross-platform-llm-client';
+  static const String githubRepo = 'Miki84/MyrmidLM';
   static const String keyServerApiKey = 'server_api_key';
   static const String keyServerUseApiKey = 'server_use_api_key';
   static const String keyServerAllowNetwork = 'server_allow_network';

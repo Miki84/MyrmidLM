@@ -1,7 +1,0 @@
-[Unit]
-Description=PrivateLM: suspend this PC
-
-[Service]
-Type=oneshot
-ExecStart=/bin/rm -f /run/privatelm-node/suspend
-ExecStart=/bin/systemctl suspend

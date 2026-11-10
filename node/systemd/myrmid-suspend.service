@@ -1,0 +1,7 @@
+[Unit]
+Description=MyrmidLM: suspend this PC
+
+[Service]
+Type=oneshot
+ExecStart=/bin/rm -f /run/myrmid/suspend
+ExecStart=/bin/systemctl suspend

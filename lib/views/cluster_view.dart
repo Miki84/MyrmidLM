@@ -87,7 +87,7 @@ class _ClusterViewState extends State<ClusterView> {
                   'phones on the same Wi-Fi.\n\n'
                   'Master: the phone you chat on. It runs the model.\n'
                   'Worker: a phone that lends its memory to the master.'
-              : 'Help an Android phone running PrivateLM run models too big for '
+              : 'Help an Android phone running MyrmidLM run models too big for '
                   'it alone: choose Worker, then scan this device\'s QR code '
                   'from that phone.',
           icon: Icons.hub_outlined,
@@ -163,7 +163,7 @@ class _ClusterViewState extends State<ClusterView> {
       if (s.throttled) ...[
         AppNotice(
           'Android is slowing this worker down (slow cores only), which slows '
-          'the whole cluster. Set PrivateLM\'s battery use to Unrestricted, '
+          'the whole cluster. Set MyrmidLM\'s battery use to Unrestricted, '
           'then turn Worker off and on.',
           icon: Icons.speed_rounded,
           color: t.orange,
@@ -181,9 +181,9 @@ class _ClusterViewState extends State<ClusterView> {
       ],
       AppCard(padding: const EdgeInsets.fromLTRB(16, 24, 16, 20), child: body),
       SectionFootnote(ClusterService.workerStopsWithApp
-          ? 'Keep this device plugged in, on the same Wi-Fi, with PrivateLM open: '
-              'iOS pauses apps in the background. Close PrivateLM to stop sharing.'
-          : 'Keep this phone plugged in and on the same Wi-Fi, with PrivateLM '
+          ? 'Keep this device plugged in, on the same Wi-Fi, with MyrmidLM open: '
+              'iOS pauses apps in the background. Close MyrmidLM to stop sharing.'
+          : 'Keep this phone plugged in and on the same Wi-Fi, with MyrmidLM '
               'open: the screen stays on while sharing, because Android slows '
               'background work. Set Phone cluster to Off to stop.'),
     ];
@@ -276,8 +276,8 @@ class _ClusterViewState extends State<ClusterView> {
         ]),
       ],
       const SectionFootnote(
-        'A Linux PC can be a worker too: run privatelm-node worker on it '
-        '(see linux-node/ in the source). Its GPU (NVIDIA, AMD or Intel) then '
+        'A Linux PC can be a worker too: run myrmid worker on it '
+        '(see node/ in the source). Its GPU (NVIDIA, AMD or Intel) then '
         'takes the biggest share, since its memory is many times faster. With '
         '--ram it also lends its RAM, listed as a second worker.',
       ),
@@ -296,14 +296,14 @@ class _ClusterViewState extends State<ClusterView> {
 
   // ── PC servers ─────────────────────────────────────────────────────────
 
-  /// Chat with a model running on a PC (privatelm-node serve), which may
+  /// Chat with a model running on a PC (myrmid serve), which may
   /// itself use phones as workers.
   List<Widget> _pcServerSection() {
     final t = AppTokens.of(context);
     return [
       const SectionHeader('Use a PC\'s model'),
       Text(
-        'Run privatelm-node serve on a Linux PC with a GPU, then scan the QR '
+        'Run myrmid serve on a Linux PC with a GPU, then scan the QR '
         'code it prints. Chat then uses the model on the PC.',
         style: t.caption,
       ),
@@ -349,8 +349,8 @@ class _ClusterViewState extends State<ClusterView> {
       final input = await showAppSheet<String>(
         context,
         title: 'API key for ${srv.name}',
-        subtitle: 'privatelm-node prints it when it starts '
-            '(~/.config/privatelm-node/api_key). The QR code includes it.',
+        subtitle: 'myrmid prints it when it starts '
+            '(/var/lib/myrmid/myrmid/api_key). The QR code includes it.',
         builder: (ctx) => Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -371,7 +371,7 @@ class _ClusterViewState extends State<ClusterView> {
       key = input.trim();
     }
     await _reportServer(cluster.connectServer(
-      name: srv.name.replaceFirst('PrivateLM ', ''),
+      name: srv.name.replaceFirst('MyrmidLM ', ''),
       baseUrl: srv.baseUrl,
       apiKey: key,
       model: srv.model ?? 'default',
@@ -596,7 +596,7 @@ class _QrScanPageState extends State<_QrScanPage> {
       appBar: AppBar(
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
-        title: const Text('Scan PrivateLM QR code'),
+        title: const Text('Scan MyrmidLM QR code'),
       ),
       body: Stack(children: [
         MobileScanner(controller: _controller, onDetect: _onDetect),

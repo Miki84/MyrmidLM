@@ -173,7 +173,7 @@ class ClusterWorkerService : Service() {
     /** Advertises this worker over NSD (mDNS) with what a master needs to plan. */
     private fun advertise(port: Int) {
         val info = NsdServiceInfo().apply {
-            serviceName = "PrivateLM ${Build.MODEL}"
+            serviceName = "MyrmidLM ${Build.MODEL}"
             serviceType = SERVICE_TYPE
             setPort(port)
             setAttribute("ram", ramMb.toString())
@@ -199,7 +199,7 @@ class ClusterWorkerService : Service() {
 
     private fun acquireLocks() {
         val power = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PrivateLM:ClusterWorker")
+        wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MyrmidLM:ClusterWorker")
             .apply { acquire() }
         // Keep Wi-Fi out of power save: a sleeping radio adds latency to every token.
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -209,7 +209,7 @@ class ClusterWorkerService : Service() {
         } else {
             WifiManager.WIFI_MODE_FULL_HIGH_PERF
         }
-        wifiLock = wifi.createWifiLock(mode, "PrivateLM:ClusterWorker").apply { acquire() }
+        wifiLock = wifi.createWifiLock(mode, "MyrmidLM:ClusterWorker").apply { acquire() }
     }
 
     private fun shutdown() {

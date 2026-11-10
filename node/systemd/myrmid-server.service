@@ -1,0 +1,28 @@
+[Unit]
+Description=MyrmidLM model server (OpenAI-compatible API, optional phone workers)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+# Set the model path. --workers auto uses workers where they make it faster or
+# are needed for memory; "all" every worker with room; "off" none.
+ExecStart=/opt/myrmid/current/bin/myrmid serve -m /srv/models/model.gguf --workers auto
+# With a router (small model for simple requests, switchable in the dashboard):
+#ExecStart=/opt/myrmid/current/bin/myrmid serve -m /srv/models/model.gguf --fast-model /srv/models/small.gguf
+DynamicUser=yes
+# Requests to the root helpers (sleep, role switch, update): /run/myrmid
+RuntimeDirectory=myrmid
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+CacheDirectory=myrmid
+Environment=XDG_CACHE_HOME=/var/cache/myrmid
+StateDirectory=myrmid
+Environment=XDG_CONFIG_HOME=/var/lib/myrmid
+SupplementaryGroups=video render
+Restart=on-failure
+RestartSec=5
+# Exit 2 = the model doesn't fit: restarting won't help
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

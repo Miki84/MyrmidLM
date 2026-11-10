@@ -1,0 +1,10 @@
+[Unit]
+Description=MyrmidLM: suspend when the host asks
+# The host service runs without root; it asks for standby by creating this
+# file, and myrmid-suspend.service (root) suspends the PC.
+
+[Path]
+PathExists=/run/myrmid/suspend
+
+[Install]
+WantedBy=multi-user.target

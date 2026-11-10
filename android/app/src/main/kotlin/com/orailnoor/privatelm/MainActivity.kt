@@ -239,7 +239,7 @@ class MainActivity : FlutterActivity() {
         val key = "update:$safeName"
 
         val request = DownloadManager.Request(Uri.parse(url)).apply {
-            setTitle("PrivateLM update")
+            setTitle("MyrmidLM update")
             setDescription(safeName)
             setMimeType("application/vnd.android.package-archive")
             setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)

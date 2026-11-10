@@ -1,4 +1,4 @@
-# PrivateLM Linux node: rpc-server, llama-server and privatelm-probe, built
+# MyrmidLM node: rpc-server, llama-server and myrmid-probe, built
 # from the llama.cpp commit the app vendors (see LLAMA_CPP_COMMIT), so the
 # RPC protocol matches the phones exactly.
 #
@@ -7,7 +7,7 @@
 # one install can carry several GPU backends and still start on a machine
 # that lacks one of them.
 cmake_minimum_required(VERSION 3.22)
-project(privatelm_node C CXX)
+project(myrmid C CXX)
 
 set(LLAMA_CPP_DIR "" CACHE PATH "llama.cpp source tree at the pinned commit")
 if(NOT EXISTS "${LLAMA_CPP_DIR}/CMakeLists.txt")
@@ -34,6 +34,6 @@ set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(${LLAMA_CPP_DIR} llama.cpp)
 
-add_executable(privatelm-probe probe/privatelm-probe.cpp)
-target_link_libraries(privatelm-probe PRIVATE ggml ggml-base)
-target_compile_features(privatelm-probe PRIVATE cxx_std_17)
+add_executable(myrmid-probe probe/myrmid-probe.cpp)
+target_link_libraries(myrmid-probe PRIVATE ggml ggml-base)
+target_compile_features(myrmid-probe PRIVATE cxx_std_17)

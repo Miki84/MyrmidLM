@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds the PrivateLM Linux node: rpc-server (GPU worker for phone masters),
-# llama-server (PC master / API server) and privatelm-probe, from the exact
+# Builds the MyrmidLM node: rpc-server (GPU worker for masters),
+# llama-server (PC master / API server) and myrmid-probe, from the exact
 # llama.cpp commit the app vendors, so phones and PC speak the same RPC
 # protocol.
 #
@@ -9,7 +9,7 @@
 #   ./build.sh --backends rocm --rocm-targets gfx1100
 #   ./build.sh --backends sycl       (needs Intel oneAPI)
 #   ./build.sh --backends cpu        no GPU
-#   ./build.sh --install /opt/privatelm-node
+#   ./build.sh --install /opt/myrmid/releases/1.1.0
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -134,8 +134,10 @@ done
 if [[ ! -d "$SRC/.git" ]]; then
     echo "==> Fetching llama.cpp $COMMIT"
     git init -q "$SRC"
-    git -C "$SRC" remote add origin https://github.com/ggml-org/llama.cpp.git
+    git -C "$SRC" remote add origin "${LLAMA_CPP_REPO:-https://github.com/ggml-org/llama.cpp.git}"
 fi
+# A mirror (e.g. your own fork, in case the original moves): LLAMA_CPP_REPO=URL
+[[ -n "${LLAMA_CPP_REPO:-}" ]] && git -C "$SRC" remote set-url origin "$LLAMA_CPP_REPO"
 if [[ "$(git -C "$SRC" rev-parse HEAD 2>/dev/null)" != "$COMMIT" ]]; then
     git -C "$SRC" fetch -q --depth 1 origin "$COMMIT"
     git -C "$SRC" checkout -q --force FETCH_HEAD
@@ -159,7 +161,7 @@ if [[ -z "$JOBS" ]]; then
     (( JOBS > $(nproc) )) && JOBS=$(nproc)
     echo "==> $JOBS parallel jobs (${avail_mb} MB free memory, $(nproc) cores; -j N to override)"
 fi
-targets=(ggml-rpc-server llama-server privatelm-probe)
+targets=(ggml-rpc-server llama-server myrmid-probe)
 if ! cmake --build "$BUILD" -j "$JOBS" --target "${targets[@]}"; then
     # The usual reason is memory: try once more, one file at a time.
     if (( JOBS > 1 )); then
@@ -170,13 +172,13 @@ if ! cmake --build "$BUILD" -j "$JOBS" --target "${targets[@]}"; then
     fi
 fi
 
-# Architectures this llama.cpp knows, for 'privatelm-node models'.
+# Architectures this llama.cpp knows, for 'myrmid models'.
 grep -oE '\{ LLM_ARCH_[A-Z0-9_]+, *"[^"]+"' "$SRC/src/llama-arch.cpp" | sed -E 's/.*"([^"]+)"/\1/' \
     | sort -u > "$BUILD/bin/supported-archs.txt"
-# llama.cpp's MoE cache tuner, for 'privatelm-node tune-moe'.
+# llama.cpp's MoE cache tuner, for 'myrmid tune-moe'.
 cp "$SRC/scripts/moe-cache-tune.py" "$BUILD/bin/" && chmod 755 "$BUILD/bin/moe-cache-tune.py"
 echo "==> Built in $BUILD/bin"
-"$BUILD/bin/privatelm-probe" --no-bench || true
+"$BUILD/bin/myrmid-probe" --no-bench || true
 
 if [[ -n "$INSTALL_DIR" ]]; then
     mkdir -p "$INSTALL_DIR/bin"
@@ -184,9 +186,13 @@ if [[ -n "$INSTALL_DIR" ]]; then
     # into a busy binary fails with "Text file busy", into a loaded .so
     # crashes the process); the installer restarts the services afterwards.
     cp -a --remove-destination "$BUILD"/bin/*.so* "$BUILD"/bin/ggml-rpc-server "$BUILD"/bin/llama-server \
-          "$BUILD"/bin/privatelm-probe "$BUILD"/bin/moe-cache-tune.py "$INSTALL_DIR/bin/"
-    install -m 755 "$HERE/privatelm_node.py" "$INSTALL_DIR/bin/privatelm-node"
+          "$BUILD"/bin/myrmid-probe "$BUILD"/bin/moe-cache-tune.py "$INSTALL_DIR/bin/"
+    install -m 755 "$HERE/myrmid.py" "$INSTALL_DIR/bin/myrmid"
     install -m 644 "$HERE/dashboard.html" "$INSTALL_DIR/bin/dashboard.html"
     install -m 644 "$BUILD/bin/supported-archs.txt" "$INSTALL_DIR/bin/supported-archs.txt"
-    echo "==> Installed to $INSTALL_DIR (run $INSTALL_DIR/bin/privatelm-node --help)"
+    # The release (for 'myrmid --version' and the updater) and the helper units it ships.
+    if [[ -f "$HERE/../VERSION" ]]; then install -m 644 "$HERE/../VERSION" "$INSTALL_DIR/bin/VERSION"; fi
+    mkdir -p "$INSTALL_DIR/systemd"
+    cp -a "$HERE"/systemd/* "$INSTALL_DIR/systemd/"
+    echo "==> Installed to $INSTALL_DIR (run $INSTALL_DIR/bin/myrmid --help)"
 fi

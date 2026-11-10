@@ -1,0 +1,38 @@
+# Checks on every push and pull request: scripts, the node program, and a
+# CPU build of the node (the same build.sh the PCs run).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python
+        run: |
+          python3 -m py_compile node/myrmid.py
+          python3 node/myrmid.py --version
+      - name: Shell scripts
+        run: shellcheck -S warning install.sh node/build.sh scripts/release.sh node/systemd/myrmid-role.sh
+
+  node-cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: node/.llama.cpp
+          key: llama-${{ hashFiles('node/LLAMA_CPP_COMMIT') }}
+      - name: Packages
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake git python3-zeroconf
+      - name: Build (CPU)
+        run: bash node/build.sh --backends cpu --install "$RUNNER_TEMP/myrmid"
+      - name: Smoke test
+        run: |
+          "$RUNNER_TEMP/myrmid/bin/myrmid" --version
+          "$RUNNER_TEMP/myrmid/bin/myrmid" detect
+          test -f "$RUNNER_TEMP/myrmid/systemd/myrmid-update.service"

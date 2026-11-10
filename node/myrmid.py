@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""privatelm-node: a Linux PC (with its GPUs) in a PrivateLM phone cluster.
+"""myrmid: a Linux PC (with its GPUs) in a MyrmidLM cluster of PCs and phones.
 
-  privatelm-node detect               devices, free memory, bandwidth
-  privatelm-node worker               lend this PC's GPU(s) to phone masters
-  privatelm-node serve -m model.gguf  run a model here, optionally with
-                                      phones (or other PCs) as workers, and
-                                      serve it as an OpenAI-compatible API
-  privatelm-node scan                 list workers and servers on the LAN
+  myrmid detect               devices, free memory, bandwidth
+  myrmid worker               lend this PC's GPU(s) to a master
+  myrmid serve -m model.gguf  run a model here, optionally with
+                              phones (or other PCs) as workers, and
+                              serve it as an OpenAI-compatible API
+  myrmid scan                 list workers and servers on the LAN
+  myrmid update               versions and the cluster-wide update
 
 Workers advertise themselves exactly like worker phones do
 (_privatelm._tcp, TXT ram/bw/model/id/v), so the app's "Scan nearby" finds a
-PC like any other phone. Phones and PC must run the same llama.cpp RPC
+PC like any other phone. The service types, the privatelm:// QR codes and
+the ids keep their PrivateLM names: they are the protocol the app (and
+phones running older builds) speak, MyrmidLM is a fork of PrivateLM. Phones and PC must run the same llama.cpp RPC
 protocol (rpc9); build.sh builds the commit the app vendors.
 
 The RPC protocol has no authentication: run workers only on a network you
@@ -44,9 +47,29 @@ HOST_TYPE = "_privatelm-host._tcp.local."  # PCs that load whole models for a ma
 DEFAULT_RPC_PORT = 50052
 DEFAULT_API_PORT = 8080
 
-BIN_DIR = Path(os.environ.get("PRIVATELM_NODE_BIN", Path(__file__).resolve().parent))
-CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "privatelm-node"
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "privatelm-node"
+BIN_DIR = Path(os.environ.get("MYRMID_BIN") or os.environ.get("PRIVATELM_NODE_BIN") or Path(__file__).resolve().parent)
+
+
+def _data_dir(base: Path) -> Path:
+    """base/myrmid. Before the rename this was base/privatelm-node: move it
+    over (keys, calibration, model choice), or keep using it if that fails."""
+    new, old = base / "myrmid", base / "privatelm-node"
+    if not new.exists() and old.is_dir():
+        try:
+            old.rename(new)
+        except OSError:
+            return old
+    return new
+
+
+def env(name: str, default: Optional[str] = None) -> Optional[str]:
+    """MYRMID_<name>, or the PRIVATELM_<name> it was called before."""
+    return os.environ.get(f"MYRMID_{name}") or os.environ.get(f"PRIVATELM_{name}") or default
+
+
+CACHE_DIR = _data_dir(Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")))
+CONFIG_DIR = _data_dir(Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")))
+RUN_DIR = env("RUN_DIR", "/run/myrmid")  # RuntimeDirectory of the services: requests to the root helpers
 
 # Share of a device's free memory the planner may fill. Phones: the same
 # 0.75 the app uses for workers. GPUs keep room for the KV cache and
@@ -64,7 +87,7 @@ PHONE_SPEED_FACTOR = 0.5
 
 
 def log(msg: str) -> None:
-    print(f"[privatelm-node] {msg}", file=sys.stderr, flush=True)
+    print(f"[myrmid] {msg}", file=sys.stderr, flush=True)
 
 
 PLAN_FAILED = 2  # the model doesn't fit: restarting won't help (systemd: RestartPreventExitStatus=2)
@@ -86,7 +109,7 @@ def find_bin(name: str) -> str:
     found = shutil.which(name)
     if found:
         return found
-    die(f"{name} not found next to privatelm-node or in PATH. Run build.sh first.")
+    die(f"{name} not found next to myrmid or in PATH. Run build.sh first.")
 
 
 # ── Devices ──────────────────────────────────────────────────────────────────
@@ -137,7 +160,7 @@ def probe(bench: bool = True, refresh: bool = False) -> list[Device]:
         except (ValueError, KeyError):
             cached = {}
     need_bench = bench and (refresh or not cached)
-    args = [find_bin("privatelm-probe")] + ([] if need_bench else ["--no-bench"])
+    args = [find_bin("myrmid-probe")] + ([] if need_bench else ["--no-bench"])
     if need_bench:
         log("Measuring memory bandwidth of each device (a few seconds)...")
     out = subprocess.run(args, check=True, capture_output=True, text=True).stdout
@@ -165,7 +188,10 @@ def host_available_mb() -> int:
 
 def machine_id() -> str:
     """This PC's lasting worker ID (the app finds a worker again by it when
-    its IP changes)."""
+    its IP changes). MYRMID_MACHINE_ID sets one, e.g. for cloned VMs that
+    share /etc/machine-id."""
+    if env("MACHINE_ID"):
+        return env("MACHINE_ID")
     for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
         try:
             raw = Path(p).read_text().strip()
@@ -824,7 +850,7 @@ def cmd_worker(args) -> None:
         log(f"Network: {address} over {link_label(ln)}")
     if not args.no_status:
         txt["stat"] = str(args.status_port)
-    _advertise(args, advs, f"PrivateLM {host}", args.port, txt, address)
+    _advertise(args, advs, f"MyrmidLM {host}", args.port, txt, address)
     show_qr(worker_qr(address, args.port, f"{host} · {label}", ram_mb, bw, wid, txt["kind"]))
 
     # The PC's RAM as a second, separate worker: masters weigh each worker
@@ -853,7 +879,7 @@ def cmd_worker(args) -> None:
                     **({"mac": mac, "bcast": bcast} if mac else {})}
             if not args.no_status:
                 rtxt["stat"] = str(args.status_port)
-            _advertise(args, advs, f"PrivateLM {host} RAM", ram_port, rtxt, address)
+            _advertise(args, advs, f"MyrmidLM {host} RAM", ram_port, rtxt, address)
             show_qr(worker_qr(address, ram_port, f"{host} · RAM", offered, cpu.bandwidth,
                               f"{wid}-ram", "cpu"))
     if not args.no_status:
@@ -967,7 +993,7 @@ class MoePlan:
 # the most used ones (LRFU-like) and the CPU computes a share of the misses
 # instead of uploading them. Usage is skewed, so a cache holding a fraction f
 # of all experts serves more than f of the reads; sqrt(f) is a cautious guess
-# (the PR measured 72-89 % hits). privatelm-node tune-moe measures it.
+# (the PR measured 72-89 % hits). myrmid tune-moe measures it.
 MOE_CACHE_MARGIN_MB = 256  # per GPU, for compute buffers that grow with the cache
 MOE_CACHE_MIN_MB = 512
 MOE_CPU_SHARE = 0.5  # default until tune-moe measured this PC (mmap'd experts: the CPU often reads faster)
@@ -1274,7 +1300,7 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     if moe:
         say(f"  (MoE on this PC alone would give ~{1/moe.time_s:.1f} tokens/s)")
     say(f"  Estimate: ~{1/est:.1f} tokens/s{' before MTP' if args.mtp else ''}, {hops} network hop(s), "
-        f"~{net_kb:.0f} KB/token on the wire (check with: privatelm-node bench)\n")
+        f"~{net_kb:.0f} KB/token on the wire (check with: myrmid bench)\n")
 
     cmd = [find_bin("llama-server"), "-m", model, "-c", str(args.ctx), "--fit", "off", "-ngl", str(ngl)]
     if any(counts):
@@ -1483,7 +1509,7 @@ def cmd_serve(args) -> None:
     address = args.advertise_ip or (args.host if args.host not in ("0.0.0.0", "") else lan_address())
     adv = None
     if not args.no_advertise:
-        adv = Advertiser(SERVER_TYPE, f"PrivateLM {socket.gethostname()}", args.port,
+        adv = Advertiser(SERVER_TYPE, f"MyrmidLM {socket.gethostname()}", args.port,
                          {"path": "/v1", "model": public_name, "auth": "1" if sp.key else "0", "v": "1",
                           "id": machine_id(), "addrs": ",".join(all_lan_addresses())[:200]}, address)
         adv.start()
@@ -1494,8 +1520,13 @@ def cmd_serve(args) -> None:
     if sp.key:
         params["key"] = sp.key
     print(f"\nOpenAI-compatible API: http://{address}:{args.port}/v1  (model: {public_name})")
+    dash = None
     if not args.no_dashboard:
         dash = Dashboard(args, sup, probe(bench=False), router=router, big_base=big_base, hosts=hosts)
+    updater = UpdateCoordinator(sup, router, hosts, dash, sp.key)
+    updater.start()
+    if dash:
+        dash.updater = updater
         if dash.start():
             print(f"Dashboard:             http://{address}:{args.dashboard_port}/"
                   + ("  (log in with the API key)" if sp.key else ""))
@@ -1572,7 +1603,7 @@ def cmd_tune_mtp(args) -> None:
         proc = subprocess.Popen(sp.cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             if not _wait_healthy(base, proc, timeout=args.load_timeout):
-                log(f"depth {depth}: server did not start (try it with privatelm-node serve --mtp {depth})")
+                log(f"depth {depth}: server did not start (try it with myrmid serve --mtp {depth})")
                 continue
             r = measure(base, sp.key, None, args.temp, args.tokens, args.context, runs=args.runs)
             results.append((depth, r))
@@ -1591,7 +1622,7 @@ def cmd_tune_mtp(args) -> None:
     for depth, r in results:
         acc = f"{r['acceptance']*100:5.0f}%" if r.get("acceptance") is not None else "    -"
         print(f"  depth {depth}: {r['tps']:6.1f} tokens/s   accepted {acc}" + ("   <- best" if (depth, r) == best else ""))
-    print(f"\nUse: privatelm-node serve -m {args.model} --mtp {best[0]}" if best[0] else
+    print(f"\nUse: myrmid serve -m {args.model} --mtp {best[0]}" if best[0] else
           "\nMTP doesn't pay off at this temperature: serve without --mtp.")
 
 
@@ -1652,7 +1683,7 @@ def _http(base: str, key: str, route: str = "auto", timeout: float = 900):
 
     headers = {"Content-Type": "application/json"}
     if route != "auto":
-        headers["X-PrivateLM-Route"] = route  # with the router: measure this model
+        headers["X-Myrmid-Route"] = route  # with the router: measure this model
     if key:
         headers["Authorization"] = f"Bearer {key}"
 
@@ -1667,7 +1698,7 @@ def _http(base: str, key: str, route: str = "auto", timeout: float = 900):
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
             if e.code == 401:
-                die("The server wants an API key: --api-key KEY (privatelm-node serve printed it)")
+                die("The server wants an API key: --api-key KEY (myrmid serve printed it)")
             die(f"Server answered {e.code} on {path}: {detail}")
 
     return call
@@ -1742,7 +1773,7 @@ def cmd_bench(args) -> None:
           f"context ~{args.context})")
     if r["acceptance"] is not None:
         print(f"MTP/draft:    {r['acceptance']*100:.0f}% of drafted tokens accepted "
-              "(MTP depth: privatelm-node tune-mtp; draft model: serve --draft-max)")
+              "(MTP depth: myrmid tune-mtp; draft model: serve --draft-max)")
     print(f"Network:      {per/1024:.0f} KB per token  (in {r['per_rx']/1024:.0f} KB, out {r['per_tx']/1024:.0f} KB)")
     n_vocab, n_embd = r["n_vocab"], r["n_embd"]
     if not n_vocab:
@@ -1755,7 +1786,7 @@ def cmd_bench(args) -> None:
         print("Verdict:      no traffic per token: the model runs on this PC alone.")
     elif r["per_rx"] >= 0.8 * logits:
         print("Verdict:      the output head sits on a worker: its scores come back every token.\n"
-              "              Restart with privatelm-node serve (it keeps the head on this PC),\n"
+              "              Restart with myrmid serve (it keeps the head on this PC),\n"
               "              or give the head's device the last place in -dev / --rpc order.")
     elif per > 64 * act + 256 * 1024:
         print("Verdict:      far more traffic than a few hand-offs: layers are probably\n"
@@ -1980,12 +2011,12 @@ def cmd_calibration(args) -> None:
         print("Calibration reset: the planner uses the estimated speeds again.")
         return
     if not c.k:
-        print("No measurements yet. They come from requests to the model (privatelm-node bench is one).")
+        print("No measurements yet. They come from requests to the model (myrmid bench is one).")
         return
     print(f"{'Device':<52} {'measured vs. estimate':>22}")
     for key, k in sorted(c.k.items(), key=lambda x: x[1]):
         print(f"{c.labels.get(key, key)[:52]:<52} {f'{1/k:.2f}x as fast':>22}")
-    print(f"\n{len(c.plans)} plan(s) measured. Reset with: privatelm-node calibration --reset")
+    print(f"\n{len(c.plans)} plan(s) measured. Reset with: myrmid calibration --reset")
 
 
 # ── Rebalancing ──────────────────────────────────────────────────────────────
@@ -2797,12 +2828,13 @@ def start_worker_status(args, rpc_info: list[dict], procs: list[subprocess.Popen
         rpc = []
         for info, p in zip(rpc_info, procs):
             rpc.append(dict(info, alive=p.poll() is None, peers=tcp_peers(info["port"])))
-        return {"role": "worker", "host": socket.gethostname(), "version": RPC_VERSION,
+        return {"role": "worker", "host": socket.gethostname(), "version": RPC_VERSION, "release": own_version(),
                 "rpc": rpc, "stats": stats.sample(), "address": NET_STATE["address"], "link": NET_STATE["link"],
-                "switchable": bool(key) and can_switch_role()}
+                "switchable": bool(key) and can_switch_role(), "keyed": bool(key), "update": update_brief()}
 
-    # Status stays open (no secrets in it); switching the role needs the cluster key.
-    post = {"/role": lambda body: request_role(str(body.get("role") or ""))} if key else {}
+    # Status stays open (no secrets in it); switching the role or updating needs the cluster key.
+    post = {"/role": lambda body: request_role(str(body.get("role") or "")),
+            "/update": request_update} if key else {}
     if _start_http(args.host, args.status_port, _json_handler({"/status": status}, post, key=key,
                                                                public=("/status",))):
         log(f"Status for the master's dashboard on port {args.status_port}")
@@ -2835,6 +2867,7 @@ class Dashboard:
         self._last_tps = 0.0
         self._kb_per_token: Optional[float] = None
         self.fast_state: dict = {}
+        self.updater: Optional["UpdateCoordinator"] = None
 
     @property
     def sp(self) -> "ServerPlan":
@@ -3027,7 +3060,8 @@ class Dashboard:
                     "plan": self.sp.info, "master": {**self.state, "uptime_s": int(time.time() - self.started),
                                                       "host": socket.gethostname()},
                     "workers": self.workers, "lan": self.lan, "history": self.history,
-                    "bench": self.bench, "models": self.models_list()}
+                    "bench": self.bench, "models": self.models_list(),
+                    "update": self.updater.info() if self.updater else {"installed": False}}
 
     def run_bench(self) -> dict:
         import threading
@@ -3122,6 +3156,7 @@ class Dashboard:
                                  "/api/rebalance": self.sup.api,
                                  "/api/role": self.switch_role,
                                  "/api/model": self.sup.model_api,
+                                 "/api/update": lambda b: self.updater.api(b) if self.updater else {"ok": False},
                                  "/api/wake": lambda b: {"ok": self.sup.known.wake(str(b.get("id") or ""), force=True)},
                                  "/api/hosts": self.hosts.api if self.hosts else (lambda b: {"error": "no hosts"})},
                                 key=self.sp.key, public=("/",))
@@ -3138,13 +3173,13 @@ class Dashboard:
 # asleep: a worker when the model doesn't fit without it, a host when a
 # request asks for its model. Hosts can sleep after a while without
 # requests: the master tells them to, they stop llama-server and suspend
-# (through a small root unit, see privatelm-suspend.path), and after
+# (through a small root unit, see myrmid-suspend.path), and after
 # waking up they load their model again.
 
 KNOWN_STATE = CONFIG_DIR / "known.json"
 WAKE_WAIT_S = 240  # how long a request waits for a host to wake up and load
 WAKE_REPEAT_S = 300  # don't wake the same machine more often (unless asked)
-SUSPEND_FILE = "/run/privatelm-node/suspend"
+SUSPEND_FILE = f"{RUN_DIR}/suspend"
 
 
 def iface_info(ip: str) -> tuple[str, str]:
@@ -3246,7 +3281,7 @@ class Known:
 def request_suspend() -> tuple[bool, str]:
     """Suspends this PC: through the root helper unit (a file it watches),
     or directly when allowed (root, or a desktop session)."""
-    custom = os.environ.get("PRIVATELM_SUSPEND_CMD")  # e.g. "systemctl hibernate"
+    custom = env("SUSPEND_CMD")  # e.g. "systemctl hibernate"
     if custom:
         import shlex
 
@@ -3254,7 +3289,7 @@ def request_suspend() -> tuple[bool, str]:
         return r.returncode == 0, (r.stderr.strip() or custom)[:200]
     p = Path(SUSPEND_FILE)
     if p.parent.is_dir() and os.access(p.parent, os.W_OK) and \
-            Path("/etc/systemd/system/privatelm-suspend.path").exists():
+            Path("/etc/systemd/system/myrmid-suspend.path").exists():
         p.write_text(str(int(time.time())))
         return True, "helper"
     r = subprocess.run(["systemctl", "suspend"], capture_output=True, text=True)
@@ -3268,10 +3303,10 @@ def request_suspend() -> tuple[bool, str]:
 # Both services are installed on a node PC; one runs. The master asks the
 # running one (authenticated with the cluster key) to switch; the service has
 # no root rights, so it leaves the wanted role in a file that a small root
-# unit watches (privatelm-role.path): it stops one service and starts the other.
+# unit watches (myrmid-role.path): it stops one service and starts the other.
 
-ROLE_FILE = "/run/privatelm-node/role"
-ROLE_HELPER = Path("/etc/systemd/system/privatelm-role.path")
+ROLE_FILE = f"{RUN_DIR}/role"
+ROLE_HELPER = Path("/etc/systemd/system/myrmid-role.path")
 
 
 def can_switch_role() -> bool:
@@ -3288,6 +3323,757 @@ def request_role(role: str) -> dict:
     Path(ROLE_FILE).write_text(role)
     log(f"Switching this PC to {role} (the other service starts in a moment)")
     return {"ok": True, "role": role}
+
+
+# ── Updates ──────────────────────────────────────────────────────────────────
+#
+# Releases are the git tags vX.Y.Z of the MyrmidLM repo (llama.cpp moves only
+# with a release: LLAMA_CPP_COMMIT is part of it). Each PC builds a new
+# release in the background into /opt/myrmid/releases/X.Y.Z while its
+# services keep running the old one, then switches the link
+# /opt/myrmid/current and restarts them. If they don't come up, it switches
+# back. The master switches its cluster together, once every PC has the
+# release built and no request is running: a master and its workers must
+# speak the same RPC protocol, phones included (they get the new app from
+# the same GitHub release).
+#
+# Building and switching need root: myrmid-update.timer (daily) runs
+# "myrmid update auto"; the services, without root, ask with a request file
+# in /run/myrmid that myrmid-update-request.path hands to a root service.
+
+PREFIX = Path(env("PREFIX", "/opt/myrmid"))
+UPDATE_DIR = Path(env("UPDATE_DIR", "/var/lib/myrmid-update"))
+UPDATE_STATE = UPDATE_DIR / "state.json"
+UPDATE_LOG = UPDATE_DIR / "build.log"
+UPDATE_CONF = Path(env("CONF", "/etc/myrmid/myrmid.conf"))
+UPDATE_REQUEST = f"{RUN_DIR}/update"
+UNIT_DIR = Path(env("UNIT_DIR", "/etc/systemd/system"))
+UPDATE_HELPER = UNIT_DIR / "myrmid-update-request.path"
+CLUSTER_KEY_FILE = Path(env("CLUSTER_KEY_FILE", "/etc/myrmid/cluster_key"))
+DEFAULT_REPO = "https://github.com/Miki84/MyrmidLM.git"
+SERVICES = ("myrmid-server", "myrmid-worker", "myrmid-host")
+VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+RELEASE_RE = re.compile(r"^(\d+\.\d+\.\d+|main-[0-9a-f]{7,40})$")
+UPDATE_ACTIONS = ("check", "prepare", "activate", "rollback", "auto")
+UPDATE_HEALTH_S = 30  # services must stay up this long after a switch
+UPDATE_SELF_AFTER_S = 7 * 86400  # a worker whose master never asks switches itself after a week
+MIN_BUILD_FREE_GB = 3
+
+
+class UpdateError(Exception):
+    pass
+
+
+def own_version() -> str:
+    """The release this program belongs to (VERSION next to it, or in the checkout)."""
+    for p in (BIN_DIR / "VERSION", Path(__file__).resolve().parent.parent / "VERSION"):
+        try:
+            v = p.read_text().strip()
+            if v:
+                return v
+        except OSError:
+            pass
+    return "dev"
+
+
+def vkey(v: Optional[str]) -> tuple:
+    return tuple(int(x) for x in v.split(".")) if v and VERSION_RE.match(v) else (-1,)
+
+
+def is_newer(a: Optional[str], b: Optional[str]) -> bool:
+    """a newer than b: by number for releases; a build of main is newer when it differs."""
+    if not a:
+        return False
+    if VERSION_RE.match(a) and b and VERSION_RE.match(b):
+        return vkey(a) > vkey(b)
+    return a != b
+
+
+def read_conf() -> dict:
+    conf = {"REPO": DEFAULT_REPO, "CHANNEL": "stable", "AUTO": "on", "BACKENDS": "auto",
+            "CUDA_BIN": "", "ROCM_TARGETS": "", "LLAMA_CPP_REPO": ""}
+    try:
+        for line in UPDATE_CONF.read_text().splitlines():
+            k, sep, v = line.strip().partition("=")
+            if sep and k and not k.startswith("#"):
+                conf[k.strip()] = v.strip().strip('"')
+    except OSError:
+        pass
+    return conf
+
+
+def write_conf_value(key: str, value: str) -> None:
+    lines = []
+    try:
+        lines = UPDATE_CONF.read_text().splitlines()
+    except OSError:
+        pass
+    lines = [ln for ln in lines if ln.split("=", 1)[0].strip() != key] + [f"{key}={value}"]
+    UPDATE_CONF.parent.mkdir(parents=True, exist_ok=True)
+    UPDATE_CONF.write_text("\n".join(lines) + "\n")
+
+
+def read_update_state() -> dict:
+    try:
+        st = json.loads(UPDATE_STATE.read_text())
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_update_state(**kw) -> dict:
+    """Merges kw into the state (a build and a request may write at the same time)."""
+    import fcntl
+
+    UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(UPDATE_DIR / "state.lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        st = read_update_state()
+        st.update(kw)
+        st["at"] = int(time.time())
+        st["auto"] = read_conf()["AUTO"] == "on"
+        tmp = UPDATE_STATE.with_suffix(f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(st, indent=1))
+        os.chmod(tmp, 0o644)  # the services (without root) read it
+        tmp.replace(UPDATE_STATE)
+    return st
+
+
+def is_bad(st: dict, v: Optional[str]) -> bool:
+    """A release that failed here or was rolled back: never switched to automatically again."""
+    return bool(v) and (v == st.get("bad") or v in (st.get("bad_all") or []))
+
+
+def mark_bad(v: str) -> dict:
+    st = read_update_state()
+    return write_update_state(bad=v, bad_all=sorted(set(st.get("bad_all") or []) | {v}))
+
+
+def update_brief() -> dict:
+    """What a PC tells its master about updates (in /status)."""
+    st = read_update_state()
+    out = {k: st.get(k) for k in ("current", "latest", "prepared", "phase", "error", "bad", "bad_all", "auto")}
+    out["release"] = own_version()
+    out["can_update"] = UPDATE_HELPER.exists() and os.access(RUN_DIR, os.W_OK)
+    return out
+
+
+def current_release() -> str:
+    link = PREFIX / "current"
+    if link.is_symlink():
+        return Path(os.readlink(link)).name
+    return own_version()
+
+
+def _releases() -> list[str]:
+    d = PREFIX / "releases"
+    return sorted((p.name for p in d.iterdir() if p.is_dir() and RELEASE_RE.match(p.name)),
+                  key=lambda v: (vkey(v), v)) if d.is_dir() else []
+
+
+def _git(*a: str, check: bool = True) -> str:
+    r = subprocess.run(["git", "-C", str(PREFIX / "src"), *a], capture_output=True, text=True, timeout=900)
+    if check and r.returncode:
+        raise UpdateError(f"git {' '.join(a)}: {(r.stderr or r.stdout).strip()[-300:]}")
+    return r.stdout.strip()
+
+
+def _systemctl(*a: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["systemctl", *a], capture_output=True, text=True)
+
+
+def _unit_active(u: str) -> bool:
+    return shutil.which("systemctl") is not None and _systemctl("is-active", "--quiet", u).returncode == 0
+
+
+def _unit_enabled(u: str) -> bool:
+    return shutil.which("systemctl") is not None and _systemctl("is-enabled", "--quiet", u).returncode == 0
+
+
+def _lock(name: str):
+    """An exclusive lock (None when another update holds it)."""
+    import fcntl
+
+    UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+    f = open(UPDATE_DIR / f"{name}.lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def update_check() -> dict:
+    """Asks the repo for the newest release (tags vX.Y.Z, or main with CHANNEL=main)."""
+    conf = read_conf()
+    if not (PREFIX / "src" / ".git").is_dir():
+        raise UpdateError(f"{PREFIX / 'src'} is not a git checkout: install with install.sh")
+    st = read_update_state()
+    write_update_state(phase="checking" if st.get("phase") != "building" else "building")
+    try:
+        _git("remote", "set-url", "origin", conf["REPO"])
+        if conf["CHANNEL"] == "main":
+            _git("fetch", "--quiet", "--force", "origin", "+main:refs/remotes/origin/main")
+            ref = "origin/main"
+            latest = "main-" + _git("rev-parse", "--short=8", ref)
+        else:
+            _git("fetch", "--quiet", "--force", "--tags", "origin")
+            tags = [t[1:] for t in _git("tag", "-l", "v*").split() if VERSION_RE.match(t[1:])]
+            latest = max(tags, key=vkey, default=None)
+            ref = f"v{latest}" if latest else None
+    except (UpdateError, OSError, subprocess.TimeoutExpired) as e:
+        write_update_state(phase="idle" if st.get("phase") != "building" else "building",
+                           error=f"Prüfen fehlgeschlagen: {e}")
+        raise UpdateError(str(e)) from e
+    rpc = None
+    if ref:
+        m = re.search(r'^RPC_VERSION = "([^"]+)"', _git("show", f"{ref}:node/myrmid.py", check=False), re.M)
+        rpc = m.group(1) if m else None
+    cur = current_release()
+    phase = read_update_state().get("phase")
+    return write_update_state(phase="building" if phase == "building" else "idle", latest=latest, latest_rpc=rpc,
+                              latest_ref=ref, checked=int(time.time()), current=cur, error="",
+                              newer=is_newer(latest, cur), channel=conf["CHANNEL"])
+
+
+def update_prepare(version: Optional[str] = None) -> dict:
+    """Builds a release next to the running one (the services keep running)."""
+    conf = read_conf()
+    st = read_update_state()
+    if not version:
+        st = update_check()
+        if not st.get("newer"):
+            return st
+        version = st["latest"]
+    if not RELEASE_RE.match(version):
+        raise UpdateError(f"not a release: {version}")
+    dest = PREFIX / "releases" / version
+    if dest.is_dir():
+        return write_update_state(prepared=version, prepared_at=st.get("prepared_at") or int(time.time()),
+                                  phase="idle", error="")
+    lock = _lock("build")
+    if lock is None:
+        return write_update_state()  # another build runs
+    try:
+        ref = f"v{version}" if VERSION_RE.match(version) else (st.get("latest_ref") or "origin/main")
+        if not _git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
+            _git("fetch", "--quiet", "--force", "--tags", "origin")  # a release the master knows, not yet here
+            if not _git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False):
+                raise UpdateError(f"release {version} is not in {read_conf()['REPO']}")
+        if version.startswith("main-") and not _git("rev-parse", "--short=8", ref).startswith(version[5:]):
+            raise UpdateError(f"{version} is no longer the newest commit on main: check again")
+        free_gb = shutil.disk_usage(PREFIX).free / 2**30
+        if free_gb < MIN_BUILD_FREE_GB:
+            raise UpdateError(f"only {free_gb:.1f} GB free under {PREFIX}; building needs {MIN_BUILD_FREE_GB} GB")
+        write_update_state(phase="building", building=version, build_started=int(time.time()), error="")
+        log(f"Update: building {version} (log: {UPDATE_LOG})")
+        _git("checkout", "--quiet", "--force", "--detach", ref)
+        _git("clean", "-fdq")  # leaves the ignored build tree: only what changed is built again
+        part = dest.with_name(version + ".part")
+        shutil.rmtree(part, ignore_errors=True)
+        envp = dict(os.environ)
+        if conf["CUDA_BIN"]:
+            envp["PATH"] = f"{conf['CUDA_BIN']}:{envp.get('PATH', '')}"
+        if conf["LLAMA_CPP_REPO"]:
+            envp["LLAMA_CPP_REPO"] = conf["LLAMA_CPP_REPO"]
+        cmd = ["nice", "-n", "19"] + (["ionice", "-c3"] if shutil.which("ionice") else [])
+        cmd += ["bash", str(PREFIX / "src" / "node" / "build.sh"), "--backends", conf["BACKENDS"],
+                "--install", str(part)]
+        if conf["ROCM_TARGETS"]:
+            cmd += ["--rocm-targets", conf["ROCM_TARGETS"]]
+        with open(UPDATE_LOG, "w") as lf:
+            rc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, env=envp, cwd=str(PREFIX / "src")).returncode
+        if rc:
+            raise UpdateError(f"Bauen von {version} fehlgeschlagen (Log: {UPDATE_LOG})")
+        (part / "bin" / "VERSION").write_text(version + "\n")
+        part.rename(dest)
+        log(f"Update: {version} is built and ready")
+        return write_update_state(prepared=version, prepared_at=int(time.time()), phase="idle", building=None,
+                                  error="")
+    except (UpdateError, OSError, subprocess.SubprocessError) as e:
+        write_update_state(phase="failed", building=None, error=str(e))
+        raise UpdateError(str(e)) from e
+    finally:
+        lock.close()
+
+
+def _switch_link(version: str) -> None:
+    link, tmp = PREFIX / "current", PREFIX / ".current.tmp"
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    os.symlink(f"releases/{version}", tmp)
+    os.replace(tmp, link)  # atomic: a service starting now gets the old or the new release, never none
+
+
+def _install_units(release: Path) -> None:
+    """The release's own helper units (update, role switch, sleep) and the
+    role-switch script; the services themselves stay as the installer wrote them."""
+    src = release / "systemd"
+    if not src.is_dir():
+        return
+    changed = False
+    for f in sorted(src.iterdir()):
+        if f.suffix not in (".path", ".service", ".timer") or f.stem in SERVICES:
+            continue
+        dst = UNIT_DIR / f.name
+        is_update = f.name.startswith("myrmid-update")
+        if not (is_update or dst.exists()):
+            continue  # not set up on this PC (e.g. sleep on a master)
+        if not dst.exists() or dst.read_bytes() != f.read_bytes():
+            shutil.copyfile(f, dst)
+            changed = True
+    role = src / "myrmid-role.sh"
+    dst = Path("/usr/local/sbin/myrmid-role")
+    if role.is_file() and dst.exists() and dst.read_bytes() != role.read_bytes():
+        shutil.copyfile(role, dst)
+        os.chmod(dst, 0o755)
+    if changed:
+        _systemctl("daemon-reload")
+
+
+def _restarts(u: str) -> int:
+    out = _systemctl("show", "-p", "NRestarts", "--value", u).stdout.strip()
+    return int(out) if out.isdigit() else 0
+
+
+def _healthy(units: list[str], before: dict[str, int]) -> tuple[bool, str]:
+    end = time.time() + UPDATE_HEALTH_S
+    while time.time() < end:
+        for u in units:
+            state = _systemctl("is-active", u).stdout.strip()
+            if state in ("failed", "inactive") or _restarts(u) > before.get(u, 0):
+                return False, f"{u} läuft nicht ({state})"
+        time.sleep(2)
+    for u in units:
+        if _systemctl("is-active", u).stdout.strip() != "active":
+            return False, f"{u} ist nicht hochgekommen"
+    return True, ""
+
+
+def update_activate(version: Optional[str] = None, *, rollback: bool = False) -> dict:
+    """Switches to a built release and restarts the running services; back to
+    the previous one if they don't stay up."""
+    st = read_update_state()
+    version = version or st.get("prepared")
+    if not version or not RELEASE_RE.match(version):
+        raise UpdateError("no release built: run myrmid update prepare")
+    dest = PREFIX / "releases" / version
+    if not dest.is_dir():
+        raise UpdateError(f"{version} is not built ({dest} missing)")
+    prev = current_release()
+    if prev == version and (PREFIX / "current").is_symlink():
+        return write_update_state(current=version, phase="idle", prepared=None if st.get("prepared") == version
+                                  else st.get("prepared"))
+    r = subprocess.run([sys.executable, str(dest / "bin" / "myrmid"), "--version"], capture_output=True, text=True)
+    if r.returncode:
+        raise UpdateError(f"{version} doesn't start: {r.stderr.strip()[-200:]}")
+    lock = _lock("switch")
+    if lock is None:
+        raise UpdateError("another switch is running")
+    try:
+        running = [u for u in SERVICES if _unit_active(u)]
+        write_update_state(phase="activating", activating=version, error="")
+        log(f"Update: {prev} -> {version}; restarting {', '.join(running) or 'nothing'}")
+        _switch_link(version)
+        _install_units(dest)
+        before = {u: _restarts(u) for u in running}
+        if running:
+            _systemctl("restart", *running)
+        ok, why = _healthy(running, before) if running else (True, "")
+        if not ok:
+            log(f"Update: {version} failed ({why}); back to {prev}")
+            if (PREFIX / "releases" / prev).is_dir():
+                _switch_link(prev)
+                _systemctl("restart", *running)
+            mark_bad(version)
+            write_update_state(phase="failed", activating=None, current=current_release(),
+                               error=f"{version}: {why}. Zurück auf {prev}.")
+            raise UpdateError(f"{version}: {why}; back on {prev}")
+        keep = {version, prev, read_update_state().get("prepared")}
+        for old in _releases():
+            if old not in keep:
+                shutil.rmtree(PREFIX / "releases" / old, ignore_errors=True)
+        log(f"Update: now on {version}")
+        st = read_update_state()
+        bad_all = [v for v in (st.get("bad_all") or []) if v != version]  # switched to by hand: good again
+        return write_update_state(phase="idle", activating=None, current=version, previous=prev, error="",
+                                  prepared=None if st.get("prepared") == version else st.get("prepared"),
+                                  bad=st.get("bad") if rollback or st.get("bad") != version else None,
+                                  bad_all=bad_all, newer=is_newer(st.get("latest"), version))
+    finally:
+        lock.close()
+
+
+def update_rollback() -> dict:
+    st = read_update_state()
+    cur = current_release()
+    prev = st.get("previous")
+    if not prev or prev == cur or not (PREFIX / "releases" / prev).is_dir():
+        older = [v for v in _releases() if v != cur]
+        prev = older[-1] if older else None
+    if not prev:
+        raise UpdateError("no earlier release on this PC")
+    mark_bad(cur)  # the timer must not switch straight back
+    return update_activate(prev, rollback=True)
+
+
+def update_auto() -> dict:
+    """The daily timer: check, build a new release, and switch where nobody
+    else does. A master's server switches its cluster itself (when idle); a
+    worker or host with the cluster key waits for its master; one without
+    the key can't be asked, so it switches itself (at the timer's hour)."""
+    conf = read_conf()
+    st = update_check()
+    if st.get("newer") and not is_bad(st, st.get("latest")):
+        st = update_prepare(st["latest"])
+    prep = st.get("prepared")
+    if conf["AUTO"] != "on" or not prep or prep == st.get("current") or is_bad(st, prep):
+        return st
+    if _unit_enabled("myrmid-server"):
+        if not _unit_active("myrmid-server"):
+            return update_activate(prep)  # nothing running to coordinate
+        return st  # the server switches the cluster when every PC is ready
+    has_key = CLUSTER_KEY_FILE.exists()
+    if not has_key or time.time() - (st.get("prepared_at") or time.time()) > UPDATE_SELF_AFTER_S:
+        return update_activate(prep)
+    return st
+
+
+def update_apply_request() -> dict:
+    """Runs what a service asked for (myrmid-update-request.service, as root)."""
+    p = Path(UPDATE_REQUEST)
+    try:
+        req = json.loads(p.read_text())
+    except (OSError, ValueError):
+        req = {}
+    finally:
+        p.unlink(missing_ok=True)
+    action, version = str(req.get("action") or ""), req.get("version")
+    if action not in UPDATE_ACTIONS:
+        raise UpdateError(f"unknown request: {action or '(none)'}")
+    if version is not None and not RELEASE_RE.match(str(version)):
+        raise UpdateError(f"not a release: {version}")
+    log(f"Update request: {action} {version or ''}".rstrip())
+    if action == "check":
+        return update_check()
+    if action == "prepare":
+        return update_prepare(version)
+    if action == "activate":
+        return update_activate(version)
+    if action == "rollback":
+        return update_rollback()
+    write_conf_value("AUTO", "on" if req.get("value") else "off")
+    return write_update_state()
+
+
+def request_update(body: dict) -> dict:
+    """A service asks the root helper (the master's dashboard, or a master asking a worker)."""
+    action, version = str(body.get("action") or ""), body.get("version")
+    if action not in UPDATE_ACTIONS:
+        return {"ok": False, "error": f"action must be one of {', '.join(UPDATE_ACTIONS)}"}
+    if version is not None and not RELEASE_RE.match(str(version)):
+        return {"ok": False, "error": "not a release"}
+    if not (UPDATE_HELPER.exists() and os.access(RUN_DIR, os.W_OK)):
+        return {"ok": False, "error": "this PC can't update itself yet: install it with install.sh"}
+    if Path(UPDATE_REQUEST).exists():
+        return {"ok": False, "error": "a request is still running"}
+    tmp = Path(f"{UPDATE_REQUEST}.tmp")
+    tmp.write_text(json.dumps({"action": action, "version": version, "value": bool(body.get("value"))}))
+    tmp.replace(UPDATE_REQUEST)
+    return {"ok": True}
+
+
+def cmd_update(args) -> None:
+    what = args.what
+    if what == "status":
+        st = read_update_state()
+        if args.json:
+            print(json.dumps({**st, "running": own_version(), "releases": _releases()}, indent=1))
+            return
+        conf = read_conf()
+        print(f"Running:   {own_version()}  (installed: {current_release()}, releases: {', '.join(_releases()) or '-'})")
+        print(f"Newest:    {st.get('latest') or '?'} ({conf['CHANNEL']}, {conf['REPO']})"
+              + (f", checked {time.strftime('%Y-%m-%d %H:%M', time.localtime(st['checked']))}" if st.get("checked") else ""))
+        if st.get("prepared"):
+            print(f"Built:     {st['prepared']} (switches with the cluster)")
+        print(f"State:     {st.get('phase') or 'idle'}" + (f" - {st['error']}" if st.get("error") else ""))
+        print(f"Automatic: {'on' if conf['AUTO'] == 'on' else 'off'} (myrmid update auto on|off)")
+        return
+    if os.geteuid() != 0:
+        die(f"Updates build into {PREFIX} and restart the services: run it with sudo")
+    try:
+        if what == "check":
+            st = update_check()
+            print(f"Newest: {st.get('latest') or 'none'}; running {current_release()}"
+                  + ("; an update is available" if st.get("newer") else ""))
+        elif what == "prepare":
+            st = update_prepare(args.version)
+            print(f"Built: {st.get('prepared') or 'nothing new'}")
+        elif what == "activate":
+            st = update_activate(args.version)
+            print(f"Now on {st.get('current')}")
+        elif what == "rollback":
+            st = update_rollback()
+            print(f"Back on {st.get('current')}")
+        elif what == "auto":
+            if args.version in ("on", "off"):
+                write_conf_value("AUTO", args.version)
+                write_update_state()
+                print(f"Automatic updates {args.version}")
+            else:
+                st = update_auto()
+                print(f"Running {st.get('current')}; newest {st.get('latest') or '?'}; built {st.get('prepared') or '-'}")
+        elif what == "apply-request":
+            update_apply_request()
+    except UpdateError as e:
+        die(str(e))
+
+
+class UpdateCoordinator:
+    """On the master: brings every PC of the cluster to a new release and
+    switches them together, when all have it built and no request runs."""
+
+    IDLE_S = 120  # no request for this long (and as long after the start: the LAN scan must find the PCs first)
+    WAIT_SWITCH_S = 240  # for each PC to come back on the new release
+
+    def __init__(self, sup: "Supervisor", router: "Router", hosts: Optional["HostManager"],
+                 dash: Optional["Dashboard"], key: str):
+        import threading
+
+        self.sup, self.router, self.hosts, self.dash, self.key = sup, router, hosts, dash, key
+        self.lock = threading.Lock()
+        self.nodes: list[dict] = []
+        self.status = ""
+        self.busy = False
+        self.asked: dict[tuple, float] = {}  # (ctl, action, version) -> when
+        self.started = time.time()
+
+    # The PCs ----------------------------------------------------------------
+
+    def _get(self, ctl: str, path: str = "/status", timeout: float = 3) -> dict:
+        import urllib.request
+
+        req = urllib.request.Request(f"http://{ctl}{path}", headers={"Authorization": f"Bearer {self.key}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+
+    def _post(self, ctl: str, body: dict) -> dict:
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(f"http://{ctl}/update", data=json.dumps(body).encode(),
+                                     headers={"Authorization": f"Bearer {self.key}",
+                                              "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "error": "kein Cluster-Key (oder ein anderer) auf diesem PC" if e.code in (401, 404)
+                    else f"HTTP {e.code}"}
+        except (OSError, ValueError) as e:
+            return {"ok": False, "error": f"nicht erreichbar: {e}"}
+
+    def _ctls(self) -> dict[str, dict]:
+        """Every PC worker and host the master knows: ctl address -> facts."""
+        out: dict[str, dict] = {}
+        for m in self.sup.sp.info.get("machines", []):
+            if m.get("role") == "worker" and m.get("status_port") and m.get("host"):
+                out[f"{m['host']}:{m['status_port']}"] = {"kind": "worker", "in_plan": True}
+        if self.dash:
+            with self.dash.lock:
+                lan = list(self.dash.lan)
+            for d in lan:
+                if d.get("ctl"):  # PC workers (phones have no status port)
+                    out.setdefault(d["ctl"], {"kind": "worker", "in_plan": bool(d.get("in_use"))})
+        if self.hosts:
+            for h in self.hosts.info()["hosts"]:
+                if not h.get("asleep") and h.get("state") != "unreachable":
+                    out[h["addr"]] = {"kind": "host", "in_plan": False, "id": h["id"]}
+        return out
+
+    def poll(self) -> list[dict]:
+        nodes = []
+        for ctl, facts in self._ctls().items():
+            try:
+                st = self._get(ctl)
+            except (OSError, ValueError):
+                continue
+            up = st.get("update") or {}
+            nodes.append({"ctl": ctl, "name": st.get("host") or ctl, **facts,
+                          "release": up.get("release") or st.get("release") or "?",
+                          "prepared": up.get("prepared"), "phase": up.get("phase") or "",
+                          "error": up.get("error") or "", "bad": up.get("bad"), "bad_all": up.get("bad_all") or [],
+                          "can_update": bool(up.get("can_update")),
+                          "keyed": bool(st.get("keyed") or facts["kind"] == "host")})
+        with self.lock:
+            self.nodes = nodes
+        return nodes
+
+    def _phones_in_plan(self) -> bool:
+        return any(m.get("role") == "worker" and not m.get("status_port") for m in self.sup.sp.info.get("machines", []))
+
+    def _idle(self) -> bool:
+        r = self.router
+        with r.lock:
+            running = any(b.inflight for b in r.backends)
+        quiet_since = max(getattr(r, "last_request", 0), self.started)
+        return not running and time.time() - quiet_since > self.IDLE_S and self.sup.state in ("running", "waiting")
+
+    def _ask(self, n: dict, action: str, version: Optional[str], every_s: float = 1800) -> None:
+        k = (n["ctl"], action, version)
+        if time.time() - self.asked.get(k, 0) < every_s:
+            return
+        self.asked[k] = time.time()
+        res = self._post(n["ctl"], {"action": action, "version": version})
+        if not res.get("ok"):
+            log(f"Update: {n['name']} can't {action}: {res.get('error')}")
+
+    # Deciding ---------------------------------------------------------------
+
+    def target(self) -> tuple[Optional[str], dict]:
+        st = read_update_state()
+        mine = own_version()
+        prep = st.get("prepared")
+        ok = prep and is_newer(prep, mine) and not is_bad(st, prep) and (PREFIX / "releases" / prep).is_dir()
+        return (prep if ok else None), st
+
+    def tick(self, force: bool = False) -> None:
+        if self.busy:
+            return
+        target, st = self.target()
+        mine = own_version()
+        nodes = self.poll()
+        if not st:
+            self.status = "Updates sind auf diesem PC nicht eingerichtet (mit install.sh installieren)."
+            return
+        if not target:
+            # PCs behind the master (were off, or failed before): bring them up to its release
+            for n in nodes:
+                if n["release"] == mine or not n["can_update"] or not n["keyed"] or mine in n["bad_all"]:
+                    continue  # (a release that failed on a PC is not pushed onto it again)
+                if n["prepared"] == mine and (self._idle() or not n["in_plan"]):
+                    self._ask(n, "activate", mine, every_s=600)
+                elif n["prepared"] != mine and n["phase"] != "building" and VERSION_RE.match(mine):
+                    self._ask(n, "prepare", mine)
+            self.status = ""
+            return
+        for n in nodes:  # let every PC build the release now, not at its own timer
+            if n["release"] != target and n["prepared"] != target and n["phase"] != "building" \
+                    and n["can_update"] and n["keyed"]:
+                self._ask(n, "prepare", target)
+        waiting = [n["name"] for n in nodes if n["release"] != target and n["prepared"] != target and n["keyed"]]
+        rpc_change = st.get("latest") == target and st.get("latest_rpc") not in (None, RPC_VERSION)
+        if not force:
+            if not st.get("auto"):
+                self.status = f"{target} ist gebaut. Automatisch umstellen ist aus: im Dashboard auf Jetzt umstellen klicken."
+                return
+            if waiting:
+                self.status = f"{target}: warte, bis es auf {', '.join(waiting)} gebaut ist."
+                return
+            if rpc_change and self._phones_in_plan():
+                self.status = (f"{target} bringt ein neues RPC-Protokoll ({st.get('latest_rpc')}): die Handys im Plan "
+                               "brauchen erst die neue App. Danach hier auf Jetzt umstellen klicken.")
+                return
+            if not self._idle():
+                self.status = f"{target}: wird umgestellt, sobald {self.IDLE_S // 60} Minuten lang keine Anfrage läuft."
+                return
+        import threading
+
+        self.busy = True
+        threading.Thread(target=self.switch, args=(target, nodes), daemon=True).start()
+
+    def switch(self, target: str, nodes: list[dict], action: str = "activate") -> None:
+        try:
+            what = "Zurück auf die vorige Version" if action == "rollback" else f"Umstellen auf {target}"
+            self.status = f"{what}: die PCs werden neu gestartet ..."
+            self.sup.event(f"update: {action} {target}", f"{what} (alle PCs zusammen).")
+            todo = [n for n in nodes if n["keyed"] and n["can_update"]
+                    and (action == "rollback" or (n["release"] != target and n["prepared"] == target))]
+            for n in todo:
+                res = self._post(n["ctl"], {"action": action, "version": None if action == "rollback" else target})
+                if not res.get("ok"):
+                    log(f"Update: {n['name']}: {res.get('error')}")
+            end = time.time() + self.WAIT_SWITCH_S
+            left = {n["ctl"]: n for n in todo}
+            while left and time.time() < end:
+                time.sleep(5)
+                for ctl, n in list(left.items()):
+                    try:
+                        st = self._get(ctl, timeout=2)
+                    except (OSError, ValueError):
+                        continue  # restarting
+                    up = st.get("update") or {}
+                    rel = up.get("release")
+                    if (action == "rollback" and rel and rel != n["release"]) or rel == target \
+                            or up.get("phase") == "failed":
+                        if up.get("phase") == "failed":
+                            log(f"Update: {n['name']} failed ({up.get('error')}); it stays on its release")
+                        left.pop(ctl)
+            for n in left.values():
+                log(f"Update: {n['name']} didn't report back; it is switched when it answers again")
+            res = request_update({"action": action, "version": None if action == "rollback" else target})
+            if not res.get("ok"):
+                self.status = f"Der Master kann sich nicht umstellen: {res.get('error')}"
+            else:
+                self.status = f"{what}: jetzt der Master (der Server startet neu) ..."
+        finally:
+            self.busy = False
+
+    # Dashboard --------------------------------------------------------------
+
+    def info(self) -> dict:
+        target, st = self.target()
+        with self.lock:
+            nodes = list(self.nodes)
+        return {"release": own_version(), "rpc": RPC_VERSION, "installed": bool(st), "target": target,
+                "latest": st.get("latest"), "latest_rpc": st.get("latest_rpc"), "prepared": st.get("prepared"),
+                "phase": st.get("phase") or "", "error": st.get("error") or "", "auto": bool(st.get("auto")),
+                "checked": st.get("checked"), "channel": st.get("channel") or "stable",
+                "previous": st.get("previous"), "status": self.status, "busy": self.busy,
+                "phones_in_plan": self._phones_in_plan(), "nodes": nodes,
+                "can_update": UPDATE_HELPER.exists() and os.access(RUN_DIR, os.W_OK)}
+
+    def api(self, body: dict) -> dict:
+        action = str(body.get("action") or "")
+        if action == "check":  # check and build: here and on every PC
+            res = request_update({"action": "prepare"})
+            for n in self.nodes:
+                if n["keyed"] and n["can_update"] and n["phase"] != "building":
+                    self._ask(n, "prepare", None, every_s=0)
+        elif action == "now":
+            target, _ = self.target()
+            if not target:
+                return {"ok": False, "error": "keine neue Version gebaut", **self.info()}
+            self.tick(force=True)
+            res = {"ok": True}
+        elif action == "rollback":
+            if self.busy:
+                return {"ok": False, "error": "ein Umstellen läuft gerade", **self.info()}
+            import threading
+
+            self.busy = True
+            threading.Thread(target=self.switch, args=(own_version(), self.poll(), "rollback"), daemon=True).start()
+            res = {"ok": True}
+        elif action == "auto":
+            res = request_update({"action": "auto", "value": bool(body.get("value"))})
+        else:
+            res = {"ok": False, "error": "unknown action"}
+        return {**res, **self.info()}
+
+    def loop(self) -> None:
+        time.sleep(20)  # let the dashboard see the workers first
+        while not self.sup.stopping:
+            try:
+                self.tick()
+            except Exception as e:  # noqa: BLE001 - updates must never stop the server
+                log(f"Update: {type(e).__name__}: {e}")
+            time.sleep(30)
+
+    def start(self) -> None:
+        import threading
+
+        threading.Thread(target=self.loop, daemon=True).start()
 
 
 # ── Hosts ────────────────────────────────────────────────────────────────────
@@ -3414,8 +4200,9 @@ class HostAgent:
                   "ctx": self.ctx, "estimate_tps": self.estimate_tps, "api_port": self.args.api_port,
                   "progress": self._progress() if self.state == "downloading" else None,
                   "mac": self.mac, "bcast": self.bcast,
-                  "can_sleep": os.geteuid() == 0 or Path("/etc/systemd/system/privatelm-suspend.path").exists(),
-                  "switchable": can_switch_role()}
+                  "can_sleep": os.geteuid() == 0 or Path("/etc/systemd/system/myrmid-suspend.path").exists(),
+                  "switchable": can_switch_role(), "keyed": True, "release": own_version(),
+                  "update": update_brief()}
         st["metrics"] = self._metrics()
         st["stats"] = self.stats.sample()
         st["models"] = sorted({p.stem.split("-00001-of-")[0] for p in self.models_dir.glob("*.gguf")}) \
@@ -3592,11 +4379,12 @@ def cmd_host(args) -> None:
     key = read_cluster_key(args.key, args.key_file)
     if not key:
         die("A host needs the cluster key (the master's API key): --key, --key-file, or the systemd "
-            "credential cluster_key. On the master: privatelm-node key")
+            "credential cluster_key. On the master: myrmid key")
     agent = HostAgent(args, key)
     handler = _json_handler({"/status": agent.status},
                             {"/assign": agent.assign, "/unload": agent.unload, "/sleep": agent.sleep,
-                             "/role": lambda body: request_role(str(body.get("role") or ""))}, key=key)
+                             "/role": lambda body: request_role(str(body.get("role") or "")),
+                             "/update": request_update}, key=key)
     if not _start_http(args.host, args.port, handler):
         die(f"Port {args.port} is busy.")
     devices = probe(bench=True)
@@ -3609,7 +4397,7 @@ def cmd_host(args) -> None:
         f"llama-server on port {args.api_port}; {gpu_txt}")
     advs = []
     if not args.no_advertise:
-        adv = Advertiser(HOST_TYPE, f"PrivateLM Host {socket.gethostname()}", args.port,
+        adv = Advertiser(HOST_TYPE, f"MyrmidLM Host {socket.gethostname()}", args.port,
                          {"id": agent.id, "host": socket.gethostname(), "api": str(args.api_port),
                           "gpu": gpu_txt[:120], "vram": str(vram), "v": "1",
                           **({"mac": agent.mac, "bcast": agent.bcast} if agent.mac else {})}, address)
@@ -3638,13 +4426,16 @@ def cmd_host(args) -> None:
 def cmd_key(args) -> None:
     """Prints the master's API key, which hosts use as the cluster key: the
     service's (installed with the script) if there is one, else this user's."""
-    service = Path("/var/lib/privatelm-node/privatelm-node/api_key")
-    try:
-        if service.is_file():
-            print(service.read_text().strip())
-            return
-    except OSError:
-        die(f"{service} is the service's key; read it with sudo: sudo {sys.argv[0]} key")
+    for service in (Path("/var/lib/myrmid/myrmid/api_key"), Path("/var/lib/private/myrmid/myrmid/api_key"),
+                    # before the rename, or moved by install.sh but the service hasn't started since:
+                    Path("/var/lib/private/myrmid/privatelm-node/api_key"),
+                    Path("/var/lib/privatelm-node/privatelm-node/api_key")):
+        try:
+            if service.is_file():
+                print(service.read_text().strip())
+                return
+        except OSError:
+            die(f"{service} is the service's key; read it with sudo: sudo {sys.argv[0]} key")
     print(_api_key())
 
 
@@ -3656,7 +4447,7 @@ def cmd_key(args) -> None:
 # model may be split across workers; the fast one runs on a single device,
 # so simple answers come back with no network round trips.
 #
-# Overrides per request: model "fast" or "big", or header X-PrivateLM-Route.
+# Overrides per request: model "fast" or "big", or header X-Myrmid-Route.
 # On/off and the decision method can be changed live from the dashboard.
 
 ROUTER_STATE = CONFIG_DIR / "router.json"
@@ -3728,6 +4519,7 @@ class Router:
         self.recent: list[dict] = []
         self.on_timings = None  # callback(timings) for requests the master's big model ran alone
         self.waker = None  # callback(backend) -> backend once awake, or None: wake a sleeping host
+        self.last_request = 0.0  # when the last request came in (updates wait for a quiet moment)
 
     @property
     def big(self) -> Backend:
@@ -3835,8 +4627,10 @@ class Router:
         return (b or self.big), reason + ", nichts anderes bereit"
 
     def decide(self, body: dict, headers) -> tuple[Backend, str]:
-        forced = ((headers.get("X-PrivateLM-Route") or "").strip() or str(body.get("model", "")).strip()).lower()
-        if forced and forced != self.public_name.lower():
+        forced = ((headers.get("X-Myrmid-Route") or headers.get("X-PrivateLM-Route") or "").strip()
+                  or str(body.get("model", "")).strip()).lower()
+        # "privatelm" was the router's name before the rename: clients set up then keep working
+        if forced and forced not in (self.public_name.lower(), "privatelm"):
             group = [b for b in self.backends if forced in (b.group.lower(), b.label.lower())]
             if group:
                 b = self.choose(group)
@@ -3964,11 +4758,11 @@ class Router:
                 path = self.path.split("?", 1)[0]
                 if path in ("/v1/models", "/models"):
                     now = int(time.time())
-                    data = [{"id": router.public_name, "object": "model", "owned_by": "privatelm", "created": now}]
+                    data = [{"id": router.public_name, "object": "model", "owned_by": "myrmid", "created": now}]
                     for role in ("fast", "big"):
                         bs = router.role(role)
                         if bs:
-                            data.append({"id": role, "object": "model", "owned_by": "privatelm", "created": now,
+                            data.append({"id": role, "object": "model", "owned_by": "myrmid", "created": now,
                                          "meta": {"models": sorted({b.label for b in bs})}})
                     seen = set()
                     for b in router.backends:
@@ -3977,7 +4771,7 @@ class Router:
                             continue
                         seen.add(g.lower())
                         where = sorted({x.where for x in router.backends if (x.group or x.label) == g})
-                        data.append({"id": g, "object": "model", "owned_by": "privatelm", "created": now,
+                        data.append({"id": g, "object": "model", "owned_by": "myrmid", "created": now,
                                      "meta": {"model": b.label, "hosts": where}})
                     return self._json(200, {"object": "list", "data": data})
                 if path == "/health":
@@ -4024,6 +4818,7 @@ class Router:
                     alone = backend.inflight == 0
                     backend.inflight += 1
                     backend.served += 1
+                    router.last_request = time.time()
                 tail = b""
                 try:
                     try:
@@ -4035,10 +4830,10 @@ class Router:
                     try:
                         self.send_response(resp.status)
                         self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
-                        self.send_header("X-PrivateLM-Route", backend.name)
-                        self.send_header("X-PrivateLM-Backend", f"{backend.group or backend.label}@{backend.where}"
+                        self.send_header("X-Myrmid-Route", backend.name)
+                        self.send_header("X-Myrmid-Backend", f"{backend.group or backend.label}@{backend.where}"
                                          .encode("ascii", "replace").decode())
-                        self.send_header("X-PrivateLM-Reason", reason.encode("ascii", "replace").decode())
+                        self.send_header("X-Myrmid-Reason", reason.encode("ascii", "replace").decode())
                         self.send_header("Transfer-Encoding", "chunked")
                         self.end_headers()
                         while True:
@@ -4586,10 +5381,10 @@ def plan_draft(args, path: str, devices: list[Device]) -> tuple[list[str], dict,
 
 # ── Models ───────────────────────────────────────────────────────────────────
 #
-# privatelm-node models   GGUF files on this PC plus a small catalog, each
+# myrmid models   GGUF files on this PC plus a small catalog, each
 #                         rated: fits here / needs workers / too big, and
 #                         whether this build knows its architecture.
-# privatelm-node download fetches a catalog model (or repo[:quant]) from
+# myrmid download fetches a catalog model (or repo[:quant]) from
 #                         Hugging Face, resumable, checked by SHA-256.
 #
 # The catalog names repositories only; file names, sizes and architectures
@@ -4608,7 +5403,7 @@ CATALOG = [
 MODEL_DIRS = ["~/models", "~/Models", "~/Downloads", "/srv/models", "/opt/models", "~/.cache/llama.cpp",
               "~/.cache/huggingface/hub", "~/.lmstudio/models", "~/.cache/lm-studio/models"]
 SPLIT_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
-HF_BASE = os.environ.get("PRIVATELM_HF_BASE", "https://huggingface.co").rstrip("/")  # or a mirror
+HF_BASE = env("HF_BASE", "https://huggingface.co").rstrip("/")  # or a mirror
 
 
 def supported_archs() -> Optional[set]:
@@ -4677,7 +5472,7 @@ def hf_resolve(repo: str, quant: str) -> dict:
     SHA-256 and the GGUF architecture."""
     import urllib.request
 
-    headers = {"User-Agent": "privatelm-node"}
+    headers = {"User-Agent": "myrmid"}
     if os.environ.get("HF_TOKEN"):
         headers["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
     req = urllib.request.Request(f"{HF_BASE}/api/models/{repo}?blobs=true", headers=headers)
@@ -4789,7 +5584,7 @@ def cmd_models(args) -> None:
         mark = " *" if res["recommended"] == i - 1 else ""
         print(f"{i:>2}. {e['name']:<34} {size}  {state:<26} {where}{mark}")
     if res["recommended"] is not None:
-        print("\n* Empfehlung. Herunterladen mit: privatelm-node download <Name aus der Liste oder Nummer>")
+        print("\n* Empfehlung. Herunterladen mit: myrmid download <Name aus der Liste oder Nummer>")
 
 
 class ModelError(Exception):
@@ -4803,7 +5598,7 @@ def resolve_spec(target: str) -> tuple[str, str]:
             return repo, quant
     repo, _, quant = target.partition(":")
     if "/" not in repo:
-        raise ModelError(f"Unknown model {target}: a catalog name (privatelm-node models), or user/repo[:QUANT]")
+        raise ModelError(f"Unknown model {target}: a catalog name (myrmid models), or user/repo[:QUANT]")
     return repo, quant or "Q4_K_M"
 
 
@@ -4879,7 +5674,7 @@ def _download_urllib(url: str, part: Path) -> None:
     import urllib.request
 
     have = part.stat().st_size if part.exists() else 0
-    headers = {"User-Agent": "privatelm-node", **({"Range": f"bytes={have}-"} if have else {})}
+    headers = {"User-Agent": "myrmid", **({"Range": f"bytes={have}-"} if have else {})}
     if os.environ.get("HF_TOKEN"):
         headers["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
     with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r, \
@@ -4888,7 +5683,8 @@ def _download_urllib(url: str, part: Path) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="privatelm-node", description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(prog="myrmid", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--version", action="version", version=f"MyrmidLM {own_version()} ({RPC_VERSION})")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("detect", help="list devices, free memory and bandwidth").set_defaults(fn=cmd_detect)
@@ -4944,7 +5740,7 @@ def main() -> None:
     s.add_argument("--port", type=int, default=DEFAULT_API_PORT)
     s.add_argument("--ctx", type=int, default=None,
                    help="context length (default 8192, shrunk automatically down to 2048 if it doesn't fit)")
-    s.add_argument("--api-key", help="default: generated once, kept in ~/.config/privatelm-node")
+    s.add_argument("--api-key", help="default: generated once, kept in ~/.config/myrmid")
     s.add_argument("--mtp", type=int, default=0,
                    help="MTP draft depth (models with MTP layers; find the best with tune-mtp)")
     s.add_argument("--ram-limit", type=float,
@@ -4958,7 +5754,7 @@ def main() -> None:
                    help="route requests between the models (auto: last setting from the dashboard, else on)")
     s.add_argument("--router-mode", choices=["heuristic", "model"],
                    help="heuristic: rules on the request; model: the fast model judges (default: last setting)")
-    s.add_argument("--model-name", default="privatelm", help="model name clients see with the router")
+    s.add_argument("--model-name", default="myrmid", help="model name clients see with the router")
     s.add_argument("--moe-cache", default="auto",
                    help="MoE models whose experts don't all fit on the GPU: auto (GPU memory left over caches "
                         "the most used experts), MIB (at most this much), or off (fixed split, --n-cpu-moe)")
@@ -4991,7 +5787,7 @@ def main() -> None:
 
     b = sub.add_parser("bench", help="measure tokens/s and network traffic per token (run on the master)")
     b.add_argument("--url", default=f"http://127.0.0.1:{DEFAULT_API_PORT}")
-    b.add_argument("--api-key", help="default: the key privatelm-node serve created")
+    b.add_argument("--api-key", help="default: the key myrmid serve created")
     b.add_argument("--tokens", type=int, default=64)
     b.add_argument("--temp", type=float, default=0.7, help="the temperature you actually use (default 0.7)")
     b.add_argument("--context", type=int, default=0, help="fill the prompt with ~N tokens first")
@@ -5041,6 +5837,18 @@ def main() -> None:
     sc.add_argument("--timeout", type=float, default=4.0)
     sc.add_argument("--json", action="store_true")
     sc.set_defaults(fn=cmd_scan)
+
+    up = sub.add_parser("update", help="versions and updates (check, prepare, activate need sudo)",
+                        description="status: this PC's release and the newest one. check: ask the repo. "
+                                    "prepare [VERSION]: build it next to the running one. activate [VERSION]: "
+                                    "switch to it (the master's dashboard does this for the whole cluster). "
+                                    "rollback: back to the previous release. auto [on|off]: the daily timer's "
+                                    "run, or switch automatic updates on or off.")
+    up.add_argument("what", nargs="?", default="status",
+                    choices=("status", "check", "prepare", "activate", "rollback", "auto", "apply-request"))
+    up.add_argument("version", nargs="?", help="release (e.g. 1.2.0); for auto: on or off")
+    up.add_argument("--json", action="store_true")
+    up.set_defaults(fn=cmd_update)
 
     args = ap.parse_args()
     if getattr(args, "extra", None) and args.extra[:1] == ["--"]:

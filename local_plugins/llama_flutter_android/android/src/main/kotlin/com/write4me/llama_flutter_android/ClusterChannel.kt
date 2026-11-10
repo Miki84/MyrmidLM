@@ -43,7 +43,7 @@ class ClusterChannel(
     companion object {
         private const val TAG = "ClusterChannel"
 
-        /** PCs running `privatelm-node serve` (linux-node/). */
+        /** PCs running `myrmid serve` (node/). */
         const val SERVER_SERVICE_TYPE = "_privatelm-api._tcp."
     }
 
@@ -52,7 +52,7 @@ class ClusterChannel(
      * treats as background work and moves to slow cores once it's busy:
      * measured on an S24, its "moderate" cpuset has 4 of 8 cores, even with
      * battery Unrestricted. Binding it with BIND_IMPORTANT gives it this app's
-     * priority, so while PrivateLM is on screen the worker gets all cores.
+     * priority, so while MyrmidLM is on screen the worker gets all cores.
      * No BIND_AUTO_CREATE: this never starts the worker, it only attaches
      * whenever the worker runs.
      */
@@ -107,7 +107,7 @@ class ClusterChannel(
             }
             "localFreeRamMb" -> result.success(ClusterWorkerService.availableRamMb(context))
             "setKeepScreenOn" -> {
-                // A worker is only at full speed while PrivateLM is on screen
+                // A worker is only at full speed while MyrmidLM is on screen
                 // (it borrows the app's priority), so keep the screen on.
                 val on = call.argument<Boolean>("on") == true
                 activity?.runOnUiThread {
@@ -207,7 +207,7 @@ class ClusterChannel(
             } else {
                 WifiManager.WIFI_MODE_FULL_HIGH_PERF
             }
-            wifiLock = wifi.createWifiLock(mode, "PrivateLM:ClusterMaster").apply { acquire() }
+            wifiLock = wifi.createWifiLock(mode, "MyrmidLM:ClusterMaster").apply { acquire() }
         } else if (!on) {
             wifiLock?.takeIf { it.isHeld }?.release()
             wifiLock = null

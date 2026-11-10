@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PrivateLM-Cluster</title>
+<title>MyrmidLM-Cluster</title>
 <style>
   :root {
     --bg: #0f1e28;
@@ -95,6 +95,7 @@
   .tag { font-weight: 600; }
   .rebalance { margin-bottom: 16px; display: grid; grid-template-columns: minmax(260px, 1fr) 1.4fr; gap: 26px; }
   .reb-state { margin: 0; font-size: 0.92rem; }
+  .up-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
   #reb-events li { grid-template-columns: 62px 1fr; }
   @media (max-width: 900px) { .router, .rebalance { grid-template-columns: 1fr; } }
   .router-off { margin-bottom: 16px; color: var(--muted); font-size: 0.9rem; }
@@ -220,8 +221,8 @@
 <body>
 <div class="login" id="login" hidden>
   <form id="login-form">
-    <h1>PrivateLM-Cluster</h1>
-    <p class="muted" style="margin:0">Geben Sie den API-Key des Servers ein. Er steht beim Start von <code>privatelm-node serve</code> im Terminal, als Dienst in <code>/var/lib/privatelm-node/privatelm-node/api_key</code>.</p>
+    <h1>MyrmidLM-Cluster</h1>
+    <p class="muted" style="margin:0">Geben Sie den API-Key des Servers ein. Er steht beim Start von <code>myrmid serve</code> im Terminal, als Dienst in <code>/var/lib/myrmid/myrmid/api_key</code>.</p>
     <label for="key">API-Key</label>
     <input id="key" type="password" autocomplete="current-password" required>
     <p class="note bad" id="login-error" hidden>Dieser Key passt nicht zum Server.</p>
@@ -232,7 +233,7 @@
 <div class="wrap" id="app">
   <header class="top">
     <div>
-      <h1>PrivateLM-Cluster</h1>
+      <h1>MyrmidLM-Cluster</h1>
       <div class="model" id="model">Verbinde mit dem Master …</div>
       <details class="model-switch" id="model-switch">
         <summary>Modell wechseln</summary>
@@ -247,7 +248,7 @@
     <div class="pill" id="state"><span class="dot"></span><span>Verbinde …</span></div>
   </header>
 
-  <div class="banner" id="offline" hidden>Der Master antwortet nicht. Läuft <code>privatelm-node serve</code> noch?</div>
+  <div class="banner" id="offline" hidden>Der Master antwortet nicht. Läuft <code>myrmid serve</code> noch?</div>
 
   <section class="live" aria-label="Live-Werte">
     <div>
@@ -316,6 +317,26 @@
     <div>
       <p class="reb-state" id="reb-state"></p>
       <ul class="decisions" id="reb-events" aria-label="Letzte Ereignisse"></ul>
+    </div>
+  </section>
+
+  <section class="panel rebalance" id="update-panel" aria-labelledby="up-title">
+    <div class="router-controls">
+      <div class="panel-head" style="margin:0"><h2 id="up-title">Version</h2><span class="muted num" id="up-version"></span></div>
+      <div class="switch-row">
+        <button class="switch" id="up-switch" role="switch" aria-checked="false" aria-labelledby="up-switch-label" type="button"></button>
+        <span id="up-switch-label">Automatisch aktualisieren</span>
+      </div>
+      <p class="muted" id="up-explain" style="margin:0"></p>
+      <div class="up-buttons">
+        <button class="btn" id="up-check" type="button">Jetzt prüfen</button>
+        <button class="btn" id="up-now" type="button" hidden>Jetzt umstellen</button>
+        <button class="btn quiet" id="up-back" type="button" hidden>Zurück auf vorige Version</button>
+      </div>
+    </div>
+    <div>
+      <p class="reb-state" id="up-state"></p>
+      <table class="lan"><thead><tr><th>Rechner</th><th>Version</th><th>Gebaut</th><th>Zustand</th></tr></thead><tbody id="up-nodes"></tbody></table>
     </div>
   </section>
 
@@ -616,7 +637,7 @@ function renderMachines(s) {
       const loading = st !== "ready";
       if (w.connected) { stateText = loading ? "Bekommt Layer" : "Verbunden"; dot = loading ? "warn" : "ok"; }
       else if (w.online) { stateText = "Im Netz"; dot = "warn"; extra = `<div class="note">Das Handy ist im Netz, der Server ist gerade nicht mit ihm verbunden.</div>`; }
-      else { dot = "bad"; stateText = "Nicht gefunden"; extra = `<div class="note bad">Das Handy ist nicht mehr im Netz zu sehen. Läuft der Worker-Modus in der App? Akku-Optimierung für PrivateLM ausschalten, Bildschirm an lassen.</div>`; }
+      else { dot = "bad"; stateText = "Nicht gefunden"; extra = `<div class="note bad">Das Handy ist nicht mehr im Netz zu sehen. Läuft der Worker-Modus in der App? Akku-Optimierung für MyrmidLM ausschalten, Bildschirm an lassen.</div>`; }
       if (loading && w.connected) extra = `<div class="note">Der Master schickt dem Handy seine Layer. Über WLAN dauert das einige Minuten.</div>`;
     } else if (!w.online) { dot = "bad"; stateText = "Nicht erreichbar"; extra = `<div class="note bad">Keine Verbindung zu ${esc((w.endpoints || []).join(", "))}. Läuft der Worker, und ist die Firewall offen?</div>`; }
     else if (w.status_missing) { dot = "warn"; stateText = "Ohne Messwerte"; extra = `<div class="note">Der Worker rechnet, meldet aber keine Messwerte (Port ${w.status_port}). Worker mit neuer Version starten.</div>`; }
@@ -814,6 +835,58 @@ async function setRebalance(body) {
   delete sw.dataset.busy;
 }
 
+const phaseText = { checking: "prüft", building: "baut", activating: "stellt um", failed: "Fehler", idle: "" };
+function renderUpdate(s) {
+  const u = s.update || {}, panel = $("update-panel");
+  if (!u.installed) {
+    $("up-version").textContent = u.release ? `${u.release}` : "";
+    $("up-explain").textContent = "Updates sind auf diesem Master nicht eingerichtet: mit install.sh installieren.";
+    ["up-switch", "up-check"].forEach((id) => { $(id).disabled = true; });
+    $("up-state").textContent = ""; $("up-nodes").innerHTML = "";
+    return;
+  }
+  $("up-version").textContent = `${u.release} · ${u.rpc}`;
+  const sw = $("up-switch");
+  sw.disabled = !u.can_update;
+  if (!sw.dataset.busy) sw.setAttribute("aria-checked", String(!!u.auto));
+  $("up-explain").textContent = u.auto
+    ? "Jede Nacht sucht jeder PC nach einer neuen Version und baut sie neben der laufenden. Haben alle sie gebaut, stellt der Master den ganzen Cluster zusammen um, sobald zwei Minuten lang keine Anfrage läuft. Kommt ein Dienst danach nicht hoch, geht der PC von selbst zurück."
+    : "Aus: Neue Versionen werden gebaut, umgestellt wird erst, wenn du auf Jetzt umstellen klickst.";
+  const checked = u.checked ? new Date(u.checked * 1000).toLocaleString("de-DE", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : null;
+  let state = u.status || "";
+  if (!state) {
+    if (u.phase === "building") state = `Baut ${u.prepared || u.latest || "die neue Version"} im Hintergrund (das Modell läuft weiter).`;
+    else if (u.phase === "failed") state = `Fehler: ${u.error}`;
+    else if (u.latest && u.latest === u.release) state = `Aktuell${checked ? ` (geprüft ${checked})` : ""}.`;
+    else if (u.latest) state = `Neu: ${u.latest}${checked ? ` (geprüft ${checked})` : ""}.`;
+    else state = checked ? `Geprüft ${checked}.` : "Noch nicht geprüft.";
+  }
+  if (u.error && u.phase !== "failed" && !u.status) state += ` (${u.error})`;
+  $("up-state").textContent = state;
+  $("up-check").disabled = !u.can_update || u.phase === "building" || u.busy;
+  $("up-now").hidden = !u.target;
+  $("up-now").disabled = !!u.busy;
+  $("up-now").textContent = u.target ? `Jetzt auf ${u.target} umstellen` : "Jetzt umstellen";
+  $("up-back").hidden = !u.previous || !!u.target;
+  $("up-back").disabled = !!u.busy;
+  const row = (name, rel, prep, phase, err, note) => `<tr><td>${esc(name)}</td><td class="num">${esc(rel || "?")}</td><td class="num">${esc(prep || "–")}</td><td>${esc(err ? "Fehler: " + err : (phaseText[phase] ?? phase) || note || "")}</td></tr>`;
+  $("up-nodes").innerHTML = row(`${s.master.host} (Master)`, u.release, u.prepared, u.phase, u.phase === "failed" ? u.error : "", "")
+    + (u.nodes || []).map((n) => row(n.name + (n.kind === "host" ? " (Host)" : ""), n.release, n.prepared, n.phase,
+        n.phase === "failed" ? n.error : "", !n.keyed ? "ohne Cluster-Key: stellt sich selbst um" : !n.can_update ? "ohne Updater (install.sh)" : "")).join("");
+}
+
+async function setUpdate(body, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  const sw = $("up-switch");
+  if ("value" in body) sw.dataset.busy = "1";
+  try {
+    const r = await api("/api/update", { method: "POST", body: JSON.stringify(body) });
+    if (last) { last.update = { ...(last.update || {}), ...r }; renderUpdate(last); }
+    if (r.ok === false && r.error) alert(r.error);
+  } catch (e) { /* next poll */ }
+  delete sw.dataset.busy;
+}
+
 function renderBench(s) {
   const b = s.bench || {}, btn = $("bench-btn"), ready = s.master.llama?.status === "ready";
   btn.disabled = !!b.running || !ready;
@@ -828,7 +901,7 @@ function renderBench(s) {
 function render(s) {
   colors = { master: "var(--c0)" };
   (s.plan.machines || []).filter((m) => m.role === "worker").forEach((m, i) => { colors[m.id] = `var(--c${(i + 1) % 6})`; });
-  renderHeader(s); renderLive(s); renderRouter(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderRebalance(s); renderHosts(s); renderBench(s); renderModelSwitch(s);
+  renderHeader(s); renderLive(s); renderRouter(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderRebalance(s); renderHosts(s); renderBench(s); renderModelSwitch(s); renderUpdate(s);
 }
 
 /* ── Polling, login ──────────────────────────────────────────────────── */
@@ -887,6 +960,23 @@ $("reb-switch").addEventListener("click", () => {
   setRebalance({ enabled: on });
 });
 $("reb-now").addEventListener("click", () => { $("reb-now").disabled = true; setRebalance({ now: true }); });
+
+$("up-switch").addEventListener("click", () => {
+  const on = $("up-switch").getAttribute("aria-checked") !== "true";
+  $("up-switch").setAttribute("aria-checked", String(on));
+  setUpdate({ action: "auto", value: on });
+});
+$("up-check").addEventListener("click", () => { $("up-check").disabled = true; setUpdate({ action: "check" }); });
+$("up-now").addEventListener("click", () => {
+  const u = (last && last.update) || {};
+  const phones = u.phones_in_plan && u.latest_rpc && u.latest_rpc !== u.rpc
+    ? `\n\nAchtung: ${u.target} spricht ${u.latest_rpc}, die Handys im Plan noch ${u.rpc}. Sie fallen heraus, bis sie die neue App haben.` : "";
+  setUpdate({ action: "now" }, `Alle PCs jetzt auf ${u.target} umstellen? Laufende Anfragen brechen ab, das Modell wird neu geladen.${phones}`);
+});
+$("up-back").addEventListener("click", () => {
+  const u = (last && last.update) || {};
+  setUpdate({ action: "rollback" }, `Alle PCs zurück auf ${u.previous || "die vorige Version"}? Das Modell wird neu geladen.`);
+});
 
 window.addEventListener("resize", () => { if (last) renderSplit(last); });
 tick();

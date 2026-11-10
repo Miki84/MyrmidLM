@@ -41,7 +41,7 @@ class UpdateSheet extends StatelessWidget {
                       color: t.text)),
               const SizedBox(height: 2),
               Text(
-                  'PrivateLM ${release.version}'
+                  'MyrmidLM ${release.version}'
                   '${release.apkSize > 0 ? ' · ${_mb(release.apkSize)}' : ''}'
                   '${updates.currentVersion.value.isNotEmpty ? ' · you have ${updates.currentVersion.value}' : ''}',
                   style: t.caption),
@@ -82,7 +82,7 @@ class UpdateSheet extends StatelessWidget {
         const SizedBox(height: 16),
         if (updates.needsInstallPermission.value) ...[
           const AppNotice(
-            'Allow PrivateLM to install apps, then come back. '
+            'Allow MyrmidLM to install apps, then come back. '
             'The installer opens automatically.',
             icon: Icons.lock_open_rounded,
           ),

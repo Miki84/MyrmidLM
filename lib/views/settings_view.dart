@@ -150,7 +150,7 @@ class SettingsView extends GetView<SettingsController> {
                   child: Image.asset('assets/icons/appicon.png',
                       width: 32, height: 32),
                 ),
-                title: 'PrivateLM',
+                title: 'MyrmidLM',
                 subtitle: controller.appVersion.value.isEmpty
                     ? 'by orailnoor & techjarves'
                     : 'Version ${controller.appVersion.value} · by orailnoor & techjarves',

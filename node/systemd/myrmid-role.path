@@ -1,0 +1,8 @@
+[Unit]
+Description=MyrmidLM: role change requested by the master
+
+[Path]
+PathExists=/run/myrmid/role
+
+[Install]
+WantedBy=multi-user.target

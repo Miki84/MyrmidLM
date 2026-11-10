@@ -1,191 +1,123 @@
-# PrivateLM
+# MyrmidLM
 
-[![Live Web App](https://img.shields.io/badge/Live_Demo-Try_Web_App-02569B?style=for-the-badge&logo=flutter&logoColor=white)](https://ai-chat-orailnoor.web.app/)
+**Viele kleine Rechner, ein großes Sprachmodell.** MyrmidLM bündelt Linux-PCs (NVIDIA, AMD, Intel) und Android-Handys im eigenen Netz zu einem Cluster. Er stellt lokale LLMs als OpenAI-kompatible API bereit, mit Dashboard, Router und automatischen Updates.
 
-A production-ready, cross-platform AI chat client built with Flutter. It unifies local on-device LLM inference (Android) with cloud API access, giving users full control over how their models run.
+*Many small machines, one large language model: a self-hosted LLM cluster of Linux PCs and phones on your own network.*
 
-![Image generation tested on Moto G71 (Snapdragon), Oneplus 10r (Mediatek), Pixel 6A (Tensor), Poco F1 (Snapdragon), Samsung s23 (Snapdragon) 4 steps fast](PrivateLM.png)
-_Image generation tested on Moto G71 (Snapdragon), Oneplus 10r (Mediatek), Pixel 6A (Tensor), Poco F1 (Snapdragon), Samsung s23 (Snapdragon) 4 steps fast_
+Der Name kommt von den Myrmidonen, griechisch μύρμηξ, „Ameise“: viele, die zusammen etwas tragen, das keiner allein schafft.
 
-![Generated on pixel 6 with 20 step](IMG_2390.png)
-_Generated on pixel 6 with 20 step_
+## Was es kann
 
----
+- **Ein Modell über mehrere Rechner verteilen.** Ein Master verteilt die Layer auf seine GPU(s) und auf Worker (PCs mit GPU oder RAM, Handys). Die schnellsten Geräte füllt er zuerst und plant automatisch neu, wenn Geräte dazukommen oder wegfallen.
+- **Mehrere ganze Modelle, ein Endpunkt.** Hosts laden je ein ganzes Modell, der Router des Masters verteilt die Anfragen nach Name, Regeln und Auslastung.
+- **Schneller dank Messungen.** Der Planer lernt aus echten Messungen. Ein Entwurfsmodell (Speculative Decoding), MTP und ein MoE-Expertencache bringen zusätzliches Tempo.
+- **Selbstverwaltend.** Wake-on-LAN und Schlaf, immer die schnellste Verbindung (Kabel vor WLAN). Das Modell und die Rolle eines PCs lassen sich im Dashboard umstellen.
+- **Installation in einem Schritt.** Das Installationsskript erledigt Treiber (NVIDIA inklusive älterer Karten und Secure Boot), CUDA oder Vulkan, den Build, die Firewall und die Dienste.
+- **Updates für den ganzen Cluster.** Jeder PC baut neue Versionen im Hintergrund. Der Master stellt alle zusammen um und geht zurück, wenn etwas nicht hochkommt.
 
-## What It Does
+## Installation
 
-- **Local Inference on Android** — Download and run GGUF models directly on your phone using GPU-accelerated inference (Vulkan). No internet required after download.
-- **Cloud API Fallback** — Seamlessly switch to OpenAI, Anthropic, Google Gemini, or Kimi (Moonshot AI) when you need more power or are on unsupported platforms.
-- **Multimodal Chat** — Send text and images in conversations. Vision support works with both local models (Qwen2-VL) and cloud providers.
-- **Persistent Sessions** — All chats and settings are stored locally via Hive. Nothing leaves your device unless you explicitly choose cloud mode.
-- **Background Services** — Firebase Cloud Messaging integration for push updates and background task handling.
-- **Smart Auto-Configuration** — On first launch, the app detects your device's RAM and recommends optimal context size and token limits automatically.
-- **Task Management (in development)** — A task view for structured, multi-step AI workflows is being built. It is not available in the app yet.
-
----
-
-## Technical Architecture
-
-### Stack
-
-- **Framework:** Flutter 3.x (Dart >=3.3.0)
-- **State Management:** GetX
-- **Local Storage:** Hive
-- **Networking:** Dio + `package:http`
-- **Background Execution:** `flutter_background_service` + `flutter_local_notifications`
-- **Push Notifications:** Firebase Core + Firebase Messaging
-
-### Inference Pipeline
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        UI Layer                              │
-│   ChatView / ModelView / ServerView / SettingsView          │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│                    Controllers (GetX)                        │
-│   ChatController · TaskController · ModelController         │
-│   SettingsController · HomeController                       │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│                      Services                                │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────┐ │
-│  │ InferenceService│  │  CloudService   │  │DownloadSvc  │ │
-│  │  (local GGUF)   │  │ (OpenAI/Claude/ │  │ (model dl)  │ │
-│  │                 │  │  Gemini/Kimi)   │  │             │ │
-│  └─────────────────┘  └─────────────────┘  └─────────────┘ │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────┐ │
-│  │  HiveService    │  │ DeviceInfoSvc   │  │ExecutionSvc │ │
-│  │  ( persistence) │  │  (RAM/GPU tier) │  │ (bg tasks)  │ │
-│  └─────────────────┘  └─────────────────┘  └─────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Local Inference (Android)
-
-The app uses `llama_flutter_android`, a custom Flutter plugin wrapping `llama.cpp` for ARM64 devices. At runtime it:
-
-1. **Detects GPU capabilities** via Vulkan to determine offload layers.
-2. **Selects thread count** based on device tier (ultra / high / mid / low).
-3. **Loads the GGUF model** with progress streaming.
-4. **Generates tokens** via `generateChat()` with native chat-template support (ChatML, Llama-3, Gemma, Phi).
-5. **Falls back** to manual prompt construction if native templates fail.
-
-Idle detection (5s) and hard timeouts (180s) keep the UX responsive even on underpowered hardware.
-
-### Cloud Inference
-
-`CloudService` normalizes four different API shapes into a single interface:
-
-- **OpenAI** — standard `/v1/chat/completions`
-- **Anthropic** — Messages API with separate system param
-- **Google Gemini** — `generateContent` with inline image base64
-- **Kimi** — OpenAI-compatible endpoint from Moonshot AI
-
-API keys are stored in Hive and never transmitted anywhere except to the provider's endpoint.
-
-### Cross-Platform Abstraction
-
-Local inference is conditionally compiled:
-
-- **Android** → `inference_android.dart` (full llama.cpp engine)
-- **Web** → `inference_stub.dart` (cloud-only, local coming soon)
-- **iOS** → `inference_android.dart` (full llama.cpp engine via Metal GPU)
-
-The `InferenceService` exposes `supportsLocalInference` so the UI can hide local-model UI on unsupported platforms.
-
----
-
-## Supported Platforms
-
-| Platform | Local Inference | Cloud APIs | Notes                           |
-| -------- | --------------- | ---------- | ------------------------------- |
-| Android  | ✅ Yes          | ✅ Yes     | CPU offload via NEON; minSdk 28 |
-| iOS      | ✅ Yes          | ✅ Yes     | Metal GPU acceleration          |
-| Web      | ❌ No           | ✅ Yes     | Cloud-only (local coming soon)  |
-
-### Linux PCs with GPUs (cluster node)
-
-A Linux PC with an NVIDIA (CUDA), AMD (ROCm), Intel (SYCL) or any Vulkan GPU can join the phone cluster:
-
-- **GPU worker:** `privatelm-node worker` lends the PC's GPU(s) to a phone master. Phones find it under *Phone cluster → Find nearby* or by QR code, and it takes the biggest share of the layers.
-- **Master / server:** `privatelm-node serve -m model.gguf` runs the model on the PC (optionally with phones as extra memory) behind an OpenAI-compatible API. Phones connect via *Phone cluster → Scan PC QR code* or *Find PCs*.
-
-The node is built from the same llama.cpp commit the app vendors, so the RPC protocol matches. See [`linux-node/README.md`](linux-node/README.md).
-
-### iOS / iPad (Installation via AltServer)
-The iOS/iPad release is distributed as a sideloadable IPA file. Due to the RAM requirements for local models, iPad is the recommended iOS target, but it can be installed on iPhones.
-
-Here is how you can install the app using AltStore and AltServer:
-
-**Prerequisites:**
-* Ensure **AltServer** is installed and running on your Mac or Windows PC.
-* Your iOS device must be connected to the same Wi-Fi network as your computer, or connected directly via a USB cable.
-* You must have **AltStore** successfully installed on your iOS device.
-
-**Installation Steps:**
-1. **Download the IPA:** Go to the [Releases](https://github.com/orailnoor/cross-platform-llm-client/releases) page on your iOS device (using Safari) and download the latest `PrivateLM-iOS.zip` package, extract it to get the `.ipa` file.
-2. **Open in AltStore:**
-   * Locate the extracted `.ipa` file in your device's "Files" app.
-   * Tap the **Share** button and select **AltStore** from the list of apps.
-   * *Alternatively*, you can open the AltStore app, go to the **My Apps** tab, tap the **"+" (plus)** icon in the top-left corner, and select the downloaded IPA file.
-3. **Install:** AltStore will begin installing the app. You may be prompted to enter your Apple ID credentials if this is your first time.
-4. **Enable Developer Mode:** On iOS 16 and later, ensure "Developer Mode" is enabled in your device's Settings (`Settings > Privacy & Security > Developer Mode`) to launch the sideloaded app.
-5. **Launch:** Once installation is finished, PrivateLM will appear in the **My Apps** tab in AltStore and on your device's home screen!
-
-*Note: Sideloaded apps via AltStore expire after 7 days, but AltStore will attempt to automatically refresh them in the background when connected to the same Wi-Fi as your computer running AltServer.*
-
----
-
-## Build Configuration
-
-### Prerequisites
-
-- Flutter SDK >=3.3.0
-- Android SDK (API 26+)
-- JDK 17
-- NDK (bundled with Android SDK)
-
-### Android
+Auf jedem PC (Debian, Ubuntu, Linux Mint, Pop!_OS, Fedora, Arch), als normaler Benutzer mit sudo-Rechten:
 
 ```bash
-flutter pub get
-flutter build apk --debug
+curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash
 ```
 
-Release APKs require a stable signing key. Copy
-`android/key.properties.example` to `android/key.properties`, fill in the
-keystore values, and keep both the key and its backup. Android accepts an APK
-upgrade only when it is signed with the same key as the installed APK.
+Das Skript fragt nach der Rolle:
+
+| Rolle | Was der PC tut |
+|---|---|
+| **Master** | stellt das Modell als OpenAI-API bereit (Port 8080), Dashboard auf Port 8090 |
+| **Worker** | leiht dem Master GPU und RAM für ein verteiltes Modell |
+| **Host** | lädt ein ganzes Modell, der Router des Masters schickt Anfragen hin |
+
+Zuerst den Master installieren. Für Worker und Hosts fragt das Skript nach dem API-Key des Masters (dort anzeigen mit `sudo myrmid key`). Mit dem Key kann der Master diese PCs im Dashboard umschalten und aktualisieren.
+
+Ohne Rückfragen, zum Beispiel für einen weiteren Worker:
 
 ```bash
-cp android/key.properties.example android/key.properties
-flutter build apk --release --split-per-abi
+curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash -s -- --role worker --cluster-key KEY --yes
 ```
 
-Never rotate the signing key between GitHub releases. The per-ABI APKs must
-also keep increasing the build number in `pubspec.yaml`.
+Alle Optionen zeigt `bash install.sh --help`. Das Skript kann gefahrlos erneut laufen, zum Beispiel nach dem Neustart für den NVIDIA-Treiber. Eine ältere Installation unter dem Namen PrivateLM-Node übernimmt es automatisch: Rolle, Einstellungen, API-Key, Messwerte und Modelle bleiben erhalten.
 
-### iOS
+**Handys:** Die Android-App (Ordner `lib/`, `android/`) ist Worker oder Chat-Client. Sie liegt als APK am jeweiligen [Release](https://github.com/Miki84/MyrmidLM/releases) und aktualisiert sich daraus selbst. Handys und PCs müssen dasselbe RPC-Protokoll sprechen; das Dashboard zeigt, wenn ein Handy eine andere Version hat.
+
+## Updates
+
+Eine neue Version ist ein Git-Tag `vX.Y.Z` in diesem Repo. So läuft ein Update ab:
+
+1. **Jede Nacht** (03:30 Uhr, zufällig bis zu einer Stunde später) prüft jeder PC das Repo. Gibt es eine neue Version, baut er sie im Hintergrund nach `/opt/myrmid/releases/X.Y.Z`, mit niedriger Priorität. Die laufenden Dienste merken davon nichts.
+2. **Der Master wartet**, bis alle PCs die neue Version gebaut haben und zwei Minuten lang keine Anfrage lief. Dann stellt er alle zusammen um: erst Worker und Hosts, dann sich selbst. Master und Worker müssen dasselbe RPC-Protokoll sprechen, deshalb passiert das gemeinsam.
+3. **Kommt ein Dienst nicht hoch**, geht der PC von selbst auf die vorige Version zurück. Diese Version wird danach nicht noch einmal automatisch versucht.
+
+Wenn eine neue Version das RPC-Protokoll ändert und Handys im Plan sind, stellt der Master nicht von selbst um: Die Handys brauchen erst die neue App.
+
+**Im Dashboard** (Bereich *Version*) gibt es:
+- einen Schalter für automatisches Umstellen,
+- *Jetzt prüfen* (prüft und baut auf allen PCs),
+- *Jetzt umstellen*,
+- *Zurück auf vorige Version*,
+- eine Tabelle mit dem Stand jedes PCs.
+
+**Auf der Kommandozeile:**
 
 ```bash
-flutter pub get
-cd ios
-pod install
-flutter build ios
+myrmid update                 # Stand: laufende, neueste und gebaute Version
+sudo myrmid update check      # jetzt prüfen
+sudo myrmid update prepare    # neueste bauen (ohne umzustellen)
+sudo myrmid update activate   # auf die gebaute umstellen (nur dieser PC)
+sudo myrmid update rollback   # zurück
+sudo myrmid update auto off   # nur noch auf Klick umstellen
 ```
 
-### Web
+Einstellungen stehen in `/etc/myrmid/myrmid.conf`:
+
+| Eintrag | Bedeutung |
+|---|---|
+| `REPO` | Herkunft der Updates, z. B. ein eigener Spiegel |
+| `CHANNEL` | `stable` = Releases, `main` = jeder Stand von main |
+| `AUTO` | automatisch umstellen (`on`/`off`) |
+| `BACKENDS` | z. B. `cuda,vulkan` |
+| `LLAMA_CPP_REPO` | Spiegel von llama.cpp, falls das Original einmal nicht erreichbar ist |
+
+Das Build-Log liegt in `/var/lib/myrmid-update/build.log`.
+
+Worker ohne Cluster-Key kann der Master nicht steuern: Sie stellen sich nach dem nächtlichen Bauen selbst um. Worker mit Key, die eine Woche lang vom Master nichts hören, stellen sich ebenfalls selbst um.
+
+### Eine neue Version veröffentlichen
 
 ```bash
-flutter pub get
-flutter build web --release
+scripts/release.sh 1.2.0      # setzt VERSION und App-Version, Commit und Tag
+git push && git push --tags   # danach baut GitHub Actions die App und legt das Release an
 ```
 
----
+llama.cpp ändert sich nur mit einem Release: `node/LLAMA_CPP_COMMIT` und die Kopie in der App (`local_plugins/llama_flutter_android/android/src/main/cpp/llama.cpp`) gehören zusammen. Vorher auf einem Test-PC prüfen:
 
-## License
+```bash
+sudo myrmid update prepare 1.2.0
+sudo myrmid update activate 1.2.0
+```
 
-MIT — see [LICENSE](./LICENSE) for details.
+## Aufbau
+
+| Ordner | Inhalt |
+|---|---|
+| `node/` | PC-Teil: `myrmid.py` (Planer, Router, Dashboard, Updates), `build.sh`, systemd-Units. Ausführlich in [node/README.md](node/README.md) |
+| `install.sh` | Installation, Treiber, Dienste, Übernahme alter Installationen |
+| `lib/`, `android/`, `local_plugins/` | Flutter-App (Chat, Handy als Worker oder Master), siehe [docs/APP.md](docs/APP.md) |
+| `scripts/release.sh` | neue Version taggen |
+
+Auf einem PC liegen:
+- das Programm in `/opt/myrmid/current` (ein Link auf `/opt/myrmid/releases/<Version>`), der Befehl `myrmid` in `/usr/local/bin`;
+- Daten in `/var/lib/myrmid` (API-Key, Messwerte, Host-Modelle);
+- Einstellungen in `/etc/myrmid`;
+- die Dienste `myrmid-server`, `myrmid-worker` und `myrmid-host`.
+
+## Sicherheit
+
+Das RPC-Protokoll von llama.cpp hat keine Anmeldung. Deshalb gibt das Installationsskript die Worker-Ports nur für den Master frei. MyrmidLM gehört ins eigene LAN oder hinter ein VPN (z. B. NetBird, WireGuard), nie direkt ins Internet. API, Dashboard, Hosts und Updates sind mit dem API-Key des Masters geschützt.
+
+## Herkunft und Lizenz
+
+MyrmidLM ist ein Fork von [PrivateLM](https://github.com/orailnoor/cross-platform-llm-client) (cross-platform-llm-client) und steht wie das Original unter der [MIT-Lizenz](LICENSE). Rechenkern ist [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT). Aus Kompatibilitätsgründen tragen das Netzwerkprotokoll (mDNS-Dienste `_privatelm…`, QR-Codes `privatelm://`) und interne Namen der App noch den alten Namen: So finden sich App und PCs auch über Versionen hinweg.
