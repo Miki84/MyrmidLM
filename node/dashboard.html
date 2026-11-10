@@ -100,11 +100,15 @@
   @media (max-width: 900px) { .router, .rebalance { grid-template-columns: 1fr; } }
   .router-off { margin-bottom: 16px; color: var(--muted); font-size: 0.9rem; }
   .backends { margin-top: 4px; }
-  .model-switch { margin-top: 8px; font-size: 0.88rem; }
-  .model-switch summary { cursor: pointer; color: var(--muted); }
-  .model-switch form { display: flex; gap: 8px; margin-top: 8px; max-width: 560px; }
-  .model-switch input { flex: 1; font: inherit; padding: 7px 9px; border-radius: 7px; border: 1px solid var(--line);
-                        background: var(--surface); color: var(--text); min-width: 0; }
+  .model-switch { margin-top: 10px; font-size: 0.88rem; }
+  .model-switch summary { cursor: pointer; display: inline-block; list-style: none; border: 1px solid var(--line);
+                          border-radius: 8px; padding: 6px 12px; font-weight: 600; }
+  .model-switch summary::-webkit-details-marker { display: none; }
+  .model-switch[open] summary { background: var(--surface-2); }
+  .model-switch form { display: grid; gap: 8px; margin-top: 10px; max-width: 620px; }
+  .model-switch .row { display: flex; gap: 8px; }
+  .model-switch select, .model-switch input { flex: 1; font: inherit; padding: 7px 9px; border-radius: 7px;
+                        border: 1px solid var(--line); background: var(--surface); color: var(--text); min-width: 0; }
   .role-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; font-size: 0.84rem; }
   .backends td.role { font-weight: 600; white-space: nowrap; }
   .hosts { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; }
@@ -236,12 +240,15 @@
       <h1>MyrmidLM-Cluster</h1>
       <div class="model" id="model">Verbinde mit dem Master …</div>
       <details class="model-switch" id="model-switch">
-        <summary>Modell wechseln</summary>
+        <summary>Modell wechseln oder herunterladen</summary>
         <form id="model-form">
-          <input name="model" list="master-models" placeholder="Katalogname, user/repo:QUANT oder Datei" required>
-          <button class="btn" type="submit">Laden</button>
+          <label for="model-pick" class="muted">Modell</label>
+          <div class="row">
+            <select id="model-pick" name="pick"></select>
+            <button class="btn" type="submit">Laden</button>
+          </div>
+          <input id="model-custom" name="custom" hidden placeholder="Hugging Face: user/repo:QUANT (z. B. bartowski/Qwen_Qwen3-8B-GGUF:Q4_K_M) oder Pfad zu einer .gguf-Datei">
         </form>
-        <datalist id="master-models"></datalist>
         <div class="note" id="model-job"></div>
       </details>
     </div>
@@ -405,14 +412,21 @@ async function api(path, opts = {}) {
 /* ── Rendering ───────────────────────────────────────────────────────── */
 
 function renderModelSwitch(s) {
-  const ms = s.models || {}, list = $("master-models");
-  if (!list.dataset.filled || list.dataset.n !== String((ms.local || []).length)) {
-    list.innerHTML = (ms.local || []).map((m) => `<option value="${esc(m.path)}">${esc(m.name)} (${nf(m.size_gb, 1)} GB, auf diesem PC)</option>`).join("")
-      + (ms.catalog || []).map((c) => `<option value="${esc(c.key)}">${esc(c.desc)}</option>`).join("");
-    list.dataset.filled = "1"; list.dataset.n = String((ms.local || []).length);
+  const ms = s.models || {}, pick = $("model-pick");
+  const sig = JSON.stringify([(ms.local || []).map((m) => m.path), (ms.catalog || []).map((c) => c.key), s.plan.model]);
+  if (pick.dataset.sig !== sig) {
+    const keep = pick.value, current = s.plan.model;
+    const local = (ms.local || []).map((m) => `<option value="${esc(m.path)}">${esc(m.name)} · ${nf(m.size_gb, 1)} GB${m.name === current ? " · läuft gerade" : ""}</option>`).join("");
+    pick.innerHTML = (local ? `<optgroup label="Auf diesem PC">${local}</optgroup>` : "")
+      + `<optgroup label="Katalog (wird heruntergeladen, falls nicht vorhanden)">`
+      + (ms.catalog || []).map((c) => `<option value="${esc(c.key)}">${esc(c.key)} · ${esc(c.desc)}</option>`).join("")
+      + `</optgroup><optgroup label="Anderes"><option value="__custom">Anderes Modell von Hugging Face oder Datei …</option></optgroup>`;
+    if ([...pick.options].some((o) => o.value === keep)) pick.value = keep;
+    pick.dataset.sig = sig;
+    $("model-custom").hidden = pick.value !== "__custom";
   }
   const j = (s.rebalance || {}).model_job, out = $("model-job");
-  if (!j) { out.textContent = "Lokale Modelle oder Katalog; fehlende werden heruntergeladen. Das Modell wird danach neu verteilt."; return; }
+  if (!j) { out.textContent = "Modelle auf diesem PC oder aus dem Katalog. Fehlende werden heruntergeladen (Fortschritt hier), danach wird neu verteilt."; return; }
   const name = j.name || j.model;
   out.className = "note" + (j.state === "error" ? " bad" : "");
   out.textContent = j.state === "resolving" ? `Suche ${name} …`
@@ -423,9 +437,18 @@ function renderModelSwitch(s) {
   $("model-form").querySelector("button").disabled = ["resolving", "downloading", "loading"].includes(j.state);
 }
 
+$("model-pick").addEventListener("change", () => {
+  const custom = $("model-pick").value === "__custom";
+  $("model-custom").hidden = !custom;
+  if (custom) $("model-custom").focus();
+});
 $("model-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
-  const model = new FormData(ev.target).get("model");
+  const pick = $("model-pick").value;
+  const model = pick === "__custom" ? $("model-custom").value.trim() : pick;
+  if (!model) { $("model-custom").focus(); return; }
+  const label = pick === "__custom" ? model : $("model-pick").selectedOptions[0].textContent;
+  if (!confirm(`Auf ${label} wechseln? Fehlt es, wird es zuerst heruntergeladen. Laufende Anfragen brechen ab, das Modell wird neu verteilt.`)) return;
   ev.target.querySelector("button").disabled = true;
   try { await api("/api/model", { method: "POST", body: JSON.stringify({ model }) }); } catch (e) { /* next poll */ }
 });
