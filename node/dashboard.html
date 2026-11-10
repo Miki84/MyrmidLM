@@ -110,6 +110,12 @@
   .model-switch select, .model-switch input { flex: 1; font: inherit; padding: 7px 9px; border-radius: 7px;
                         border: 1px solid var(--line); background: var(--surface); color: var(--text); min-width: 0; }
   .role-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; font-size: 0.84rem; }
+  .layout-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 0.84rem; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg-btn { font: inherit; border: 0; background: transparent; color: var(--text); padding: 5px 10px; cursor: pointer; }
+  .seg-btn + .seg-btn { border-left: 1px solid var(--line); }
+  .seg-btn[aria-pressed="true"] { background: var(--c0); color: #0f1e28; font-weight: 650; cursor: default; }
+  .seg-btn:disabled { opacity: .6; cursor: default; }
   .backends td.role { font-weight: 600; white-space: nowrap; }
   .hosts { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; }
   .host { background: var(--surface-2); border-radius: var(--radius-s); padding: 14px 16px; display: grid; gap: 10px; }
@@ -749,7 +755,7 @@ function renderHosts(s) {
   $("hosts-sub").textContent = list.length ? `${list.length} ${list.length === 1 ? "Host" : "Hosts"} im Netz` : "";
   $("hosts-note").textContent = h.off
     ? "Hosts brauchen einen API-Key auf dem Master (er ist ihr Cluster-Schlüssel)."
-    : list.length ? "Jeder Host lädt ein ganzes Modell auf seine eigenen GPUs. Hosts mit demselben Namen teilen sich die Anfragen; Rolle „groß“ und „schnell“ nutzt der Router auch ohne Namen."
+    : list.length ? "Jeder Host lädt ein ganzes Modell auf seine eigenen GPUs; ein PC mit mehreren GPUs kann auch jeder GPU ein eigenes Modell geben. Hosts mit demselben Namen für Clients teilen sich die Anfragen, verschiedene Namen sind getrennte Modelle. Rolle „groß“ und „schnell“ nutzt der Router auch ohne Namen."
     : "Noch keine Hosts gefunden. Auf einem PC mit GPU das Installationsskript mit der Rolle „Host“ starten (es fragt nach dem API-Key dieses Masters).";
   const focused = document.activeElement && document.activeElement.closest(".host");
   if (focused) return;  // don't rebuild the form someone is typing in
@@ -763,18 +769,27 @@ function renderHosts(s) {
       <div class="note">${esc(pr.name)}: ${gb(pr.done_mb)} von ${gb(pr.total_mb)}</div>` : "";
     const now = x.model ? `<div><b>${esc(x.model)}</b>${x.ctx ? `, Kontext ${x.ctx.toLocaleString("de-DE")}` : ""}${x.estimate_tps ? `, geschätzt ${nf(x.estimate_tps, 1)} Token/s` : ""}${x.busy ? `, ${x.busy} Anfrage(n) in Arbeit` : ""}</div>` : "";
     const role = e.role ?? a.role ?? "big";
+    const nGpus = (x.gpus || []).length;
+    const layoutRow = x.layout_owner && nGpus >= 2 && !x.asleep
+      ? `<div class="layout-row"><span class="muted">${nGpus} GPUs:</span>
+          <div class="seg" role="group" aria-label="Aufteilung der GPUs">
+            <button type="button" class="seg-btn" data-layout="split" aria-pressed="${x.layout !== "per_gpu"}"${x.switching ? " disabled" : ""}>Ein Modell über alle GPUs</button>
+            <button type="button" class="seg-btn" data-layout="per_gpu" aria-pressed="${x.layout === "per_gpu"}"${x.switching ? " disabled" : ""}>Jede GPU ein eigenes Modell</button>
+          </div>${x.switching ? `<span class="muted">stellt um …</span>` : ""}</div>`
+      : "";
     const roleRow = x.switchable && !x.asleep
       ? `<div class="role-row"><span class="muted">Rolle: Host</span><button class="btn quiet small" type="button" data-role-ctl="${esc(x.addr)}" data-role="worker">Zum Worker machen</button></div>`
       : "";
     const sleepRow = x.asleep
       ? `<div class="kv"><span>${x.waking ? "Wird geweckt, lädt danach sein Modell …" : "Schläft. Eine Anfrage an sein Modell weckt ihn."}</span>${x.wakeable && !x.waking ? `<button class="btn quiet small" type="button" data-hwake>Aufwecken</button>` : ""}</div>`
-      : `<div class="kv"><label class="inline">Schlafen nach <input name="sleep_min" class="mini" inputmode="numeric" value="${esc(String(e.sleep_min ?? x.sleep_min ?? 0))}"> Min. ohne Anfrage (0 = nie)</label>${x.can_sleep && x.state === "ready" ? `<button class="btn quiet small" type="button" data-hsleep>Jetzt schlafen</button>` : ""}</div>
+      : `<div class="kv"><label class="inline">Schlafen nach <input name="sleep_min" class="mini" inputmode="numeric" value="${esc(String(e.sleep_min ?? x.sleep_min ?? 0))}"> Min. ohne Anfrage (0 = nie)</label>${x.can_sleep && x.state === "ready" ? `<button class="btn quiet small" type="button" data-hsleep>${x.slot != null ? "PC jetzt schlafen legen" : "Jetzt schlafen"}</button>` : ""}</div>
+         ${x.slot != null && x.sleep_min ? `<div class="note">Der PC schläft erst, wenn alle seine GPUs so lange keine Anfrage hatten.</div>` : ""}
          ${x.sleep_min && !x.can_sleep ? `<div class="note">Schlafen braucht den Helfer des Installationsskripts (Rolle Host) auf diesem PC.</div>` : ""}
          ${x.sleep_min && !x.wakeable ? `<div class="note">Keine MAC-Adresse bekannt (WLAN?): Aufwecken per Wake-on-LAN geht nur über Kabel.</div>` : ""}`;
     return `<article class="host" data-id="${esc(x.id)}">
-      <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${gpus ? " · " + gpus : ""}</div></div>
+      <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${x.gpu ? " · " + esc(x.gpu) : gpus ? " · " + gpus : ""}</div></div>
         <div class="pill"><span class="dot ${cls}"></span><span>${txt}</span></div></div>
-      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${sleepRow}${roleRow}
+      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${layoutRow}${sleepRow}${roleRow}
       <form>
         <label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
@@ -786,8 +801,12 @@ function renderHosts(s) {
 }
 
 async function hostAction(body) {
-  try { const r = await api("/api/hosts", { method: "POST", body: JSON.stringify(body) }); if (last && r.hosts) { last.hosts = r; renderHosts(last); } }
-  catch (e) { /* the next poll shows the real state */ }
+  if (document.activeElement && document.activeElement.matches("button")) document.activeElement.blur();
+  try {
+    const r = await api("/api/hosts", { method: "POST", body: JSON.stringify(body) });
+    if (r.error) alert(r.error);
+    if (last && r.hosts) { last.hosts = r; renderHosts(last); }
+  } catch (e) { /* the next poll shows the real state */ }
 }
 
 $("hosts").addEventListener("input", (ev) => {
@@ -807,6 +826,14 @@ $("hosts").addEventListener("click", (ev) => {
   if (ev.target.matches("[data-unload]")) { delete hostEdits[card.dataset.id]; hostAction({ host: card.dataset.id, unload: true }); }
   if (ev.target.matches("[data-hwake]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, wake: true }); }
   if (ev.target.matches("[data-hsleep]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, sleep: true }); }
+  const lay = ev.target.closest("[data-layout]");
+  if (lay && lay.getAttribute("aria-pressed") !== "true") {
+    const perGpu = lay.dataset.layout === "per_gpu";
+    const msg = perGpu
+      ? "Jede GPU dieses PCs bekommt ein eigenes Modell. Die laufenden Modelle stoppen; GPU 0 lädt das bisherige Modell wieder, die anderen GPUs bekommen eigene Karten zum Zuweisen.\n\nGleicher Name für Clients auf mehreren GPUs = ein gemeinsames Modell, auf das der Router die Anfragen verteilt. Verschiedene Namen = getrennte Modelle."
+      : "Ein Modell über alle GPUs dieses PCs. Die Modelle der einzelnen GPUs stoppen; das Modell von GPU 0 wird über alle GPUs neu geladen.";
+    if (confirm(msg)) { lay.disabled = true; hostAction({ host: card.dataset.id, layout: lay.dataset.layout }); }
+  }
 });
 $("hosts").addEventListener("change", (ev) => {
   if (ev.target.name !== "sleep_min") return;

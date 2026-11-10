@@ -1141,6 +1141,9 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
         if d.name in getattr(args, "reserve_mb", {}):
             d.free_mb = max(0, int(d.free_mb - args.reserve_mb[d.name]))
     local_gpus = usable_gpus(devices)
+    only = getattr(args, "only_devices", None)
+    if only:  # a host with one model per GPU: this model gets its GPU (and its share of the RAM)
+        local_gpus = [d for d in local_gpus if d.name in only]
     cpu = next((d for d in devices if d.type == "cpu"), None)
     host_speed = cpu.bandwidth if cpu and cpu.bandwidth else 20.0
 
@@ -3249,17 +3252,27 @@ class Known:
             return
         rec = {"kind": kind, "name": name, "ip": ip, "mac": mac, "bcast": txt_or_status.get("bcast") or "",
                "seen": int(time.time()), "port": txt_or_status.get("port"),
-               "model": txt_or_status.get("model") or "", "api_port": txt_or_status.get("api_port")}
+               "model": txt_or_status.get("model") or "", "api_port": txt_or_status.get("api_port"),
+               "path": txt_or_status.get("path") or "", "pc": txt_or_status.get("pc") or ""}
         with self.lock:
             old = self.machines.get(mid)
-            changed = not old or any(old.get(k) != rec[k] for k in ("mac", "ip", "name", "bcast", "port", "model"))
+            changed = not old or any(old.get(k) != rec[k]
+                                     for k in ("mac", "ip", "name", "bcast", "port", "model", "path", "pc"))
             if changed or rec["seen"] - old.get("seen", 0) > 3600:
                 self.machines[mid] = rec
-                try:
-                    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                    KNOWN_STATE.write_text(json.dumps({"machines": self.machines}, indent=1))
-                except OSError:
-                    pass
+                self._save()
+
+    def _save(self) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            KNOWN_STATE.write_text(json.dumps({"machines": self.machines}, indent=1))
+        except OSError:
+            pass
+
+    def forget(self, mid: str) -> None:
+        with self.lock:
+            if self.machines.pop(mid, None) is not None:
+                self._save()
 
     def wake(self, mid: str, force: bool = False) -> bool:
         rec = self.machines.get(mid)
@@ -4089,6 +4102,9 @@ class UpdateCoordinator:
 HOST_CTL_PORT = 50070
 HOST_API_PORT = 8081
 HOST_STATE = CONFIG_DIR / "host.json"
+HOST_LAYOUT = CONFIG_DIR / "host-layout.json"
+HOST_INTERNAL_PORT = 18081  # the llama-servers listen on 127.0.0.1 from here up; the API port forwards to them
+HOST_LAYOUTS = ("split", "per_gpu")  # one model over all GPUs, or one model per GPU
 
 
 def read_cluster_key(key: Optional[str], key_file: Optional[str]) -> str:
@@ -4113,15 +4129,24 @@ def host_id(port: int) -> str:
 
 
 class HostAgent:
-    """Loads the model the master assigned and keeps it running."""
+    """Loads the model the master assigned and keeps it running: on all of
+    this PC's GPUs, or (slot) on one of them, when each GPU has its own model."""
 
-    def __init__(self, args, key: str):
+    def __init__(self, args, key: str, slot: Optional[int] = None, gpu: Optional["Device"] = None,
+                 ram_limit_gb: Optional[float] = None, stats: Optional["SystemStats"] = None):
         import threading
 
         self.args, self.key = args, key
+        self.slot, self.gpu, self.ram_limit_gb = slot, gpu, ram_limit_gb
         self.models_dir = Path(args.models_dir).expanduser()
         self.lock = threading.RLock()
-        self.id = host_id(args.port)
+        self.pc_id = host_id(args.port)
+        self.id = self.pc_id if slot is None else f"{self.pc_id}-gpu{slot}"
+        self.path = "" if slot is None else f"/gpu{slot}"  # prefix on the control and API ports
+        self.api_port = HOST_INTERNAL_PORT + (slot or 0)  # llama-server, on 127.0.0.1
+        self.state_file = HOST_STATE if slot is None else CONFIG_DIR / f"host-gpu{slot}.json"
+        self.closed = False  # replaced by another layout
+        self.node: Optional["HostNode"] = None
         self.state, self.error = "idle", ""
         self.assignment: Optional[dict] = None  # model, name, role, ctx
         self.proc: Optional[subprocess.Popen] = None
@@ -4133,31 +4158,42 @@ class HostAgent:
         self.restarts = 0
         self.paths: dict[str, str] = {}  # assigned model -> file, so a restart needs no lookup
         self.mac, self.bcast = "", ""
-        self.stats = SystemStats(probe(bench=False))
+        self.stats = stats or SystemStats(probe(bench=False))
+
+    @property
+    def label(self) -> str:
+        return "Host" if self.slot is None else f"Host GPU {self.slot}"
 
     # State -------------------------------------------------------------------
 
     def _set(self, state: str, error: str = "") -> None:
         with self.lock:
             self.state, self.error = state, error
-        log(f"Host: {state}{': ' + error if error else ''}")
+        log(f"{self.label}: {state}{': ' + error if error else ''}")
 
     def _save(self) -> None:
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            HOST_STATE.write_text(json.dumps({"assignment": self.assignment, "paths": self.paths}))
+            self.state_file.write_text(json.dumps({"assignment": self.assignment, "paths": self.paths}))
         except OSError as e:
-            log(f"Host: could not save the assignment ({e})")
+            log(f"{self.label}: could not save the assignment ({e})")
 
-    def restore(self) -> None:
-        """Loads the last assignment again after a restart, without the master."""
+    def saved(self) -> dict:
         try:
-            saved = json.loads(HOST_STATE.read_text())
+            d = json.loads(self.state_file.read_text())
+            return d if isinstance(d, dict) else {}
         except (OSError, ValueError):
-            return
-        a, self.paths = saved.get("assignment"), saved.get("paths") or {}
+            return {}
+
+    def restore(self, inherit: Optional[dict] = None) -> None:
+        """Loads the last assignment again after a restart, without the master.
+        inherit: what the previous layout's first host ran (switching layouts
+        keeps that model running on the new first host)."""
+        own = self.saved()
+        saved = inherit if inherit and inherit.get("assignment") else own
+        a, self.paths = saved.get("assignment"), {**(own.get("paths") or {}), **(saved.get("paths") or {})}
         if a and a.get("model"):
-            log(f"Host: loading the last assigned model again ({a['model']})")
+            log(f"{self.label}: loading the last assigned model again ({a['model']})")
             self.assign(a)
 
     def budget_mb(self) -> int:
@@ -4171,7 +4207,7 @@ class HostAgent:
         if not self.proc or self.proc.poll() is not None:
             return out
         try:
-            req = urllib.request.Request(f"http://127.0.0.1:{self.args.api_port}/metrics",
+            req = urllib.request.Request(f"http://127.0.0.1:{self.api_port}/metrics",
                                          headers={"Authorization": f"Bearer {self.key}"})
             with urllib.request.urlopen(req, timeout=2) as r:
                 for line in r.read().decode().splitlines():
@@ -4194,8 +4230,12 @@ class HostAgent:
         return {"name": d["name"], "total_mb": d["size_mb"], "done_mb": done // 2**20}
 
     def status(self) -> dict:
+        node = self.node
         with self.lock:
-            st = {"id": self.id, "host": socket.gethostname(), "v": 1, "state": self.state, "error": self.error,
+            name = socket.gethostname() if self.slot is None else f"{socket.gethostname()} · GPU {self.slot}"
+            st = {"id": self.id, "host": socket.gethostname(), "name": name, "v": 1, "state": self.state,
+                  "error": self.error, "pc": self.pc_id, "path": self.path, "slot": self.slot,
+                  "gpu": f"{self.gpu.name} {self.gpu.description}" if self.gpu else None,
                   "assignment": self.assignment, "model": self.model_path.stem if self.model_path else None,
                   "ctx": self.ctx, "estimate_tps": self.estimate_tps, "api_port": self.args.api_port,
                   "progress": self._progress() if self.state == "downloading" else None,
@@ -4207,6 +4247,9 @@ class HostAgent:
         st["stats"] = self.stats.sample()
         st["models"] = sorted({p.stem.split("-00001-of-")[0] for p in self.models_dir.glob("*.gguf")}) \
             if self.models_dir.is_dir() else []
+        if node:  # the PC's layout: the master lists every slot and can switch it
+            st.update(node.layout_info())
+            st["layout_owner"] = bool(node.agents) and node.agents[0] is self
         return st
 
     # Commands ------------------------------------------------------------------
@@ -4251,29 +4294,28 @@ class HostAgent:
         self.proc = None
 
     def sleep(self, _body: Optional[dict] = None) -> dict:
-        """Stops llama-server and suspends this PC (the master wakes it by
-        Wake-on-LAN; the model loads again after waking up)."""
+        """Suspends this PC (all its GPUs' models): see HostNode.sleep."""
+        if self.node:
+            return self.node.sleep(self)
+        return self.status()
+
+    def busy(self) -> bool:
         with self.lock:
-            if self.state in ("downloading", "loading", "preparing"):
-                return {**self.status(), "error": f"busy ({self.state})"}
+            return self.state in ("downloading", "loading", "preparing")
+
+    def park(self) -> None:
+        """Stops llama-server before the PC sleeps; resumed() loads it again."""
+        with self.lock:
             self.job += 1  # stops a restart in progress
         self.stop_server()
         self._set("asleep")
-        ok, how = request_suspend()
-        if not ok:
-            log(f"Host: could not suspend ({how}); loading the model again")
-            if self.assignment:
-                self.assign(self.assignment)
-            return {**self.status(), "error": f"suspend failed: {how}"}
-        log(f"Host: suspending ({how})")
-        return self.status()
 
     def resumed(self) -> None:
         """Back from sleep (or suspended by someone else): load the model again."""
         with self.lock:
             a = self.assignment
             dead = self.proc is None or self.proc.poll() is not None
-        log("Host: woke up")
+        log(f"{self.label}: woke up")
         if a and (self.state == "asleep" or dead):
             self.assign(a)
         elif not a:
@@ -4319,10 +4361,13 @@ class HostAgent:
             if not current():
                 return
             self._set("loading")
-            ns = argparse.Namespace(model=str(path), ctx=a.get("ctx"), mtp=0, workers="off", ram_limit=None,
-                                    api_key=self.key, host=self.args.host, port=self.args.api_port,
-                                    extra=list(self.args.extra or []), scan_timeout=1.0)
+            ns = argparse.Namespace(model=str(path), ctx=a.get("ctx"), mtp=0, workers="off",
+                                    ram_limit=self.ram_limit_gb, api_key=self.key, host="127.0.0.1",
+                                    port=self.api_port, extra=list(self.args.extra or []), scan_timeout=1.0,
+                                    only_devices=[self.gpu.name] if self.gpu else None)
             sp = build_server_fitting(ns, quiet=True, exit_on_fail=False)
+            if self.gpu:  # without it llama.cpp spreads the model over every GPU it sees
+                sp.cmd += ["--device", self.gpu.name]
             if not current():
                 return
             log(" ".join(sp.cmd).replace(self.key, "***"))
@@ -4330,7 +4375,7 @@ class HostAgent:
             with self.lock:
                 self.proc, self.model_path, self.ctx, self.estimate_tps = proc, path, ns.ctx, round(sp.estimate_tps, 1)
                 self.download = None
-            if _wait_healthy(f"http://127.0.0.1:{self.args.api_port}", proc, timeout=3600) and current():
+            if _wait_healthy(f"http://127.0.0.1:{self.api_port}", proc, timeout=3600) and current():
                 self._set("ready")
             elif current():
                 self._set("error", f"llama-server did not start (code {proc.poll()}); see the log")
@@ -4342,17 +4387,9 @@ class HostAgent:
                 self._set("error", f"{type(e).__name__}: {e}")
 
     def watch(self) -> None:
-        """Restarts llama-server if it ends on its own (up to 3 times in a row),
-        and notices waking up (the wall clock jumps, the monotonic one doesn't)."""
-        offset = time.time() - time.monotonic()
-        while True:
+        """Restarts llama-server if it ends on its own (up to 3 times in a row)."""
+        while not self.closed:
             time.sleep(5)
-            now_offset = time.time() - time.monotonic()
-            if now_offset - offset > 20:
-                offset = now_offset
-                self.resumed()
-                continue
-            offset = now_offset
             with self.lock:
                 dead = self.state == "ready" and self.proc is not None and self.proc.poll() is not None
                 a = self.assignment
@@ -4365,12 +4402,241 @@ class HostAgent:
                 self._set("error", f"llama-server ended (code {code}); restarting in 30 s")
                 time.sleep(30)
                 with self.lock:
-                    same = self.assignment is a
+                    same = self.assignment is a and not self.closed
                     if same:
                         self.job += 1
                         job = self.job
                 if same:
                     self._run(job, a)
+
+    def close(self) -> None:
+        """For a layout change: stop for good (the saved assignment stays)."""
+        with self.lock:
+            self.closed = True
+            self.job += 1
+        self.stop_server()
+
+
+class HostNode:
+    """The host on one PC: one HostAgent over all GPUs (layout "split"), or
+    one per dedicated GPU ("per_gpu"), switched from the master's dashboard.
+    The control port answers for each (/gpuN/status, /gpuN/assign, ...; the
+    first also without prefix), the API port forwards /gpuN/... to that
+    GPU's llama-server on 127.0.0.1. So the firewall needs no new ports."""
+
+    def __init__(self, args, key: str):
+        import threading
+
+        self.args, self.key = args, key
+        self.lock = threading.RLock()
+        self.devices = probe(bench=False)
+        self.gpus = [d for d in usable_gpus(self.devices) if d.type == "gpu"]
+        self.stats = SystemStats(self.devices)
+        self.get_routes: dict = {}
+        self.post_routes: dict = {}
+        self.agents: list[HostAgent] = []
+        self.mac, self.bcast = "", ""
+        self.switching = False
+        try:
+            self.layout = json.loads(HOST_LAYOUT.read_text()).get("layout", "split")
+        except (OSError, ValueError, AttributeError):
+            self.layout = "split"
+        if self.layout not in HOST_LAYOUTS or (self.layout == "per_gpu" and len(self.gpus) < 2):
+            self.layout = "split"
+
+    def _make(self) -> list[HostAgent]:
+        if self.layout == "per_gpu":
+            ram_gb = memory_budget(False)[0] / 1024 / len(self.gpus)  # models that spill share the RAM
+            agents = [HostAgent(self.args, self.key, slot=i, gpu=g, ram_limit_gb=ram_gb, stats=self.stats)
+                      for i, g in enumerate(self.gpus)]
+        else:
+            agents = [HostAgent(self.args, self.key, stats=self.stats)]
+        for a in agents:
+            a.node, a.mac, a.bcast = self, self.mac, self.bcast
+        return agents
+
+    def _set_routes(self) -> None:
+        gets, posts = {}, {}
+        for i, a in enumerate(self.agents):
+            for prefix in ([""] if i == 0 else []) + ([a.path] if a.path else []):
+                gets[f"{prefix}/status"] = a.status
+                posts.update({f"{prefix}/assign": a.assign, f"{prefix}/unload": a.unload,
+                              f"{prefix}/sleep": a.sleep})
+        posts.update({"/layout": self.set_layout, "/role": lambda body: request_role(str(body.get("role") or "")),
+                      "/update": request_update})
+        # the handler holds these dicts: change them in place
+        self.get_routes.clear()
+        self.get_routes.update(gets)
+        self.post_routes.clear()
+        self.post_routes.update(posts)
+
+    def start(self) -> None:
+        import threading
+
+        with self.lock:
+            self.agents = self._make()
+            self._set_routes()
+        for a in self.agents:
+            threading.Thread(target=a.watch, daemon=True).start()
+            a.restore()
+        threading.Thread(target=self.watch_resume, daemon=True).start()
+
+    def layout_info(self) -> dict:
+        return {"layout": self.layout, "switching": self.switching,
+                "slots": [{"id": a.id, "path": a.path} for a in self.agents],
+                "gpus": [{"name": g.name, "description": g.description, "total_mb": g.total_mb} for g in self.gpus]}
+
+    def set_layout(self, body: dict) -> dict:
+        """Switches between one model over all GPUs and one per GPU. The
+        models stop and load again; the first GPU (or all of them) keeps the
+        model the other layout had there, if it has nothing of its own yet."""
+        import threading
+
+        layout = str(body.get("layout") or "")
+        if layout not in HOST_LAYOUTS:
+            return {"ok": False, "error": f"layout must be one of {', '.join(HOST_LAYOUTS)}"}
+        if layout == "per_gpu" and len(self.gpus) < 2:
+            return {"ok": False, "error": "this PC has fewer than two GPUs"}
+        if layout == self.layout:
+            return {"ok": True, **self.layout_info()}
+        if self.switching:
+            return {"ok": False, "error": "a switch is running"}
+        self.switching = True
+
+        def run() -> None:
+            try:
+                old = self.agents
+                first = old[0].saved() if old else {}
+                for a in old:
+                    a.close()
+                with self.lock:
+                    self.layout = layout
+                    try:
+                        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                        HOST_LAYOUT.write_text(json.dumps({"layout": layout}))
+                    except OSError as e:
+                        log(f"Host: could not save the layout ({e})")
+                    self.agents = self._make()
+                    self._set_routes()
+                log(f"Host: layout {layout} ({len(self.agents)} model(s))")
+                for i, a in enumerate(self.agents):
+                    threading.Thread(target=a.watch, daemon=True).start()
+                    a.restore(inherit=first if i == 0 else None)
+            finally:
+                self.switching = False
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"ok": True, **self.layout_info()}
+
+    def sleep(self, asking: HostAgent) -> dict:
+        """Stops every model and suspends this PC (the master wakes it by
+        Wake-on-LAN; the models load again after waking up)."""
+        busy = [a for a in self.agents if a.busy()]
+        if busy:
+            return {**asking.status(), "error": f"busy ({busy[0].state})"}
+        for a in self.agents:
+            a.park()
+        ok, how = request_suspend()
+        if not ok:
+            log(f"Host: could not suspend ({how}); loading the models again")
+            for a in self.agents:
+                if a.assignment:
+                    a.assign(a.assignment)
+            return {**asking.status(), "error": f"suspend failed: {how}"}
+        log(f"Host: suspending ({how})")
+        return asking.status()
+
+    def watch_resume(self) -> None:
+        """Notices waking up (the wall clock jumps, the monotonic one doesn't)."""
+        offset = time.time() - time.monotonic()
+        while True:
+            time.sleep(5)
+            now_offset = time.time() - time.monotonic()
+            if now_offset - offset > 20:
+                for a in list(self.agents):
+                    a.resumed()
+            offset = now_offset
+
+    def backend_port(self, path: str) -> tuple[Optional[int], str]:
+        """The llama-server for a request on the API port, and the path for it."""
+        agents = self.agents
+        for a in agents:
+            if a.path and (path == a.path or path.startswith(a.path + "/")):
+                return a.api_port, path[len(a.path):] or "/"
+        if path.startswith("/gpu"):
+            return None, path  # a GPU of the other layout
+        return (agents[0].api_port if agents else None), path
+
+    def stop(self) -> None:
+        for a in self.agents:
+            a.close()
+
+
+def _host_proxy_handler(node: HostNode):
+    """The host's API port: passes each request to the llama-server it is for
+    (streaming, like the router), so per-GPU models need no extra ports."""
+    import http.client
+    from http.server import BaseHTTPRequestHandler
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _pass(self, method: str) -> None:
+            port, path = node.backend_port(self.path)
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n) if n else None
+            if port is None:
+                body = b'{"error":{"message":"no model on this path"}}'
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() in ("content-type", "accept", "authorization")}
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=900)
+            try:
+                try:
+                    conn.request(method, path, body=raw, headers=headers)
+                    resp = conn.getresponse()
+                except OSError as e:
+                    body = json.dumps({"error": {"message": f"model not running: {e}"}}).encode()
+                    self.send_response(502)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                try:
+                    self.send_response(resp.status)
+                    for k, v in resp.getheaders():
+                        if k.lower() not in ("transfer-encoding", "content-length", "connection"):
+                            self.send_header(k, v)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    while True:
+                        chunk = resp.read1(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                        self.wfile.flush()
+                    self.wfile.write(b"0\r\n\r\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True  # client went away; closing the backend stops generating
+            finally:
+                conn.close()
+
+        def do_GET(self):
+            self._pass("GET")
+
+        def do_POST(self):
+            self._pass("POST")
+
+    return H
 
 
 def cmd_host(args) -> None:
@@ -4380,32 +4646,30 @@ def cmd_host(args) -> None:
     if not key:
         die("A host needs the cluster key (the master's API key): --key, --key-file, or the systemd "
             "credential cluster_key. On the master: myrmid key")
-    agent = HostAgent(args, key)
-    handler = _json_handler({"/status": agent.status},
-                            {"/assign": agent.assign, "/unload": agent.unload, "/sleep": agent.sleep,
-                             "/role": lambda body: request_role(str(body.get("role") or "")),
-                             "/update": request_update}, key=key)
-    if not _start_http(args.host, args.port, handler):
+    node = HostNode(args, key)
+    if not _start_http(args.host, args.port, _json_handler(node.get_routes, node.post_routes, key=key)):
         die(f"Port {args.port} is busy.")
+    if not _start_http(args.host, args.api_port, _host_proxy_handler(node)):
+        die(f"Port {args.api_port} is busy.")
     devices = probe(bench=True)
     gpus = usable_gpus(devices)
     address = args.advertise_ip or (args.host if args.host not in ("0.0.0.0", "") else lan_address())
     vram = sum(d.total_mb for d in gpus if d.type == "gpu")
-    agent.mac, agent.bcast = iface_info(address)
+    node.mac, node.bcast = iface_info(address)
     gpu_txt = ", ".join(sorted({d.description for d in gpus})) or "CPU"
-    log(f"Host {socket.gethostname()}: control API on {address}:{args.port}, models in {agent.models_dir}, "
-        f"llama-server on port {args.api_port}; {gpu_txt}")
+    log(f"Host {socket.gethostname()}: control API on {address}:{args.port}, models in "
+        f"{Path(args.models_dir).expanduser()}, API on port {args.api_port}; {gpu_txt}; "
+        + ("one model per GPU" if node.layout == "per_gpu" else "one model over all GPUs"))
     advs = []
     if not args.no_advertise:
         adv = Advertiser(HOST_TYPE, f"MyrmidLM Host {socket.gethostname()}", args.port,
-                         {"id": agent.id, "host": socket.gethostname(), "api": str(args.api_port),
+                         {"id": host_id(args.port), "host": socket.gethostname(), "api": str(args.api_port),
                           "gpu": gpu_txt[:120], "vram": str(vram), "v": "1",
-                          **({"mac": agent.mac, "bcast": agent.bcast} if agent.mac else {})}, address)
+                          **({"mac": node.mac, "bcast": node.bcast} if node.mac else {})}, address)
         adv.start()
         advs.append(adv)
     NetWatch(advs, fixed=bool(args.advertise_ip) or args.host not in ("0.0.0.0", "")).start()
-    threading.Thread(target=agent.watch, daemon=True).start()
-    agent.restore()
+    node.start()
 
     stopping = False
 
@@ -4417,8 +4681,7 @@ def cmd_host(args) -> None:
     signal.signal(signal.SIGINT, stop)
     while not stopping:
         time.sleep(0.5)
-    agent.job += 1
-    agent.stop_server()
+    node.stop()
     for a in advs:
         a.stop()
 
@@ -4905,9 +5168,11 @@ class HostManager:
         # hosts seen before that are off or asleep now: listed, and woken on demand
         for mid, rec in self.known.machines.items():
             if rec.get("kind") == "host" and rec.get("ip") and rec.get("port"):
-                self.hosts[mid] = {"addr": rec["ip"], "port": int(rec["port"]), "name": rec.get("name", rec["ip"]),
-                                   "status": {}, "seen": 0, "error": "", "asleep": True}
+                self.hosts[mid] = {"addr": rec["ip"], "port": int(rec["port"]), "path": rec.get("path") or "",
+                                   "name": rec.get("name", rec["ip"]), "status": {}, "seen": 0, "error": "",
+                                   "asleep": True, "pc": rec.get("pc") or mid}
         self.last_scan = 0.0
+        self.rescan = False  # a PC changed its layout: ask every host again
         self.pushed: dict[str, tuple] = {}  # id -> (assignment, time) last sent
 
     @staticmethod
@@ -4940,7 +5205,7 @@ class HostManager:
     def _call(self, h: dict, path: str, body: Optional[dict] = None, timeout: float = 5) -> dict:
         import urllib.request
 
-        req = urllib.request.Request(f"http://{h['addr']}:{h['port']}{path}",
+        req = urllib.request.Request(f"http://{h['addr']}:{h['port']}{h.get('path') or ''}{path}",
                                      data=json.dumps(body).encode() if body is not None else None,
                                      headers={"Authorization": f"Bearer {self.key}",
                                               "Content-Type": "application/json"})
@@ -4954,27 +5219,72 @@ class HostManager:
         except Exception:  # noqa: BLE001 - mDNS trouble: --hosts still works
             pass
         for addr, port in found + self.extra:
-            if any(h["addr"] == addr and h["port"] == port for h in self.hosts.values()):
+            # A PC with one model per GPU has a host for each GPU (path /gpuN); the
+            # first answers without a path too and lists them all.
+            known_here = [h for h in self.hosts.values() if h["addr"] == addr and h["port"] == port]
+            if known_here and all(not h.get("asleep") for h in known_here) and \
+                    time.time() - min(h.get("seen", 0) for h in known_here) < 60 and not self.rescan:
                 continue
             try:
-                st = self._call({"addr": addr, "port": port}, "/status")
+                root = self._call({"addr": addr, "port": port}, "/status")
             except Exception as e:  # noqa: BLE001
-                log(f"Host {addr}:{port} doesn't answer ({e}); a wrong key gives HTTP 401")
+                if not known_here:
+                    log(f"Host {addr}:{port} doesn't answer ({e}); a wrong key gives HTTP 401")
                 continue
-            with self.lock:
-                self.hosts[st["id"]] = {"addr": addr, "port": port, "name": st.get("host", addr), "status": st,
-                                        "seen": time.time(), "error": "", "asleep": st.get("state") == "asleep"}
-            self.known.note(st["id"], "host", st.get("host", addr), addr, {**st, "port": port})
-            log(f"Host {st.get('host', addr)} ({addr}:{port}) found: {st.get('state')}"
-                + (f", {st.get('model')}" if st.get("model") else ""))
+            for slot in root.get("slots") or [{"id": root["id"], "path": ""}]:
+                if slot["id"] in self.hosts and not self.hosts[slot["id"]].get("asleep"):
+                    continue
+                try:
+                    st = root if slot["id"] == root["id"] else \
+                        self._call({"addr": addr, "port": port, "path": slot["path"]}, "/status")
+                except Exception:  # noqa: BLE001 - switching layouts: next time
+                    continue
+                name = st.get("name") or st.get("host", addr)
+                with self.lock:
+                    self.hosts[st["id"]] = {"addr": addr, "port": port, "path": slot["path"], "name": name,
+                                            "status": st, "seen": time.time(), "error": "",
+                                            "asleep": st.get("state") == "asleep", "pc": st.get("pc") or st["id"]}
+                self.known.note(st["id"], "host", name, addr, {**st, "port": port, "path": slot["path"]})
+                log(f"Host {name} ({addr}:{port}{slot['path']}) found: {st.get('state')}"
+                    + (f", {st.get('model')}" if st.get("model") else ""))
+        self.rescan = False
+
+    def _prune(self, st: dict) -> None:
+        """A PC switched its layout: its hosts that no longer exist go (their
+        assignment stays, for when it switches back)."""
+        pc, slots = st.get("pc"), st.get("slots")
+        if not pc or slots is None:
+            return
+        valid = {x["id"] for x in slots}
+        with self.lock:
+            gone = [hid for hid, h in self.hosts.items() if h.get("pc") == pc and hid not in valid]
+            for hid in gone:
+                log(f"Host {self.hosts[hid]['name']}: gone (the PC now has {len(valid)} model slot(s))")
+                del self.hosts[hid]
+                self.known.forget(hid)
+        if len(valid) > sum(1 for h in self.hosts.values() if h.get("pc") == pc):
+            self.rescan = True
+            self.last_scan = 0  # find the new ones now
 
     def poll(self) -> None:
         for hid, h in list(self.hosts.items()):
+            if hid not in self.hosts:
+                continue  # pruned by a sibling
             try:
                 st = self._call(h, "/status", timeout=3)
+                if st.get("id") != hid:  # the PC switched layouts: this path belongs to another host now
+                    self._prune(st)
+                    if hid in self.hosts and st.get("pc") == self.hosts[hid].get("pc"):
+                        with self.lock:
+                            self.hosts.pop(hid, None)
+                        self.known.forget(hid)
+                    self.rescan, self.last_scan = True, 0
+                    continue
                 with self.lock:
-                    h.update(status=st, seen=time.time(), error="", asleep=st.get("state") == "asleep")
-                self.known.note(hid, "host", h["name"], h["addr"], {**st, "port": h["port"]})
+                    h.update(status=st, seen=time.time(), error="", asleep=st.get("state") == "asleep",
+                             pc=st.get("pc") or hid)
+                self.known.note(hid, "host", h["name"], h["addr"], {**st, "port": h["port"], "path": h.get("path", "")})
+                self._prune(st)
             except Exception as e:  # noqa: BLE001
                 with self.lock:
                     if hid in self.known.machines:
@@ -5038,14 +5348,16 @@ class HostManager:
                     if not a or not label:
                         continue
                     backends.append(Backend(a.get("role") or "big",
-                                            f"http://{h['addr']}:{st.get('api_port') or rec.get('api_port') or HOST_API_PORT}",
+                                            f"http://{h['addr']}:{st.get('api_port') or rec.get('api_port') or HOST_API_PORT}"
+                                            f"{h.get('path') or ''}",
                                             self.key, label, group=a.get("name") or label, where=h["name"],
                                             source=hid, ctx=st.get("ctx") or 0, asleep=True, status="asleep"))
                     continue
                 a = st.get("assignment") or {}
                 if st.get("state") != "ready" or not st.get("model") or h.get("error"):
                     continue
-                backends.append(Backend(a.get("role") or "big", f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}",
+                backends.append(Backend(a.get("role") or "big",
+                                        f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}{h.get('path') or ''}",
                                         self.key, st["model"], group=a.get("name") or st["model"],
                                         where=h["name"], source=hid, ctx=st.get("ctx") or 0))
         self.router.set_hosts(backends)
@@ -5068,7 +5380,18 @@ class HostManager:
             if not mins or h.get("asleep") or not st.get("can_sleep") or hid not in self.known.machines:
                 continue
             if now - self.last_active.setdefault(hid, now) > mins * 60:
-                self.sleep(hid, f"{mins} min without requests")
+                # a PC with a model per GPU sleeps only when all of them may
+                siblings = [x for x, y in self.hosts.items() if y.get("pc") == h.get("pc") and x != hid]
+                if all(self._may_sleep(x, now) for x in siblings):
+                    self.sleep(hid, f"{mins} min without requests")
+
+    def _may_sleep(self, hid: str, now: float) -> bool:
+        h = self.hosts[hid]
+        st = h.get("status") or {}
+        mins = int(self.sleep_min.get(hid, self.args.host_sleep or 0) or 0)
+        if h.get("asleep") or not st.get("assignment"):
+            return True
+        return bool(mins) and st.get("state") == "ready" and now - self.last_active.get(hid, now) > mins * 60
 
     def sleep(self, hid: str, why: str) -> None:
         h = self.hosts.get(hid)
@@ -5078,7 +5401,9 @@ class HostManager:
         self._send(hid, "/sleep", {})
         if (h.get("status") or {}).get("state") == "asleep":
             with self.lock:
-                h["asleep"] = True
+                for y in self.hosts.values():  # the whole PC sleeps
+                    if y.get("pc") == h.get("pc"):
+                        y["asleep"] = True
             self.update_router()
 
     def wake(self, hid: str, force: bool = False) -> bool:
@@ -5131,6 +5456,31 @@ class HostManager:
         if body.get("wake"):
             self.wake(hid, force=True)
             return self.info()
+        if body.get("layout"):
+            h = dict(self.hosts[hid], path="")  # the PC's first host answers for the layout
+            try:
+                res = self._call(h, "/layout", {"layout": str(body["layout"])}, timeout=10)
+            except Exception as e:  # noqa: BLE001
+                return {**self.info(), "error": f"layout: {e}"}
+            if not res.get("ok"):
+                return {**self.info(), "error": res.get("error") or "layout failed"}
+            log(f"Host {h['name']}: layout {body['layout']}")
+            # The model the PC's first host ran keeps running on the new first host
+            # (the host does that too; the master must not push the old wish back).
+            pc = self.hosts[hid].get("pc") or hid
+            with self.lock:
+                old_first = next((x for x, y in self.hosts.items()
+                                  if y.get("pc") == pc and (y.get("status") or {}).get("layout_owner")), None)
+                want = self.assign.get(old_first) if old_first else None
+                if want is None and old_first:
+                    want = (self.hosts[old_first].get("status") or {}).get("assignment")
+                new_first = pc if body["layout"] == "split" else f"{pc}-gpu0"
+                if want:
+                    self.assign[new_first] = {k: want.get(k) for k in ("model", "role", "name", "ctx")}
+                    self.pushed.pop(new_first, None)
+            self.save()
+            self.rescan, self.last_scan = True, 0
+            return self.info()
         if body.get("sleep"):
             threading.Thread(target=self.sleep, args=(hid, "from the dashboard"), daemon=True).start()
             return self.info()
@@ -5167,8 +5517,10 @@ class HostManager:
                               "sleep_min": int(self.sleep_min.get(hid, self.args.host_sleep or 0) or 0),
                               "can_sleep": bool((h.get("status") or {}).get("can_sleep")),
                               "switchable": bool((h.get("status") or {}).get("switchable")),
+                              "pc": h.get("pc"), "path": h.get("path") or "",
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
-                                                       "estimate_tps", "progress", "models", "stats")},
+                                                       "estimate_tps", "progress", "models", "stats", "layout",
+                                                       "gpus", "layout_owner", "slot", "gpu", "switching")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]
@@ -5717,7 +6069,8 @@ def main() -> None:
     h.add_argument("--host", default="0.0.0.0", help="address to listen on (default all)")
     h.add_argument("--port", type=int, default=HOST_CTL_PORT, help=f"control API (default {HOST_CTL_PORT})")
     h.add_argument("--api-port", type=int, default=HOST_API_PORT,
-                   help=f"llama-server for the master (default {HOST_API_PORT})")
+                   help=f"the models' API for the master (default {HOST_API_PORT}; the llama-servers "
+                        f"themselves listen on 127.0.0.1:{HOST_INTERNAL_PORT} and up)")
     h.add_argument("--models-dir", default="/srv/models" if os.access("/srv/models", os.W_OK) else "~/models",
                    help="where downloaded models go")
     h.add_argument("--advertise-ip")
