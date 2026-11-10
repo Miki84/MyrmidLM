@@ -19,7 +19,7 @@ BUILD="${BUILD_DIR:-$HERE/build}"
 BACKENDS="auto"
 ROCM_TARGETS=""
 INSTALL_DIR=""
-JOBS="$(nproc)"
+JOBS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -149,7 +149,26 @@ echo "==> Configuring"
 cmake -S "$HERE" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DLLAMA_CPP_DIR="$SRC" ${flags[@]+"${flags[@]}"}
 
 echo "==> Building with $JOBS jobs (CUDA/ROCm builds take a while)"
-cmake --build "$BUILD" -j "$JOBS" --target ggml-rpc-server llama-server privatelm-probe
+# Parallel jobs by free memory, not just cores: single generated Vulkan/CUDA
+# files (mul_mm.comp.cpp) need 2-3 GB each to compile, and running out kills
+# the compiler ("Killed signal terminated program cc1plus").
+if [[ -z "$JOBS" ]]; then
+    avail_mb=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 4096)
+    JOBS=$(( avail_mb / 2500 ))
+    (( JOBS < 1 )) && JOBS=1
+    (( JOBS > $(nproc) )) && JOBS=$(nproc)
+    echo "==> $JOBS parallel jobs (${avail_mb} MB free memory, $(nproc) cores; -j N to override)"
+fi
+targets=(ggml-rpc-server llama-server privatelm-probe)
+if ! cmake --build "$BUILD" -j "$JOBS" --target "${targets[@]}"; then
+    # The usual reason is memory: try once more, one file at a time.
+    if (( JOBS > 1 )); then
+        echo "==> Build failed with $JOBS jobs; trying again with one (slower, needs less memory)"
+        cmake --build "$BUILD" -j 1 --target "${targets[@]}"
+    else
+        exit 1
+    fi
+fi
 
 # Architectures this llama.cpp knows, for 'privatelm-node models'.
 grep -oE '\{ LLM_ARCH_[A-Z0-9_]+, *"[^"]+"' "$SRC/src/llama-arch.cpp" | sed -E 's/.*"([^"]+)"/\1/' \
