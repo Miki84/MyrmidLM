@@ -848,8 +848,13 @@ def cmd_worker(args) -> None:
     if ln:
         txt["link"] = ln["kind"]
         log(f"Network: {address} over {link_label(ln)}")
+    pairing = Pairing(read_cluster_key(args.key, args.key_file), args.pair_from)
     if not args.no_status:
         txt["stat"] = str(args.status_port)
+        if pairing.waiting:  # the master sees it and gives this PC its key
+            txt["pair"] = "1"
+            log("No cluster key yet: the first master that sees this PC takes it into its cluster"
+                + (f" (only {args.pair_from})" if args.pair_from else " (in the next hour)"))
     _advertise(args, advs, f"MyrmidLM {host}", args.port, txt, address)
     show_qr(worker_qr(address, args.port, f"{host} · {label}", ram_mb, bw, wid, txt["kind"]))
 
@@ -879,11 +884,13 @@ def cmd_worker(args) -> None:
                     **({"mac": mac, "bcast": bcast} if mac else {})}
             if not args.no_status:
                 rtxt["stat"] = str(args.status_port)
+                if pairing.waiting:
+                    rtxt["pair"] = "1"
             _advertise(args, advs, f"MyrmidLM {host} RAM", ram_port, rtxt, address)
             show_qr(worker_qr(address, ram_port, f"{host} · RAM", offered, cpu.bandwidth,
                               f"{wid}-ram", "cpu"))
     if not args.no_status:
-        start_worker_status(args, rpc_info, procs, devices)
+        start_worker_status(args, rpc_info, procs, devices, pairing, advs)
     NetWatch(advs, fixed=bool(args.advertise_ip) or args.host not in ("0.0.0.0", "")).start()
     _wait(procs, advs)
 
@@ -1528,6 +1535,8 @@ def cmd_serve(args) -> None:
         dash = Dashboard(args, sup, probe(bench=False), router=router, big_base=big_base, hosts=hosts)
     updater = UpdateCoordinator(sup, router, hosts, dash, sp.key)
     updater.start()
+    if sp.key and args.auto_pair == "on":
+        Pairer(sp.key, sup).start()
     if dash:
         dash.updater = updater
         if dash.start():
@@ -2780,10 +2789,11 @@ def _json_handler(get_routes: dict, post_routes: Optional[dict] = None, key: str
             pass
 
         def _authorized(self, path: str) -> bool:
-            if not key or path in public:
+            k = key() if callable(key) else key  # a worker gets its key while running (pairing)
+            if not k or path in public:
                 return True
             got = self.headers.get("Authorization", "")
-            return secrets.compare_digest(got.encode(), f"Bearer {key}".encode())
+            return secrets.compare_digest(got.encode(), f"Bearer {k}".encode())
 
         def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
             self.send_response(code)
@@ -2806,7 +2816,10 @@ def _json_handler(get_routes: dict, post_routes: Optional[dict] = None, key: str
                     body = json.loads(self.rfile.read(n)) if n else {}
                 except ValueError:
                     body = {}
-                res = fn(body if isinstance(body, dict) else {})
+                body = body if isinstance(body, dict) else {}
+                if path.endswith("/pair"):  # pairing checks who asks
+                    body["_client"] = self.client_address[0]
+                res = fn(body)
             else:
                 res = fn()
             if isinstance(res, tuple):
@@ -2823,22 +2836,31 @@ def _json_handler(get_routes: dict, post_routes: Optional[dict] = None, key: str
 
 
 def start_worker_status(args, rpc_info: list[dict], procs: list[subprocess.Popen],
-                        devices: list[Device]) -> None:
+                        devices: list[Device], pairing: "Pairing", advs: Optional[list] = None) -> None:
     stats = SystemStats(devices)
-    key = read_cluster_key(getattr(args, "key", None), getattr(args, "key_file", None))
 
     def status() -> dict:
         rpc = []
         for info, p in zip(rpc_info, procs):
             rpc.append(dict(info, alive=p.poll() is None, peers=tcp_peers(info["port"])))
+        key = pairing.key
         return {"role": "worker", "host": socket.gethostname(), "version": RPC_VERSION, "release": own_version(),
                 "rpc": rpc, "stats": stats.sample(), "address": NET_STATE["address"], "link": NET_STATE["link"],
-                "switchable": bool(key) and can_switch_role(), "keyed": bool(key), "update": update_brief()}
+                "switchable": bool(key) and can_switch_role(), "keyed": bool(key), "update": update_brief(),
+                **pairing.status()}
 
     # Status stays open (no secrets in it); switching the role or updating needs the cluster key.
-    post = {"/role": lambda body: request_role(str(body.get("role") or "")),
-            "/update": request_update} if key else {}
-    if _start_http(args.host, args.status_port, _json_handler({"/status": status}, post, key=key,
+    keyed = {"/role": lambda body: request_role(str(body.get("role") or "")), "/update": request_update}
+    post = dict(keyed) if pairing.key else {"/pair": pairing.pair}
+
+    def paired(_key: str) -> None:  # from now on the master may switch and update this PC
+        post.pop("/pair", None)
+        post.update(keyed)
+        for adv in advs or []:
+            adv.move(adv.address, {k: v for k, v in adv.txt.items() if k != "pair"})
+
+    pairing.on_paired = paired
+    if _start_http(args.host, args.status_port, _json_handler({"/status": status}, post, key=lambda: pairing.key,
                                                                public=("/status",))):
         log(f"Status for the master's dashboard on port {args.status_port}")
 
@@ -3748,7 +3770,8 @@ def update_auto() -> dict:
         if not _unit_active("myrmid-server"):
             return update_activate(prep)  # nothing running to coordinate
         return st  # the server switches the cluster when every PC is ready
-    has_key = CLUSTER_KEY_FILE.exists()
+    has_key = CLUSTER_KEY_FILE.exists() or any(
+        p.exists() for p in (Path("/var/lib/private/myrmid/myrmid/cluster_key"), Path("/var/lib/myrmid/myrmid/cluster_key")))
     if not has_key or time.time() - (st.get("prepared_at") or time.time()) > UPDATE_SELF_AFTER_S:
         return update_activate(prep)
     return st
@@ -4108,13 +4131,19 @@ HOST_INTERNAL_PORT = 18081  # the llama-servers listen on 127.0.0.1 from here up
 HOST_LAYOUTS = ("split", "per_gpu")  # one model over all GPUs, or one model per GPU
 
 
+PAIRED_KEY = CONFIG_DIR / "cluster_key"  # the key a master gave this PC (pairing)
+PAIR_WINDOW_S = 3600  # without --pair-from, the first hour after the start
+
+
 def read_cluster_key(key: Optional[str], key_file: Optional[str]) -> str:
-    """--key, --key-file, or the systemd credential cluster_key."""
+    """--key, --key-file, the systemd credential cluster_key, or the key a
+    master gave this PC when it took it into its cluster."""
     if key:
         return key.strip()
     paths = [Path(key_file).expanduser()] if key_file else []
     if os.environ.get("CREDENTIALS_DIRECTORY"):
         paths.append(Path(os.environ["CREDENTIALS_DIRECTORY"]) / "cluster_key")
+    paths.append(PAIRED_KEY)
     for p in paths:
         try:
             k = p.read_text().strip()
@@ -4123,6 +4152,109 @@ def read_cluster_key(key: Optional[str], key_file: Optional[str]) -> str:
         except OSError:
             continue
     return ""
+
+
+class Pairing:
+    """A worker or host installed without the cluster key: the first master
+    that sees it gives it its key (myrmid serve does that on its own), from
+    then on the PC is that master's. Who may: the master's addresses the
+    installer found (--pair-from), or anyone in the first hour after the
+    start (restart the service to open that hour again)."""
+
+    def __init__(self, key: str, allow: Optional[str], on_paired=None):
+        import threading
+
+        self.key = key
+        self.allow = [a.strip() for a in (allow or "").split(",") if a.strip()]
+        self.started = time.time()
+        self.on_paired = on_paired
+        self.lock = threading.Lock()
+
+    @property
+    def waiting(self) -> bool:
+        return not self.key and (bool(self.allow) or time.time() - self.started < PAIR_WINDOW_S)
+
+    def pair(self, body: dict) -> dict:
+        who = str(body.get("_client") or "")
+        with self.lock:
+            if self.key:
+                return {"ok": False, "error": "already in a cluster"}
+            if self.allow and who not in self.allow:
+                log(f"Pairing: refused {who} (only {', '.join(self.allow)})")
+                return {"ok": False, "error": "only the master given at the installation may take this PC"}
+            if not self.allow and time.time() - self.started > PAIR_WINDOW_S:
+                return {"ok": False, "error": "the hour for taking this PC is over: restart its service"}
+            key = str(body.get("key") or "").strip()
+            if len(key) < 16:
+                return {"ok": False, "error": "no key"}
+            try:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                tmp = PAIRED_KEY.with_suffix(".tmp")
+                tmp.write_text(key + "\n")
+                os.chmod(tmp, 0o600)
+                tmp.replace(PAIRED_KEY)
+            except OSError as e:
+                return {"ok": False, "error": f"could not save the key: {e}"}
+            self.key = key
+        log(f"Pairing: now in the cluster of {body.get('master') or who} ({who})")
+        if self.on_paired:
+            self.on_paired(key)
+        return {"ok": True}
+
+    def status(self) -> dict:
+        return {"paired": bool(self.key), "pairing": self.waiting}
+
+
+class Pairer:
+    """On the master: takes new workers and hosts (installed without the key)
+    into the cluster by giving them its key."""
+
+    def __init__(self, key: str, sup: Optional["Supervisor"] = None):
+        self.key, self.sup = key, sup
+        self.tried: dict[str, float] = {}
+
+    def once(self) -> None:
+        import urllib.request
+
+        for p in scan(3.0):
+            if p.txt.get("pair") != "1" or p.kind not in ("worker", "host"):
+                continue
+            port = p.port if p.kind == "host" else int(p.txt.get("stat") or 0)
+            if not port:
+                continue
+            ctl = f"{p.host}:{port}"
+            if time.time() - self.tried.get(ctl, 0) < 60:
+                continue
+            self.tried[ctl] = time.time()
+            body = json.dumps({"key": self.key, "master": socket.gethostname()}).encode()
+            req = urllib.request.Request(f"http://{ctl}/pair", data=body, headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    res = json.loads(r.read())
+            except (OSError, ValueError) as e:
+                log(f"Pairing: {p.name} ({ctl}) doesn't answer: {e}")
+                continue
+            name = p.txt.get("host") or p.name
+            if res.get("ok"):
+                log(f"Pairing: {name} ({p.kind}) is now in this cluster")
+                if self.sup:
+                    self.sup.event(f"paired {name}", f"{name} aufgenommen ({'Host' if p.kind == 'host' else 'Worker'}):"
+                                   " der Master kann ihn jetzt umschalten und aktualisieren.")
+            elif "already" not in str(res.get("error")):
+                log(f"Pairing: {name} ({ctl}): {res.get('error')}")
+
+    def loop(self) -> None:
+        while True:
+            try:
+                self.once()
+            except Exception as e:  # noqa: BLE001 - never stops the server
+                log(f"Pairing: {type(e).__name__}: {e}")
+            time.sleep(20)
+
+    def start(self) -> None:
+        import threading
+
+        threading.Thread(target=self.loop, daemon=True).start()
 
 
 def host_id(port: int) -> str:
@@ -4573,6 +4705,44 @@ class HostNode:
             a.close()
 
 
+def _host_wait_for_master(args) -> None:
+    """A host without the cluster key can't run models: it waits until a
+    master takes it into its cluster (gives it its key), then goes on."""
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    got = threading.Event()
+    pairing = Pairing("", args.pair_from, on_paired=lambda _k: got.set())
+
+    def status() -> dict:
+        return {"id": host_id(args.port), "host": socket.gethostname(), "state": "pairing", "v": 1,
+                "release": own_version(), **pairing.status()}
+
+    try:
+        srv = ThreadingHTTPServer((args.host, args.port),
+                                  _json_handler({"/status": status}, {"/pair": pairing.pair}))
+    except OSError:
+        die(f"Port {args.port} is busy.")
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    address = args.advertise_ip or (args.host if args.host not in ("0.0.0.0", "") else lan_address())
+    adv = None
+    if not args.no_advertise:
+        adv = Advertiser(HOST_TYPE, f"MyrmidLM Host {socket.gethostname()}", args.port,
+                         {"id": host_id(args.port), "host": socket.gethostname(), "api": str(args.api_port),
+                          "v": "1", "pair": "1"}, address)
+        adv.start()
+    log("No cluster key yet: waiting for a master to take this host into its cluster"
+        + (f" (only {args.pair_from})" if args.pair_from else " (in the next hour; then restart the service)"))
+    while not got.wait(5):
+        if not pairing.waiting:
+            die("No master took this host in the first hour. Restart the service, or give it the key: "
+                "--key-file (on the master: myrmid key)")
+    if adv:
+        adv.stop()
+    srv.shutdown()
+    srv.server_close()
+
+
 def _host_proxy_handler(node: HostNode):
     """The host's API port: passes each request to the llama-server it is for
     (streaming, like the router), so per-GPU models need no extra ports."""
@@ -4645,8 +4815,8 @@ def cmd_host(args) -> None:
 
     key = read_cluster_key(args.key, args.key_file)
     if not key:
-        die("A host needs the cluster key (the master's API key): --key, --key-file, or the systemd "
-            "credential cluster_key. On the master: myrmid key")
+        _host_wait_for_master(args)  # returns with the key a master gave this PC
+        key = read_cluster_key(args.key, args.key_file)
     node = HostNode(args, key)
     if not _start_http(args.host, args.port, _json_handler(node.get_routes, node.post_routes, key=key)):
         die(f"Port {args.port} is busy.")
@@ -5232,6 +5402,8 @@ class HostManager:
                 if not known_here:
                     log(f"Host {addr}:{port} doesn't answer ({e}); a wrong key gives HTTP 401")
                 continue
+            if root.get("state") == "pairing":
+                continue  # waits for its key (the pairer gives it this master's)
             for slot in root.get("slots") or [{"id": root["id"], "path": ""}]:
                 if slot["id"] in self.hosts and not self.hosts[slot["id"]].get("asleep"):
                     continue
@@ -6060,13 +6232,20 @@ def main() -> None:
     w.add_argument("--status-port", type=int, default=STATUS_PORT,
                    help=f"read-only status for the master's dashboard (default {STATUS_PORT})")
     w.add_argument("--no-status", action="store_true")
-    w.add_argument("--key", help="cluster key (the master's API key): lets the master switch this PC to host")
+    w.add_argument("--key", help="cluster key (the master's API key): lets the master switch this PC to host. "
+                                 "Without it the first master that sees this PC gives it its key")
     w.add_argument("--key-file", help="file with the cluster key")
+    w.add_argument("--pair-from", metavar="IP[,IP]",
+                   help="without a key: only this master may take the PC into its cluster "
+                        "(otherwise any master, in the first hour after the start)")
     w.set_defaults(fn=cmd_worker)
 
     h = sub.add_parser("host", help="load whole models for a master's router (the master picks the model)")
-    h.add_argument("--key", help="cluster key: the master's API key (better: --key-file)")
+    h.add_argument("--key", help="cluster key: the master's API key (better: --key-file). "
+                                 "Without it the first master that sees this PC gives it its key")
     h.add_argument("--key-file", help="file with the cluster key")
+    h.add_argument("--pair-from", metavar="IP[,IP]",
+                   help="without a key: only this master may take the PC into its cluster")
     h.add_argument("--host", default="0.0.0.0", help="address to listen on (default all)")
     h.add_argument("--port", type=int, default=HOST_CTL_PORT, help=f"control API (default {HOST_CTL_PORT})")
     h.add_argument("--api-port", type=int, default=HOST_API_PORT,
@@ -6124,6 +6303,9 @@ def main() -> None:
                         "name, user/repo[:QUANT] or a file on the host; role big (default), fast, or extra "
                         "(only by name); name is what clients ask for")
     s.add_argument("--hosts", help="hosts mDNS doesn't find: IP[:PORT],... (default port 50070)")
+    s.add_argument("--auto-pair", choices=("on", "off"), default="on",
+                   help="give new workers and hosts (installed without the key) this master's key, so it can "
+                        "switch and update them (default on)")
     s.add_argument("--host-sleep", type=int, default=0, metavar="MIN",
                    help="hosts sleep after MIN minutes without requests and are woken by Wake-on-LAN "
                         "when a request needs them (default 0: never; per host in the dashboard)")

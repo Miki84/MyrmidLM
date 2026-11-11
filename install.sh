@@ -769,11 +769,9 @@ if [[ "$ROLE" == worker || "$ROLE" == host ]]; then
         ok "API-Key des Masters ist schon hinterlegt."
     fi
     if [[ -z "$CLUSTER_KEY" ]]; then
-        info "Dafür braucht er den API-Key des Masters. Anzeigen auf dem Master: sudo myrmid key"
-        info "Mit dem Key kann der Master diesen PC auch umschalten und aktualisieren."
-        CLUSTER_KEY="$(ask "API-Key des Masters$( [[ "$ROLE" == worker ]] && echo " (leer = Worker ohne Umschalten, aktualisiert sich nachts selbst)")" "")"
+        info "Den API-Key des Masters musst du nicht eingeben: Sobald der Master diesen PC im Netz sieht,"
+        info "nimmt er ihn auf und gibt ihm seinen Schlüssel (danach kann er ihn umschalten und aktualisieren)."
     fi
-    [[ -n "$CLUSTER_KEY" || "$ROLE" == worker ]] || die "Ohne den API-Key des Masters kann der Host nicht arbeiten."
 
     worker_args=(worker --cache)
     RAM_NOTE="" WHAT="GPU"
@@ -794,10 +792,13 @@ if [[ "$ROLE" == worker || "$ROLE" == host ]]; then
     # Die Ports braucht nur der Master (RPC hat keine Anmeldung).
     ask_master_ip
     check_master_ip
-    ports=("50052:50053/tcp" "50060/tcp")
-    [[ -n "$CLUSTER_KEY" ]] && ports+=("50070/tcp" "8081/tcp")
-    open_ports "${MASTER_IP:-$LAN_NET}" "${ports[@]}"
+    open_ports "${MASTER_IP:-$LAN_NET}" "50052:50053/tcp" "50060/tcp" "50070/tcp" "8081/tcp"
     enable_wol
+    # Ohne Key: nur dieser Master darf den PC aufnehmen (sonst jeder, in der ersten Stunde nach dem Start).
+    if [[ -z "$CLUSTER_KEY" && -n "$MASTER_IP" ]]; then
+        worker_args+=(--pair-from "$MASTER_IP")
+        host_args+=(--pair-from "$MASTER_IP")
+    fi
 
     cred=""
     if [[ -n "$CLUSTER_KEY" ]]; then
@@ -815,25 +816,20 @@ if [[ "$ROLE" == worker || "$ROLE" == host ]]; then
         # ausgelöst durch eine Datei, die der Dienst (ohne Root-Rechte) anlegt.
         install_static_units myrmid-suspend.path myrmid-suspend.service myrmid-role.path myrmid-role.service
         srun install -m 755 "$PREFIX/current/systemd/myrmid-role.sh" /usr/local/sbin/myrmid-role
-        srun systemctl enable --now myrmid-suspend.path
-        [[ -n "$CLUSTER_KEY" ]] && srun systemctl enable --now myrmid-role.path
+        srun systemctl enable --now myrmid-suspend.path myrmid-role.path
     fi
 
     if [[ $SERVICE -eq 1 ]]; then
         other=$( [[ "$ROLE" == worker ]] && echo host || echo worker )
-        if [[ -n "$CLUSTER_KEY" ]]; then
-            write_unit myrmid-worker "MyrmidLM Worker (GPU und RAM für den Master)" "$NODE ${worker_args[*]}" "$cred" \
-                "$( [[ "$ROLE" == worker ]] && echo on || echo off )"
-            write_unit myrmid-host "MyrmidLM Host (ganzes Modell für den Router des Masters)" "$NODE ${host_args[*]}" "$cred" \
-                "$( [[ "$ROLE" == host ]] && echo on || echo off )"
-        else
-            write_unit myrmid-worker "MyrmidLM Worker (GPU und RAM für den Master)" "$NODE ${worker_args[*]}"
-        fi
-        ok "Dienst myrmid-$ROLE läuft und startet künftig automatisch$( [[ -n "$CLUSTER_KEY" ]] && echo "; myrmid-$other ist eingerichtet, aber aus")."
+        write_unit myrmid-worker "MyrmidLM Worker (GPU und RAM für den Master)" "$NODE ${worker_args[*]}" "$cred" \
+            "$( [[ "$ROLE" == worker ]] && echo on || echo off )"
+        write_unit myrmid-host "MyrmidLM Host (ganzes Modell für den Router des Masters)" "$NODE ${host_args[*]}" "$cred" \
+            "$( [[ "$ROLE" == host ]] && echo on || echo off )"
+        ok "Dienst myrmid-$ROLE läuft und startet künftig automatisch; myrmid-$other ist eingerichtet, aber aus."
         info "Log: journalctl -u myrmid-$ROLE -f"
     else
         if [[ "$ROLE" == worker ]]; then info "Starten mit: $NODE ${worker_args[*]}"
-        else info "Starten mit: $NODE ${host_args[*]} --key-file /etc/myrmid/cluster_key (als root)"; fi
+        else info "Starten mit: $NODE ${host_args[*]}"; fi
     fi
     [[ $DRY -eq 0 ]] && { srun "$NODE" update check >/dev/null 2>&1 || true; }
     echo
@@ -844,7 +840,12 @@ if [[ "$ROLE" == worker || "$ROLE" == host ]]; then
         echo "${G}${B}Fertig.${N} Dieser PC ist Host ($VER, Steuerung ${LAN_IP:-?}:50070)."
         echo "Im Dashboard des Masters erscheint er im Bereich Hosts: dort ein Modell wählen und auf Laden klicken."
     fi
-    [[ -n "$CLUSTER_KEY" ]] && echo "Rolle und Updates steuert das Dashboard des Masters."
+    if [[ -n "$CLUSTER_KEY" ]]; then
+        echo "Rolle und Updates steuert das Dashboard des Masters."
+    else
+        echo "Der Master nimmt diesen PC in den nächsten Sekunden auf (er muss laufen und im selben Netz sein)."
+        echo "Danach steuert er Rolle und Updates im Dashboard. Ohne Master: innerhalb einer Stunde, sonst Dienst neu starten."
+    fi
     exit 0
 fi
 

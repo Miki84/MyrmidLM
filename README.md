@@ -31,13 +31,15 @@ Das Skript fragt nach der Rolle:
 | **Worker** | leiht dem Master GPU und RAM für ein verteiltes Modell |
 | **Host** | lädt ein ganzes Modell, der Router des Masters schickt Anfragen hin |
 
-Zuerst den Master installieren. Für Worker und Hosts fragt das Skript nach dem API-Key des Masters (dort anzeigen mit `sudo myrmid key`). Mit dem Key kann der Master diese PCs im Dashboard umschalten und aktualisieren.
+Zuerst den Master installieren, danach Worker und Hosts. Einen Schlüssel musst du dabei nicht eintippen: Das Skript sucht den Master im Netz, und sobald der Master den neuen PC sieht, nimmt er ihn auf und gibt ihm seinen API-Key. Ab dann kann er ihn im Dashboard umschalten und aktualisieren. Aufnehmen darf ihn nur der Master, den das Skript gefunden hat; findet es keinen, nimmt ihn der erste Master, der ihn in der ersten Stunde nach dem Start sieht.
 
 Ohne Rückfragen, zum Beispiel für einen weiteren Worker:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash -s -- --role worker --cluster-key KEY --yes
+curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash -s -- --role worker --yes
 ```
+
+Einem anderen Master zuordnen: auf dem PC `sudo rm -f /var/lib/myrmid/myrmid/cluster_key /etc/myrmid/cluster_key` und den Dienst neu starten (`sudo systemctl restart myrmid-worker` bzw. `myrmid-host`). Den Schlüssel von Hand vorgeben geht weiter mit `--cluster-key KEY` (auf dem Master: `sudo myrmid key`).
 
 Alle Optionen zeigt `bash install.sh --help`. Das Skript kann gefahrlos erneut laufen, zum Beispiel nach dem Neustart für den NVIDIA-Treiber. Eine ältere Installation unter dem Namen PrivateLM-Node übernimmt es automatisch: Rolle, Einstellungen, API-Key, Messwerte und Modelle bleiben erhalten.
 
