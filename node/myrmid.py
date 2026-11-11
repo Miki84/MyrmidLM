@@ -3031,7 +3031,17 @@ class Dashboard:
                for p in peers if not self._is_me(p) and p.kind != "host"]  # hosts have their own panel
         seen_ips = {p.host for p in peers}
         used_ips = {ep.rsplit(":", 1)[0] for ep in used}
+        if self.hosts:
+            # A PC that became a host: its old worker entry is not a sleeping worker
+            host_info = self.hosts.info()["hosts"]
+            seen_ips |= {h["addr"].rsplit(":", 1)[0] for h in host_info}
+            host_macs = {(self.sup.known.machines.get(h["id"]) or {}).get("mac") for h in host_info} - {None, ""}
+            self.hosts.worker_ips = {p.host for p in peers if p.kind == "worker" and p.txt.get("stat")}
+        else:
+            host_macs = set()
         for mid, rec in self.sup.known.machines.items():
+            if rec.get("kind") == "worker" and rec.get("mac") and rec.get("mac") in host_macs:
+                continue
             if rec.get("kind") == "worker" and rec.get("ip") not in seen_ips and rec.get("ip") not in used_ips:
                 seen_ips.add(rec.get("ip"))  # GPU and RAM worker of one PC: one row, one wake-up
                 lan.append({"kind": "worker", "name": rec.get("name") or rec["ip"], "endpoint": rec["ip"],
@@ -5353,6 +5363,10 @@ class HostManager:
     def __init__(self, args, router: Router, key: str, known: Optional[Known] = None):
         import threading
 
+        # Addresses where a PC worker answers right now (the dashboard's LAN scan):
+        # a sleeping host there is that PC from before it became a worker.
+        self.worker_ips: set[str] = set()
+
         self.args, self.router, self.key = args, router, key
         self.known = known or Known()
         self.sleep_min: dict[str, int] = {}  # host id -> minutes without requests before it sleeps
@@ -5551,6 +5565,8 @@ class HostManager:
             for hid, h in self.hosts.items():
                 st = h.get("status") or {}
                 rec = self.known.machines.get(hid, {})
+                if h.get("asleep") and h["addr"] in self.worker_ips:
+                    continue  # the PC is a worker now
                 if h.get("asleep"):
                     # still offered: the router wakes it when a request needs it
                     a = (st.get("assignment") or self.assign.get(hid) or {})
@@ -5721,6 +5737,8 @@ class HostManager:
             hosts = []
             for hid, h in self.hosts.items():
                 st = h.get("status") or {}
+                if h.get("asleep") and h["addr"] in self.worker_ips:
+                    continue  # the PC is a worker now; switched back to host, it shows up again
                 hosts.append({"id": hid, "name": h["name"], "addr": f"{h['addr']}:{h['port']}",
                               "error": h.get("error", ""), "want": self.assign.get(hid, "–"),
                               "asleep": bool(h.get("asleep")), "wakeable": hid in self.known.machines,
