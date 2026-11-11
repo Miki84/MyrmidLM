@@ -150,6 +150,9 @@ class ClusterWorkerStatus {
   /// The app is exempt from battery optimization (Android).
   final bool batteryUnrestricted;
 
+  /// Build.MANUFACTURER, lower case: for maker-specific advice on throttling.
+  final String maker;
+
   /// This device's lasting worker ID (put in its QR code).
   final String? id;
 
@@ -162,6 +165,7 @@ class ClusterWorkerStatus {
     this.bandwidth = 0,
     this.throttled = false,
     this.batteryUnrestricted = true,
+    this.maker = '',
     this.id,
   });
 
@@ -201,14 +205,18 @@ class LlamaCluster {
       bandwidth: (m['bandwidth'] as num?)?.toDouble() ?? 0,
       throttled: m['throttled'] as bool? ?? false,
       batteryUnrestricted: m['batteryUnrestricted'] as bool? ?? true,
+      maker: m['maker'] as String? ?? '',
       id: m['id'] as String?,
     );
   }
 
   /// Android: asks to exempt the app from battery optimization, so a busy
   /// worker isn't moved to slow cores. No-op if already exempt.
-  static Future<void> requestBatteryUnrestricted() =>
-      _channel.invokeMethod('requestBatteryUnrestricted');
+  /// Opens Android's prompt for unrestricted battery use; once granted, the
+  /// maker's own screen (Huawei app launch, Xiaomi autostart, ...). Answers
+  /// "prompt", "maker" or "details" (the app's settings page).
+  static Future<String?> requestBatteryUnrestricted() =>
+      _channel.invokeMethod<String>('requestBatteryUnrestricted');
 
   /// Keeps this device's screen on (a worker runs at full speed only while
   /// MyrmidLM is on screen).

@@ -103,6 +103,7 @@ class ClusterChannel(
                     "throttled" to (alive && status.optBoolean("throttled")),
                     "id" to ClusterWorkerService.workerId(context),
                     "batteryUnrestricted" to isBatteryUnrestricted(),
+                    "maker" to Build.MANUFACTURER.lowercase(),
                 ))
             }
             "localFreeRamMb" -> result.success(ClusterWorkerService.availableRamMb(context))
@@ -118,19 +119,11 @@ class ClusterChannel(
             }
             "requestBatteryUnrestricted" -> {
                 // Android's own prompt; Samsung otherwise throttles a busy
-                // worker in the background (slow cores, low CPU share).
-                if (!isBatteryUnrestricted()) {
-                    @Suppress("BatteryLife")
-                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
-                        .setData(Uri.parse("package:${context.packageName}"))
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    runCatching { context.startActivity(intent) }.onFailure {
-                        context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
-                            .setData(Uri.parse("package:${context.packageName}"))
-                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    }
-                }
-                result.success(null)
+                // worker in the background (slow cores, low CPU share). Once
+                // that is granted and the phone still throttles (Huawei,
+                // Xiaomi keep their own lists), the maker's screen for it.
+                // Answers what it opened: "prompt", "maker" or "details".
+                result.success(openBatterySettings())
             }
             "benchmark" -> scope.launch(Dispatchers.IO) {
                 val gbps = ClusterNative.nativeMemBandwidth(ClusterNative.fastCoreCount())
@@ -218,6 +211,36 @@ class ClusterChannel(
         runCatching { context.unbindService(workerPriority) }
         setLowLatencyWifi(false)
         channel.setMethodCallHandler(null)
+    }
+
+    private fun start(intent: Intent): Boolean = runCatching {
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (intent.resolveActivity(context.packageManager) == null) return false
+        context.startActivity(intent)
+        true
+    }.getOrDefault(false)
+
+    private fun openBatterySettings(): String {
+        val pkg = Uri.parse("package:${context.packageName}")
+        @Suppress("BatteryLife")
+        if (!isBatteryUnrestricted() && start(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).setData(pkg))) {
+            return "prompt"
+        }
+        val makerScreens = listOf(
+            // Huawei / Honor (EMUI): Battery > App launch, where "Manage manually" lets it run in the background
+            "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+            "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity",
+            "com.hihonor.systemmanager" to "com.hihonor.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+            // Xiaomi (MIUI / HyperOS): autostart
+            "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity",
+            // Samsung: battery settings
+            "com.samsung.android.lool" to "com.samsung.android.sm.battery.ui.BatteryActivity",
+        )
+        for ((p, cls) in makerScreens) {
+            if (start(Intent().setComponent(ComponentName(p, cls)))) return "maker"
+        }
+        start(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).setData(pkg))
+        return "details"
     }
 
     private fun isBatteryUnrestricted(): Boolean {

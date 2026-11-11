@@ -161,18 +161,12 @@ class _ClusterViewState extends State<ClusterView> {
 
     return [
       if (s.throttled) ...[
-        AppNotice(
-          'Android is slowing this worker down (slow cores only), which slows '
-          'the whole cluster. Set MyrmidLM\'s battery use to Unrestricted, '
-          'then turn Worker off and on.',
-          icon: Icons.speed_rounded,
-          color: t.orange,
-        ),
+        AppNotice(_throttleAdvice(s), icon: Icons.speed_rounded, color: t.orange),
         const SizedBox(height: 8),
-        const Align(
+        Align(
           alignment: Alignment.centerLeft,
           child: PillButton(
-            label: 'Set Unrestricted',
+            label: s.batteryUnrestricted ? 'Open battery settings' : 'Set Unrestricted',
             primary: true,
             onPressed: LlamaCluster.requestBatteryUnrestricted,
           ),
@@ -623,4 +617,27 @@ class _QrScanPageState extends State<_QrScanPage> {
       ]),
     );
   }
+}
+
+/// What to do when Android moves the worker to its slow cores. Battery use
+/// "Unrestricted" is enough on most phones; some makers keep their own list.
+String _throttleAdvice(ClusterWorkerStatus s) {
+  const intro = 'Android is slowing this worker down (slow cores only), which slows the whole cluster. ';
+  if (!s.batteryUnrestricted) {
+    return '${intro}Set MyrmidLM\'s battery use to Unrestricted, then turn Worker off and on.';
+  }
+  final maker = s.maker;
+  if (maker.contains('huawei') || maker.contains('honor')) {
+    return '${intro}Battery use is already unrestricted, but Huawei keeps its own list: '
+        'Settings › Battery › App launch › MyrmidLM: switch off "Manage automatically" and '
+        'turn on all three (auto-launch, secondary launch, run in background). '
+        'Then turn Worker off and on, and keep MyrmidLM open on screen.';
+  }
+  if (maker.contains('xiaomi') || maker.contains('redmi') || maker.contains('poco')) {
+    return '${intro}Battery use is already unrestricted, but Xiaomi has its own settings: '
+        'allow Autostart for MyrmidLM and set its battery saver to "No restrictions". '
+        'Then turn Worker off and on, and keep MyrmidLM open on screen.';
+  }
+  return '${intro}Battery use is already unrestricted. Keep MyrmidLM open on screen '
+      'while it works (Android slows apps in the background), then turn Worker off and on.';
 }
