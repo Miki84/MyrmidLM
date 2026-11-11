@@ -283,6 +283,11 @@
         <span id="router-switch-label">Anfragen verteilen</span>
       </div>
       <p class="muted" id="router-explain" style="margin:0"></p>
+      <div class="switch-row">
+        <button class="switch" id="fastfirst-switch" role="switch" aria-checked="false" aria-labelledby="fastfirst-label" type="button"></button>
+        <span id="fastfirst-label">Schnellstes Gerät zuerst</span>
+      </div>
+      <p class="muted" id="fastfirst-explain" style="margin:0"></p>
       <div>
         <div class="muted" style="font-size:.86rem;margin-bottom:6px" id="mode-label">Wer entscheidet</div>
         <div class="seg-ctl" role="group" aria-labelledby="mode-label">
@@ -292,7 +297,7 @@
       </div>
     </div>
     <div>
-      <table class="lan backends"><thead><tr><th>Rolle</th><th>Name für Clients</th><th>Modell</th><th>Rechner</th><th>Status</th><th class="num">aktiv</th><th class="num">Anfragen</th></tr></thead><tbody id="backends"></tbody></table>
+      <table class="lan backends"><thead><tr><th>Rolle</th><th>Name für Clients</th><th>Modell</th><th>Rechner</th><th>Status</th><th class="num">Token/s</th><th class="num">aktiv</th><th class="num">Anfragen</th></tr></thead><tbody id="backends"></tbody></table>
       <div class="share" id="share" aria-hidden="true"></div>
       <div class="muted" style="font-size:.84rem" id="share-text"></div>
       <ul class="decisions" id="decisions" aria-label="Letzte Entscheidungen"></ul>
@@ -721,7 +726,7 @@ function renderRouter(s) {
   const names = (role) => [...new Set(bs.filter((b) => b.role === role).map((b) => b.model))].join(", ") || "–";
   const fastName = names("fast"), bigName = names("big");
   $("router-explain").textContent = !r.has_fast
-    ? `Kein schnelles Modell: Anfragen gehen an die großen Modelle (${bigName}), jeweils an das mit den wenigsten laufenden Anfragen. Mit dem Namen aus der Tabelle lässt sich jedes Modell gezielt ansprechen.`
+    ? `Kein schnelles Modell: Anfragen gehen an die großen Modelle (${bigName}), ${r.prefer_fast ? "jeweils an das, das am schnellsten fertig wird" : "jeweils an das mit den wenigsten laufenden Anfragen"}. Mit dem Namen aus der Tabelle lässt sich jedes Modell gezielt ansprechen.`
     : r.enabled
     ? (r.mode === "model"
       ? `Das schnelle Modell schätzt jede Anfrage ein. Einfache beantwortet ${fastName}, alles andere ${bigName}.`
@@ -733,7 +738,13 @@ function renderRouter(s) {
     <td><code>${esc(b.group || b.model)}</code></td><td>${esc(b.model)}${b.ctx ? `<div class="note">Kontext ${b.ctx.toLocaleString("de-DE")}</div>` : ""}</td>
     <td>${esc(b.where)}${b.source === "local" ? ' <span class="muted">(Master)</span>' : ""}</td>
     <td>${STATUS_TEXT[b.status] || esc(b.status)}${b.role === "fast" && b.source === "local" && fastTps ? `, ${nf(fastTps, 1)} Token/s` : ""}</td>
+    <td class="num" title="${b.measured ? "gemessen" : "geschätzt"}">${b.tps ? (b.measured ? "" : "≈ ") + nf(b.tps, 1) : "–"}</td>
     <td class="num">${b.inflight}</td><td class="num">${nf(b.served, 0)}</td></tr>`).join("");
+  const ff = $("fastfirst-switch");
+  if (!ff.dataset.busy) ff.setAttribute("aria-checked", String(!!r.prefer_fast));
+  $("fastfirst-explain").textContent = r.prefer_fast
+    ? "An: Teilen sich mehrere Geräte ein Modell (gleicher Name oder gleiche Rolle), bekommt eine einzelne Anfrage das schnellste. Ein langsameres hilft erst, wenn das schnellste so viel zu tun hat, dass es später fertig würde. Das Tempo misst der Router an jeder Antwort (≈ = noch geschätzt)."
+    : "Aus: Jede Anfrage geht an das Gerät mit den wenigsten laufenden Anfragen; bei Gleichstand wird abgewechselt, egal wie schnell es ist.";
   const n = r.counts || {}, total = (n.fast || 0) + (n.big || 0) + (n.extra || 0);
   const pf = total ? 100 * (n.fast || 0) / total : 0, pe = total ? 100 * (n.extra || 0) / total : 0;
   $("share").innerHTML = total ? `<i style="width:${pf}%;background:var(--c1)"></i><i style="width:${100 - pf - pe}%;background:var(--c0)"></i><i style="width:${pe}%;background:var(--c3)"></i>` : "";
@@ -760,7 +771,7 @@ function renderHosts(s) {
   $("hosts-note").textContent = h.off
     ? "Hosts brauchen einen API-Key auf dem Master (er ist ihr Cluster-Schlüssel)."
     : list.length ? "Jeder Host lädt ein ganzes Modell auf seine eigenen GPUs; ein PC mit mehreren GPUs kann auch jeder GPU ein eigenes Modell geben. Hosts mit demselben Namen für Clients teilen sich die Anfragen, verschiedene Namen sind getrennte Modelle. Rolle „groß“ und „schnell“ nutzt der Router auch ohne Namen."
-    : "Noch keine Hosts gefunden. Auf einem PC mit GPU das Installationsskript mit der Rolle „Host“ starten (es fragt nach dem API-Key dieses Masters).";
+    : "Noch keine Hosts gefunden. Auf einem PC mit GPU das Installationsskript mit der Rolle „Host“ starten; dieser Master nimmt ihn dann automatisch auf.";
   const focused = document.activeElement && document.activeElement.closest(".host");
   if (focused) return;  // don't rebuild the form someone is typing in
   $("hosts").innerHTML = list.map((x) => {
@@ -1009,6 +1020,13 @@ $("bench-btn").addEventListener("click", async () => {
   try { await api("/api/bench", { method: "POST" }); } catch (e) { $("bench-out").textContent = "Test konnte nicht starten."; }
 });
 
+$("fastfirst-switch").addEventListener("click", async () => {
+  const ff = $("fastfirst-switch"), on = ff.getAttribute("aria-checked") !== "true";
+  ff.setAttribute("aria-checked", String(on));
+  ff.dataset.busy = "1";
+  await setRouter({ prefer_fast: on });
+  delete ff.dataset.busy;
+});
 $("router-switch").addEventListener("click", () => {
   const on = $("router-switch").getAttribute("aria-checked") !== "true";
   $("router-switch").setAttribute("aria-checked", String(on));

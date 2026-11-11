@@ -1476,7 +1476,7 @@ def cmd_serve(args) -> None:
     big_base = f"http://127.0.0.1:{args.port}"
     fast_proc = None
     backends = [Backend("big", big_base, sp.key, sp.name, group=sp.name, where=socket.gethostname(),
-                        ctx=args.ctx or 0)]
+                        ctx=args.ctx or 0, est_tps=sp.estimate_tps or 0.0)]
     if has_fast:
         if fast_cmd:
             if sp.key:
@@ -1497,6 +1497,10 @@ def cmd_serve(args) -> None:
     public_name = args.model_name
     router = Router(backends, args.fast_ctx, enabled, mode, public_name, sp.key)
     router.on_timings = sup.on_timings
+    try:
+        router.prefer_fast = bool(json.loads(ROUTER_STATE.read_text()).get("prefer_fast"))
+    except (OSError, ValueError, AttributeError):
+        pass
 
     def new_model(sp_new) -> None:
         b = router.big
@@ -4929,6 +4933,12 @@ class Backend:
     inflight: int = 0  # requests running now
     served: int = 0
     asleep: bool = False  # a host that sleeps (or is off) and can be woken
+    est_tps: float = 0.0  # the planner's estimate (tokens/s)
+    tps: float = 0.0  # measured on requests it ran alone (moving average)
+
+    @property
+    def speed(self) -> float:
+        return self.tps or self.est_tps
 
 
 ROLE_WORDS = {"fast": ("fast", "schnell", "small"), "big": ("big", "large", "groß", "gross")}
@@ -4954,6 +4964,7 @@ class Router:
         self.on_timings = None  # callback(timings) for requests the master's big model ran alone
         self.waker = None  # callback(backend) -> backend once awake, or None: wake a sleeping host
         self.last_request = 0.0  # when the last request came in (updates wait for a quiet moment)
+        self.prefer_fast = False  # within a group: the fastest first, slower ones only when it is busy
 
     @property
     def big(self) -> Backend:
@@ -4973,6 +4984,8 @@ class Router:
                 prev = old.get((h.source, h.base))
                 if prev:
                     prev.name, prev.label, prev.group, prev.where, prev.ctx = h.name, h.label, h.group, h.where, h.ctx
+                    if prev.label != h.label or prev.est_tps != h.est_tps:
+                        prev.est_tps = h.est_tps
                     if prev.asleep != h.asleep:
                         prev.asleep, prev.healthy = h.asleep, False
                         prev.status = "asleep" if h.asleep else "starting"
@@ -4986,7 +4999,8 @@ class Router:
     def save(self) -> None:
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            ROUTER_STATE.write_text(json.dumps({"enabled": self.enabled, "mode": self.mode}))
+            ROUTER_STATE.write_text(json.dumps({"enabled": self.enabled, "mode": self.mode,
+                                                "prefer_fast": self.prefer_fast}))
         except OSError as e:
             log(f"Router: could not save the setting ({e})")
 
@@ -4996,8 +5010,11 @@ class Router:
                 self.enabled = bool(body["enabled"])
             if body.get("mode") in ("heuristic", "model"):
                 self.mode = body["mode"]
+            if "prefer_fast" in body:
+                self.prefer_fast = bool(body["prefer_fast"])
         self.save()
-        log(f"Router {'on' if self.enabled else 'off'} ({self.mode})")
+        log(f"Router {'on' if self.enabled else 'off'} ({self.mode}); "
+            f"{'fastest first' if self.prefer_fast else 'fewest running requests'} within a group")
         return self.info()
 
     def info(self) -> dict:
@@ -5006,14 +5023,14 @@ class Router:
 
         with self.lock:
             fast = self.fast or next((b for b in self.backends if b.name == "fast"), None)
-            return {"available": True, "enabled": self.enabled, "mode": self.mode,
+            return {"available": True, "enabled": self.enabled, "mode": self.mode, "prefer_fast": self.prefer_fast,
                     "fast": brief(fast), "big": brief(self.big),
                     "has_fast": any(b.name == "fast" for b in self.backends),
                     "counts": dict(self.counts), "recent": list(self.recent[-12:]),
                     "backends": [{"role": b.name, "group": b.group, "model": b.label, "where": b.where,
                                   "source": b.source, "status": "asleep" if b.asleep else b.status,
-                                  "inflight": b.inflight,
-                                  "served": b.served, "ctx": b.ctx} for b in self.backends]}
+                                  "inflight": b.inflight, "served": b.served, "ctx": b.ctx,
+                                  "tps": round(b.speed, 1), "measured": b.tps > 0} for b in self.backends]}
 
     def watch_health(self) -> None:
         import urllib.request
@@ -5035,9 +5052,18 @@ class Router:
 
     def choose(self, cands: list[Backend]) -> Optional[Backend]:
         """The healthy backend with the fewest running requests (then the
-        fewest served, so equal ones take turns)."""
+        fewest served, so equal ones take turns). With "fastest first": the
+        one that should finish soonest, (running + 1) / speed: a single
+        request goes to the fastest, a slower one helps once the fastest is
+        busy enough (llama-server runs several requests at once, each slower)."""
         ok = [b for b in cands if b.healthy]
-        return min(ok, key=lambda b: (b.inflight, b.served)) if ok else None
+        if not ok:
+            return None
+        known = [b.speed for b in ok if b.speed > 0]
+        if self.prefer_fast and known and len(ok) > 1:
+            slowest = min(known)  # no measurement or estimate yet: count it as the slowest
+            return min(ok, key=lambda b: ((b.inflight + 1) / (b.speed or slowest), b.served))
+        return min(ok, key=lambda b: (b.inflight, b.served))
 
     def role(self, role: str) -> list[Backend]:
         return [b for b in self.backends if b.name == role]
@@ -5285,13 +5311,17 @@ class Router:
                     with router.lock:
                         alone = alone and backend.inflight == 1
                         backend.inflight -= 1
-                    if alone and router.on_timings and backend.source == "local" and backend.name == "big" and tail:
-                        found = re.findall(rb'"timings"\s*:\s*(\{[^{}]*\})', tail)
-                        if found:
-                            try:
-                                router.on_timings(json.loads(found[-1]))
-                            except Exception as e:  # noqa: BLE001 - measuring must never break serving
-                                log(f"Calibration: {e}")
+                    found = re.findall(rb'"timings"\s*:\s*(\{[^{}]*\})', tail) if alone and tail else []
+                    if found:
+                        try:
+                            t = json.loads(found[-1])
+                            tps = float(t.get("predicted_per_second") or 0)
+                            if tps > 0 and (t.get("predicted_n") or 0) >= 8:  # the speed for "fastest first"
+                                backend.tps = tps if not backend.tps else 0.7 * backend.tps + 0.3 * tps
+                            if router.on_timings and backend.source == "local" and backend.name == "big":
+                                router.on_timings(t)
+                        except Exception as e:  # noqa: BLE001 - measuring must never break serving
+                            log(f"Calibration: {e}")
 
         return H
 
@@ -5532,7 +5562,8 @@ class HostManager:
                 backends.append(Backend(a.get("role") or "big",
                                         f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}{h.get('path') or ''}",
                                         self.key, st["model"], group=a.get("name") or st["model"],
-                                        where=h["name"], source=hid, ctx=st.get("ctx") or 0))
+                                        where=h["name"], source=hid, ctx=st.get("ctx") or 0,
+                                        est_tps=float(st.get("estimate_tps") or 0)))
         self.router.set_hosts(backends)
 
     # Sleep and wake ------------------------------------------------------------
