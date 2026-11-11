@@ -11,7 +11,7 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Python
         run: |
           python3 -m py_compile node/myrmid.py
@@ -22,13 +22,18 @@ jobs:
   node-cpu:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
         with:
           path: node/.llama.cpp
           key: llama-${{ hashFiles('node/LLAMA_CPP_COMMIT') }}
-      - name: Packages
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake git python3-zeroconf
+      # The runner image has git, cmake and a compiler. No apt: when Ubuntu's
+      # mirrors don't answer (it happens), apt fails the whole build.
+      - name: Tools
+        run: |
+          cmake --version | head -1
+          c++ --version | head -1
+          python3 -m pip install --quiet --break-system-packages zeroconf || echo "::warning::no zeroconf (mDNS); the build doesn't need it"
       - name: Build (CPU)
         run: bash node/build.sh --backends cpu --install "$RUNNER_TEMP/myrmid"
       - name: Smoke test
