@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="224" fill="#0f1e28"/>
+  <defs><polygon id="h" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/></defs>
+  <g stroke="#0f1e28" stroke-width="22">
+    <use href="#h" x="512" y="512" fill="#f0b54a"/>
+    <use href="#h" x="512" y="282" fill="#4fc3b4"/>
+    <use href="#h" x="512" y="742" fill="#4fc3b4" opacity=".75"/>
+    <use href="#h" x="313" y="397" fill="#4fc3b4" opacity=".9"/>
+    <use href="#h" x="711" y="397" fill="#4fc3b4" opacity=".6"/>
+    <use href="#h" x="313" y="627" fill="#4fc3b4" opacity=".6"/>
+    <use href="#h" x="711" y="627" fill="#4fc3b4" opacity=".9"/>
+  </g>
+  <g stroke="#0f1e28" stroke-width="18" stroke-linecap="round">
+    <path d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/>
+  </g>
+  <g fill="#0f1e28"><circle cx="512" cy="512" r="40"/></g>
+  <g fill="#0f1e28">
+    <circle cx="512" cy="282" r="26"/><circle cx="512" cy="742" r="26"/><circle cx="313" cy="397" r="26"/>
+    <circle cx="711" cy="397" r="26"/><circle cx="313" cy="627" r="26"/><circle cx="711" cy="627" r="26"/>
+  </g>
+</svg>

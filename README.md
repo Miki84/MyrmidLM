@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" width="128" alt="MyrmidLM Logo"></p>
+
 # MyrmidLM
 
 **Viele kleine Rechner, ein großes Sprachmodell.** MyrmidLM bündelt Linux-PCs (NVIDIA, AMD, Intel) und Android-Handys im eigenen Netz zu einem Cluster. Er stellt lokale LLMs als OpenAI-kompatible API bereit, mit Dashboard, Router und automatischen Updates.
