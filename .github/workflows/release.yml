@@ -54,10 +54,13 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      # Pinned: the Android build (Gradle 8.14, AGP 8.11, Kotlin 2.2) is what Flutter 3.47 wants;
+      # 3.50 refuses it. Move both together (android/settings.gradle.kts, gradle-wrapper.properties).
       - uses: subosito/flutter-action@v2
         if: env.KEYSTORE != ''
         with:
           channel: stable
+          flutter-version: 3.47.9
           cache: true
       - name: Signing
         if: env.KEYSTORE != ''
