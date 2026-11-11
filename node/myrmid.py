@@ -5964,7 +5964,10 @@ def local_models() -> list[dict]:
     seen, out = set(), []
     for d in MODEL_DIRS:
         root = Path(os.path.expanduser(d))
-        if not root.is_dir():
+        try:
+            if not root.is_dir():
+                continue
+        except OSError:  # e.g. a service without a home: ~ is /, and /.cache belongs to root
             continue
         for dirpath, dirnames, files in os.walk(root, followlinks=True):
             if dirpath.count(os.sep) - str(root).count(os.sep) > 6:
