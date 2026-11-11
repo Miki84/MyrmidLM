@@ -153,7 +153,7 @@ class SettingsView extends GetView<SettingsController> {
                 title: 'MyrmidLM',
                 // MyrmidLM is a fork: its author, and credit to the app it builds on.
                 subtitle: '${controller.appVersion.value.isEmpty ? '' : 'Version ${controller.appVersion.value} · '}'
-                    'by Mirsad Nadarevic · based on PrivateLM by orailnoor & techjarves',
+                    'by Miki84 · based on PrivateLM by orailnoor & techjarves',
               ),
             ]),
           ],
