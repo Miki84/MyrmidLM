@@ -46,6 +46,9 @@ jobs:
       KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
     steps:
       - uses: actions/checkout@v7
+        if: env.KEYSTORE != ''
+        with:
+          submodules: recursive  # stable-diffusion.cpp (image generation) and its ggml
       - name: No signing key
         if: env.KEYSTORE == ''
         run: echo "::notice::No ANDROID_KEYSTORE_BASE64 secret, so no APK in this release."
