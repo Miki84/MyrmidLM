@@ -1671,9 +1671,16 @@ def cmd_scan(args) -> None:
     for p in peers:
         if p.kind == "worker":
             kind = p.txt.get("kind", "phone")
-            note = "" if p.txt.get("v") == RPC_VERSION else f"  !! protocol {p.txt.get('v')}"
+            note = "" if p.txt.get("v") == RPC_VERSION else \
+                f"  !! speaks {p.txt.get('v') or '?'}, this cluster {RPC_VERSION}: " + \
+                ("needs the MyrmidLM app of this release" if kind == "phone" else "update it") + " (not used)"
             print(f"worker  {p.endpoint:<22} {kind:<5} {p.ram_mb or '?':>6} MB "
                   f"{p.bandwidth or 0:>6.1f} GB/s  {p.txt.get('model', p.name)}{note}")
+        elif p.kind == "host":
+            gpu = p.txt.get("gpu") or "?"
+            state = "  (waits to be taken into a cluster)" if p.txt.get("pair") == "1" else ""
+            print(f"host    {p.endpoint:<22} {p.txt.get('host') or p.name}, {gpu}, "
+                  f"models for the router on port {p.txt.get('api', HOST_API_PORT)}{state}")
         else:
             print(f"server  {p.endpoint:<22} http://{p.endpoint}{p.txt.get('path', '/v1')}  "
                   f"model {p.txt.get('model', '?')}")
