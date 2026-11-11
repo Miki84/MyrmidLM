@@ -3064,7 +3064,8 @@ class Dashboard:
                                                       "host": socket.gethostname()},
                     "workers": self.workers, "lan": self.lan, "history": self.history,
                     "bench": self.bench, "models": self.models_list(),
-                    "update": self.updater.info() if self.updater else {"installed": False}}
+                    "update": self.updater.info() if self.updater
+                    else {"installed": False, "release": own_version(), "rpc": RPC_VERSION}}
 
     def run_bench(self) -> dict:
         import threading

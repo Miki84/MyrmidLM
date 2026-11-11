@@ -96,6 +96,10 @@
   .rebalance { margin-bottom: 16px; display: grid; grid-template-columns: minmax(260px, 1fr) 1.4fr; gap: 26px; }
   .reb-state { margin: 0; font-size: 0.92rem; }
   .up-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+  .title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .ver-badge { font-size: 0.8rem; font-weight: 650; padding: 3px 9px; border-radius: 999px; text-decoration: none;
+               border: 1px solid var(--line); color: var(--muted); font-variant-numeric: tabular-nums; }
+  .ver-badge.new { background: var(--c0); border-color: var(--c0); color: #0f1e28; }
   #reb-events li { grid-template-columns: 62px 1fr; }
   @media (max-width: 900px) { .router, .rebalance { grid-template-columns: 1fr; } }
   .router-off { margin-bottom: 16px; color: var(--muted); font-size: 0.9rem; }
@@ -243,7 +247,7 @@
 <div class="wrap" id="app">
   <header class="top">
     <div>
-      <h1>MyrmidLM-Cluster</h1>
+      <div class="title-row"><h1>MyrmidLM-Cluster</h1><a class="ver-badge" id="ver-badge" href="#update-panel" hidden></a></div>
       <div class="model" id="model">Verbinde mit dem Master …</div>
       <details class="model-switch" id="model-switch">
         <summary>Modell wechseln oder herunterladen</summary>
@@ -886,8 +890,19 @@ async function setRebalance(body) {
 }
 
 const phaseText = { checking: "prüft", building: "baut", activating: "stellt um", failed: "Fehler", idle: "" };
+function renderVersion(u) {
+  const b = $("ver-badge");
+  if (!u.release) { b.hidden = true; return; }
+  b.hidden = false;
+  b.classList.toggle("new", !!u.target);
+  b.textContent = `Version ${u.release}` + (u.target ? ` · ${u.target} bereit` : "");
+  b.title = u.target ? `Version ${u.target} ist gebaut: unten im Bereich Version umstellen.`
+    : `Läuft: MyrmidLM ${u.release} (RPC ${u.rpc || "?"})`;
+}
+
 function renderUpdate(s) {
   const u = s.update || {}, panel = $("update-panel");
+  renderVersion(u);
   if (!u.installed) {
     $("up-version").textContent = u.release ? `${u.release}` : "";
     $("up-explain").textContent = "Updates sind auf diesem Master nicht eingerichtet: mit install.sh installieren.";
