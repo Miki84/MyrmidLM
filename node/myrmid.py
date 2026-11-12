@@ -538,6 +538,8 @@ class ModelInfo:
     expert_mb: float = 0.0  # MoE: all experts of one layer
     n_nextn: int = 0  # MTP: draft layers at the end of the model
     n_ctx_train: int = 0  # the context the model was trained for (0: unknown)
+    arch: str = ""
+    ple_mb: float = 0.0  # per-layer n-gram embedding table (Qwen3.8-Flash-Next): read from RAM or SSD, never on a GPU
 
     def per_layer_mb(self) -> float:
         """Memory per layer: all weights plus KV cache."""
@@ -566,9 +568,36 @@ def kv_flags(kv: Optional[str]) -> list[str]:
     return ["-ctk", kv, "-ctv", kv, "-fa", "on"]
 
 
+PLE_TENSORS = r"per_layer_token_embd|ple_ngram"  # Qwen3.8-Flash-Next's n-gram table: kept off the GPUs
+
+
+def gguf_shards(path: str) -> list[str]:
+    """All files of a split GGUF (name-00001-of-00003.gguf), else just path."""
+    m = re.match(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", path)
+    if not m:
+        return [path]
+    n = int(m.group(3))
+    files = [f"{m.group(1)}-{i:05d}-of-{m.group(3)}.gguf" for i in range(1, n + 1)]
+    return [f for f in files if os.path.isfile(f)] or [path]
+
+
 def gguf_info(path: str, ctx: int, kv_type: Optional[str] = "f16") -> ModelInfo:
     """Layer count, sizes and KV cache size from the GGUF header and tensor
-    table (tensor sizes are exact: taken from the data offsets)."""
+    table (tensor sizes are exact: taken from the data offsets). A split
+    model is read from all its files: big ones put most layers in the others."""
+    sizes: dict[str, int] = {}
+    kv: dict = {}
+    for i, shard in enumerate(gguf_shards(path)):
+        skv, shard_sizes = _gguf_read(shard)
+        if i == 0:
+            kv = skv
+        sizes.update(shard_sizes)
+    file_size = sum(os.path.getsize(x) for x in gguf_shards(path))
+    return _gguf_model(kv, sizes, file_size, ctx, kv_type)
+
+
+def _gguf_read(path: str) -> tuple[dict, dict[str, int]]:
+    """Metadata and tensor sizes (bytes) of one GGUF file."""
     scalar = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
     file_size = os.path.getsize(path)
     with open(path, "rb") as f:
@@ -614,18 +643,23 @@ def gguf_info(path: str, ctx: int, kv_type: Optional[str] = "f16") -> ModelInfo:
         align = kv.get("general.alignment", 32) or 32
         data_start = (f.tell() + align - 1) // align * align
 
+    tensors.sort()
+    sizes: dict[str, int] = {}
+    for i, (off, name, dims) in enumerate(tensors):
+        nxt = tensors[i + 1][0] if i + 1 < len(tensors) else file_size - data_start
+        sizes[name] = nxt - off
+    return kv, sizes
+
+
+def _gguf_model(kv: dict, sizes: dict[str, int], file_size: int, ctx: int, kv_type: Optional[str]) -> ModelInfo:
     arch = kv.get("general.architecture")
     a = lambda k, d=None: kv.get(f"{arch}.{k}", d)  # noqa: E731
     n_layer = a("block_count")
     if not isinstance(n_layer, int) or n_layer <= 0:
         die("Could not read the model's layer count")
 
-    tensors.sort()
-    sizes: dict[str, int] = {}
-    for i, (off, name, dims) in enumerate(tensors):
-        nxt = tensors[i + 1][0] if i + 1 < len(tensors) else file_size - data_start
-        sizes[name] = nxt - off
-    blk = sum(v for k, v in sizes.items() if k.startswith("blk."))
+    ple = sum(v for k, v in sizes.items() if re.search(PLE_TENSORS, k))
+    blk = sum(v for k, v in sizes.items() if k.startswith("blk.") and not re.search(PLE_TENSORS, k))
     out = sizes.get("output.weight", sizes.get("token_embd.weight", 0))
 
     n_embd = a("embedding_length", 0) or 0
@@ -649,7 +683,8 @@ def gguf_info(path: str, ctx: int, kv_type: Optional[str] = "f16") -> ModelInfo:
                      n_expert if isinstance(n_expert, int) else 0,
                      n_used if isinstance(n_used, int) else 0,
                      exps / n_layer / 2**20, nextn if isinstance(nextn, int) else 0,
-                     train if isinstance(train, int) and train > 0 else 0)
+                     train if isinstance(train, int) and train > 0 else 0,
+                     str(arch or ""), ple / 2**20)
 
 
 # ── Planning ─────────────────────────────────────────────────────────────────
@@ -1186,6 +1221,9 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     if not Path(model).is_file():
         die(f"No such model: {model}")
     m = gguf_info(model, args.ctx, getattr(args, "kv", "f16"))
+    args.ple_mb = m.ple_mb
+    if m.ple_mb and not quiet:
+        log(f"n-gram table {m.ple_mb / 1024:.0f} GB: stays in RAM (or is read from the SSD when RAM is short)")
     if args.mtp and not m.n_nextn:
         die("This model has no MTP layers (nextn_predict_layers = 0). Use a model with MTP, "
             "or leave out --mtp.")
@@ -1442,6 +1480,16 @@ def _moe_command(args, model: str, m: ModelInfo, gpus: list[Device], moe: MoePla
 def _finish_command(args, cmd: list[str], model: str, tps: float, info: Optional[dict] = None) -> ServerPlan:
     cmd += ["--metrics"]  # for the dashboard
     cmd += kv_flags(getattr(args, "kv", "f16"))
+    if not getattr(args, "no_tune", False):
+        tuned = tune_lookup(model, getattr(args, "tune_slot", ""))
+        if tuned:
+            apply_tune(cmd, tuned.get("flags") or {})
+            if info is not None:
+                info["tuned"] = {"flags": tuned.get("flags"), "at": tuned.get("at"), "score": tuned.get("score")}
+    if getattr(args, "ple_mb", 0):
+        # The n-gram table is only looked up (a few rows per token): host memory,
+        # mmap'd, so with too little RAM the OS reads it from the SSD as needed.
+        cmd += ["-ot", f"{PLE_TENSORS}=CPU"]
     if args.mtp:
         cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(args.mtp)]
     elif getattr(args, "draft_opts", None):
@@ -1549,6 +1597,7 @@ def cmd_serve(args) -> None:
     public_name = args.model_name
     router = Router(backends, args.fast_ctx, enabled, mode, public_name, sp.key)
     router.on_timings = sup.on_timings
+    router.load_external()
     router.embedder = Embedder(public_port + 3)
     if mode == "examples":
         router.embedder.ensure()
@@ -1606,6 +1655,161 @@ def cmd_serve(args) -> None:
         log("Rebalancing on: new or lost workers lead to a new plan when the server is idle "
             "(--rebalance off or the dashboard switches it off)")
     sup.run([adv] if adv else [], [fast_proc] if fast_proc else [])
+
+
+# ── Autotune ─────────────────────────────────────────────────────────────────
+#
+# The planner computes a split; the autotune measures it. It starts the
+# planned server a few times with other settings (batch size, CPU threads,
+# the CPU's share of the MoE expert cache misses), one setting after the
+# other, and keeps what answers a typical agent turn fastest: reading a long
+# prompt and writing an answer. Saved per model and slot; every later start
+# uses it.
+TUNE_STATE = CONFIG_DIR / "tune.json"
+TUNE_PROMPT, TUNE_GEN = 3000, 160  # a typical opencode turn: long prompt, short answer
+
+
+def tune_lookup(model: str, slot: str = "") -> dict:
+    try:
+        return json.loads(TUNE_STATE.read_text()).get(f"{Path(model).resolve()}|{slot}") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def tune_save(model: str, slot: str, entry: Optional[dict]) -> None:
+    try:
+        data = json.loads(TUNE_STATE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    key = f"{Path(model).resolve()}|{slot}"
+    if entry is None:
+        data.pop(key, None)
+    else:
+        data[key] = entry
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    TUNE_STATE.write_text(json.dumps(data, indent=1))
+
+
+def apply_tune(cmd: list[str], flags: dict) -> list[str]:
+    """Sets each flag in the command (replacing its value), skipping flags
+    that don't apply to this plan (the CPU share without the expert cache)."""
+    for flag, value in flags.items():
+        if flag == "--moe-cache-cpu-share" and "--cpu-moe" not in cmd:
+            continue
+        if flag in cmd:
+            i = cmd.index(flag)
+            if i + 1 < len(cmd):
+                cmd[i + 1] = str(value)
+        else:
+            cmd += [flag, str(value)]
+    return cmd
+
+
+def _tune_variants(cmd: list[str]) -> list[tuple[str, list]]:
+    """Settings to try, each a list of values (None: llama.cpp's default)."""
+    dims: list[tuple[str, list]] = []
+    if "--cpu-moe" in cmd:
+        dims.append(("--moe-cache-cpu-share", [None, 0.25, 0.75]))
+    dims.append(("-ub", [None, 1024, 2048]))
+    cpu_work = "--cpu-moe" in cmd or "--n-cpu-moe" in cmd or \
+        ("-ngl" in cmd and cmd[cmd.index("-ngl") + 1] == "0")
+    if cpu_work:
+        cores = os.cpu_count() or 4
+        phys = max(1, cores // 2)
+        dims.append(("-t", [None, phys] + ([cores] if cores != phys else [])))
+    return dims
+
+
+def tune_bench(base: str, key: str, timeout: float = 900) -> dict:
+    """Reads a long prompt and writes an answer: prompt and generation speed."""
+    call = _http(base, key, "big", timeout)
+    per = len(call("/tokenize", {"content": FILLER}).get("tokens", [])) or 30
+    n_ctx = call("/props").get("default_generation_settings", {}).get("n_ctx", 0) or 4096
+    want = max(256, min(TUNE_PROMPT, n_ctx - TUNE_GEN - 64))
+    prompt = FILLER * max(1, want // per) + "\nContinue the log with a new entry:"
+    call("/completion", {"prompt": "Hello", "n_predict": 4, "cache_prompt": False})  # warm-up
+    t = call("/completion", {"prompt": prompt, "n_predict": TUNE_GEN, "ignore_eos": True, "cache_prompt": False,
+                             "temperature": 0.7, "seed": 42}).get("timings", {})
+    pp, tg = float(t.get("prompt_per_second") or 0), float(t.get("predicted_per_second") or 0)
+    n_p, n_g = int(t.get("prompt_n") or want), int(t.get("predicted_n") or TUNE_GEN)
+    secs = (n_p / pp if pp else 1e9) + (n_g / tg if tg else 1e9)
+    return {"pp": round(pp, 1), "tg": round(tg, 2), "secs": round(secs, 2)}
+
+
+def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=None,
+             load_timeout: float = 3600) -> dict:
+    """Measures the variants one setting at a time, keeping the best of each.
+    base_cmd is the planned command (its --port is replaced). Returns
+    {"flags", "score", "results"}; raises RuntimeError if nothing ran."""
+    say = progress or (lambda *_: None)
+    stop = cancelled or (lambda: False)
+    base_cmd = apply_tune(list(base_cmd), {"--port": port, "--host": "127.0.0.1"})
+    dims = _tune_variants(base_cmd)
+    total = 1 + sum(len(v) - 1 for _, v in dims)
+    results: list[dict] = []
+    best_flags: dict = {}
+    seen: dict[str, dict] = {}
+
+    def trial(flags: dict) -> Optional[dict]:
+        sig = json.dumps(flags, sort_keys=True)
+        if sig in seen:
+            return seen[sig]
+        n = len(results) + 1
+        label = ", ".join(f"{k} {v}" for k, v in flags.items()) or "Plan"
+        say(f"{n}/{total}: {label} – lädt …", n, total)
+        cmd = apply_tune(list(base_cmd), flags)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        r: dict = {"flags": dict(flags), "label": label}
+        try:
+            if not _wait_healthy(f"http://127.0.0.1:{port}", proc, timeout=load_timeout):
+                r["error"] = f"startet nicht (Code {proc.poll()})"
+            elif not stop():
+                say(f"{n}/{total}: {label} – misst …", n, total)
+                r.update(tune_bench(f"http://127.0.0.1:{port}", key))
+        except (OSError, SystemExit, ValueError) as e:
+            r["error"] = str(e)[:200] or "Messung fehlgeschlagen"
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        results.append(r)
+        seen[sig] = r
+        log(f"Autotune {label}: " + (r.get("error") or f"{r['pp']} t/s prompt, {r['tg']} t/s answer, {r['secs']} s"))
+        return r
+
+    base = trial({})
+    if stop():
+        raise RuntimeError("abgebrochen")
+    best = base if base and "secs" in base else None
+    for flag, values in dims:
+        for v in values[1:]:
+            if stop():
+                raise RuntimeError("abgebrochen")
+            r = trial({**best_flags, flag: v})
+            if r and "secs" in r and (best is None or r["secs"] < best["secs"] * 0.98):  # 2 %: noise
+                best, best_flags = r, dict(r["flags"])
+    if best is None:
+        raise RuntimeError("keine Variante ist gestartet: " + (results[0].get("error") or ""))
+    return {"flags": best_flags, "score": {k: best[k] for k in ("pp", "tg", "secs")},
+            "base": {k: base[k] for k in ("pp", "tg", "secs")} if base and "secs" in base else None,
+            "results": results, "at": int(time.time())}
+
+
+def cmd_tune(args) -> None:
+    """myrmid tune: the autotune for the model serve would load here (stop
+    the service first: the GPU memory is needed)."""
+    args.host, args.no_advertise, args.workers, args.no_tune = "127.0.0.1", True, "off", True
+    try:
+        sp = build_server_fitting(args, quiet=False, exit_on_fail=True)
+    except PlanTooBig as e:
+        die(str(e), PLAN_FAILED)
+    res = autotune(sp.cmd, sp.key, args.port, lambda text, *_: log(text))
+    tune_save(args.model, "", res)
+    print(f"\nBest: {res['flags'] or 'the plan as it is'} – {res['score']['pp']} t/s prompt, "
+          f"{res['score']['tg']} t/s answer. Saved; serve uses it from now on.")
 
 
 def cmd_tune_moe(args) -> None:
@@ -2223,6 +2427,7 @@ class Supervisor:
         self.calib = Calibration()
         self.known = Known()
         self.model_job: dict = {}
+        self.tune_job: dict = {}  # the autotune running or last run
         self.on_new_model = None  # callback(sp) after a model change
         self.last_calib_check = 0.0
         self.last_calib_save = 0.0
@@ -2267,6 +2472,8 @@ class Supervisor:
                     "model_job": self.model_progress(),
                     "pending": self.pending, "now_requested": self.now_requested,
                     "events": list(self.events[-8:]), "ctx_auto": self.ctx_auto,
+                    "tune_job": self.tune_job or None,
+                    "tuned": tune_lookup(self.args.model) or None,
                     "ctx": self.args.ctx, "ctx_max": int(getattr(self.args, "ctx_top", 0) or 0),
                     "ctx_choices": list(CTX_CHOICES), "ctx_train": self._ctx_train(),
                     "kv": getattr(self.args, "kv", "f16"), "kv_choices": list(KV_BYTES),
@@ -2367,6 +2574,74 @@ class Supervisor:
             return gguf_info(str(Path(self.args.model).expanduser().resolve()), CTX_STEPS[-1]).n_ctx_train
         except (OSError, SystemExit, struct.error):
             return 0
+
+    def tune_api(self, body: dict) -> dict:
+        """Dashboard: start or cancel the autotune, or forget its result."""
+        import threading
+
+        action = str(body.get("action") or "start")
+        with self.lock:
+            running = self.tune_job.get("state") == "running"
+            if action == "cancel":
+                if running:
+                    self.tune_job["cancel"] = True
+                return self.info()
+            if action == "reset":
+                if running:
+                    return {"error": "the autotune is running"}
+                tune_save(self.args.model, "", None)
+                self.tune_job = {}
+            elif running:
+                return {"error": "the autotune is running"}
+            elif self.model_job and self.model_job.get("state") in ("resolving", "downloading", "loading"):
+                return {"error": "a model change is running"}
+            elif self.state not in ("running", "waiting"):
+                return {"error": "the model is not running"}
+            else:
+                self.tune_job = {"state": "running", "text": "startet …", "step": 0, "total": 0,
+                                 "started": int(time.time()), "model": Path(self.args.model).stem}
+                threading.Thread(target=self._tune, daemon=True).start()
+                return self.info()
+        threading.Thread(target=self.replan, args=("Autotune result removed", "Autotune verworfen, lade neu."),
+                         daemon=True).start()
+        return self.info()
+
+    def _tune(self) -> None:
+        """Runs the autotune for the master's model (only when it runs on
+        the master alone: with workers the network decides the speed)."""
+        a, job = self.args, self.tune_job
+        self.event("Autotune started: the model restarts several times", "Autotune gestartet: das Modell startet mehrmals neu.")
+        with self.lock:
+            self.state = "tuning"
+        self.stop_server()
+        public = (a.host, a.port)
+        a.host, a.port, a.no_tune = "127.0.0.1", self.big_port, True
+        if self.ctx_auto:
+            a.ctx = None
+
+        def progress(text: str, step: int = 0, total: int = 0) -> None:
+            job.update(text=text, step=step, total=total)
+
+        try:
+            sp = build_server_fitting(a, True, exit_on_fail=False)
+            if any(m.get("role") == "worker" for m in sp.info.get("machines", [])):
+                raise RuntimeError("Das Modell läuft mit Workern; der Autotune misst nur Modelle, die auf einem PC laufen.")
+            res = autotune(sp.cmd, sp.key, self.big_port, progress, lambda: bool(job.get("cancel")))
+            tune_save(a.model, "", res)
+            job.update(state="done", text="fertig", result=res)
+            sc, b = res["score"], res.get("base") or res["score"]
+            self.event(f"Autotune done: {res['flags'] or 'plan unchanged'}",
+                       f"Autotune fertig: Antwort {b['tg']} → {sc['tg']} Token/s, Prompt {b['pp']} → {sc['pp']} Token/s.")
+        except (RuntimeError, PlanTooBig) as e:
+            job.update(state="error", text=str(e)[:300])
+            self.event(f"Autotune stopped: {e}", f"Autotune beendet: {e}")
+        except Exception as e:  # noqa: BLE001 - the model must come back
+            job.update(state="error", text=f"{type(e).__name__}: {e}"[:300])
+        finally:
+            a.host, a.port = public
+            a.no_tune = False
+            job["ended"] = int(time.time())
+            self.replan("Autotune: loading the model again", "Autotune: lade das Modell wieder.")
 
     def ctx_api(self, body: dict) -> dict:
         """Dashboard: the largest context the master may use (0: automatic,
@@ -3304,6 +3579,7 @@ class Dashboard:
                                  "/api/role": self.switch_role,
                                  "/api/model": self.sup.model_api,
                                  "/api/ctx": self.sup.ctx_api,
+                                 "/api/tune": self.sup.tune_api,
                                  "/api/update": lambda b: self.updater.api(b) if self.updater else {"ok": False},
                                  "/api/wake": lambda b: {"ok": self.sup.known.wake(str(b.get("id") or ""), force=True)},
                                  "/api/hosts": self.hosts.api if self.hosts else (lambda b: {"error": "no hosts"})},
@@ -4411,6 +4687,7 @@ class HostAgent:
         self.download: Optional[dict] = None  # files being fetched, for the progress
         self.job = 0  # a newer assignment makes older jobs stop
         self.restarts = 0
+        self.tune_job: dict = {}
         self.paths: dict[str, str] = {}  # assigned model -> file, so a restart needs no lookup
         self.mac, self.bcast = "", ""
         self.stats = stats or SystemStats(probe(bench=False))
@@ -4497,6 +4774,8 @@ class HostAgent:
                   "mac": self.mac, "bcast": self.bcast,
                   "can_sleep": os.geteuid() == 0 or Path("/etc/systemd/system/myrmid-suspend.path").exists(),
                   "switchable": can_switch_role(), "keyed": True, "release": own_version(),
+                  "tune_job": self.tune_job or None,
+                  "tuned": (tune_lookup(str(self.model_path), self.path) or None) if self.model_path else None,
                   "update": update_brief()}
         st["metrics"] = self._metrics()
         st["stats"] = self.stats.sample()
@@ -4617,13 +4896,8 @@ class HostAgent:
             if not current():
                 return
             self._set("loading")
-            ns = argparse.Namespace(model=str(path), ctx=a.get("ctx"), kv=a.get("kv") or "f16", mtp=0, workers="off",
-                                    ram_limit=self.ram_limit_gb, api_key=self.key, host="127.0.0.1",
-                                    port=self.api_port, extra=list(self.args.extra or []), scan_timeout=1.0,
-                                    only_devices=[self.gpu.name] if self.gpu else None)
-            sp = build_server_fitting(ns, quiet=True, exit_on_fail=False)
-            if self.gpu:  # without it llama.cpp spreads the model over every GPU it sees
-                sp.cmd += ["--device", self.gpu.name]
+            ns = self._ns(path, a)
+            sp = self._plan(ns)
             if not current():
                 return
             log(" ".join(sp.cmd).replace(self.key, "***"))
@@ -4641,6 +4915,69 @@ class HostAgent:
         except Exception as e:  # noqa: BLE001 - report it to the master instead of dying
             if current():
                 self._set("error", f"{type(e).__name__}: {e}")
+
+    def _ns(self, path: Path, a: dict, no_tune: bool = False) -> argparse.Namespace:
+        return argparse.Namespace(model=str(path), ctx=a.get("ctx"), kv=a.get("kv") or "f16", mtp=0, workers="off",
+                                  ram_limit=self.ram_limit_gb, api_key=self.key, host="127.0.0.1",
+                                  port=self.api_port, extra=list(self.args.extra or []), scan_timeout=1.0,
+                                  only_devices=[self.gpu.name] if self.gpu else None,
+                                  tune_slot=self.path, no_tune=no_tune)
+
+    def _plan(self, ns: argparse.Namespace) -> "ServerPlan":
+        sp = build_server_fitting(ns, quiet=True, exit_on_fail=False)
+        if self.gpu:  # without it llama.cpp spreads the model over every GPU it sees
+            sp.cmd += ["--device", self.gpu.name]
+        return sp
+
+    def tune(self, body: Optional[dict] = None) -> dict:
+        """The master's dashboard: autotune this host's model (start, cancel, reset)."""
+        import threading
+
+        action = str((body or {}).get("action") or "start")
+        with self.lock:
+            running = self.tune_job.get("state") == "running"
+            if action == "cancel":
+                if running:
+                    self.tune_job["cancel"] = True
+                return self.status()
+            if running:
+                return {**self.status(), "error": "the autotune is running"}
+            if action == "reset":
+                if self.model_path:
+                    tune_save(str(self.model_path), self.path, None)
+                self.tune_job = {}
+                a = self.assignment
+            else:
+                if self.state != "ready" or not self.model_path or not self.assignment:
+                    return {**self.status(), "error": "no model running"}
+                self.job += 1  # no restart from watch() meanwhile
+                self.tune_job = {"state": "running", "text": "startet …", "step": 0, "total": 0,
+                                 "started": int(time.time()), "model": self.model_path.stem}
+                threading.Thread(target=self._tune, args=(self.model_path, dict(self.assignment)),
+                                 daemon=True).start()
+                return self.status()
+        if a:
+            self.assign(a)
+        return self.status()
+
+    def _tune(self, path: Path, a: dict) -> None:
+        job = self.tune_job
+        self._set("tuning")
+        self.stop_server()
+        try:
+            sp = self._plan(self._ns(path, a, no_tune=True))
+            res = autotune(sp.cmd, self.key, self.api_port,
+                           lambda text, step=0, total=0: job.update(text=text, step=step, total=total),
+                           lambda: bool(job.get("cancel")))
+            tune_save(str(path), self.path, res)
+            job.update(state="done", text="fertig", result=res)
+        except (RuntimeError, PlanTooBig, ModelError) as e:
+            job.update(state="error", text=str(e)[:300])
+        except Exception as e:  # noqa: BLE001 - the model must come back
+            job.update(state="error", text=f"{type(e).__name__}: {e}"[:300])
+        job["ended"] = int(time.time())
+        log(f"{self.label}: autotune {job['state']}: {job.get('text')}")
+        self.assign(a)
 
     def watch(self) -> None:
         """Restarts llama-server if it ends on its own (up to 3 times in a row)."""
@@ -4716,7 +5053,7 @@ class HostNode:
         for i, a in enumerate(self.agents):
             for prefix in ([""] if i == 0 else []) + ([a.path] if a.path else []):
                 gets[f"{prefix}/status"] = a.status
-                posts.update({f"{prefix}/assign": a.assign, f"{prefix}/unload": a.unload,
+                posts.update({f"{prefix}/assign": a.assign, f"{prefix}/unload": a.unload, f"{prefix}/tune": a.tune,
                               f"{prefix}/sleep": a.sleep})
         posts.update({"/layout": self.set_layout, "/role": lambda body: request_role(str(body.get("role") or "")),
                       "/update": request_update})
@@ -5055,6 +5392,7 @@ class Backend:
     est_tps: float = 0.0  # the planner's estimate (tokens/s)
     ctx_at: float = 0.0  # when ctx was last read from the server
     tps: float = 0.0  # measured on requests it ran alone (moving average)
+    upstream_model: str = ""  # external server: the model name it wants in requests
 
     @property
     def speed(self) -> float:
@@ -5067,6 +5405,7 @@ ROLE_WORDS = {"fast": ("fast", "schnell", "small"), "big": ("big", "large", "gro
 # example sentences; the closest category decides (fast, big, or a model by
 # its client name, e.g. a coder model for code). Edited in the dashboard.
 ROUTER_EXAMPLES = CONFIG_DIR / "router-examples.json"
+ROUTER_EXTERNAL = CONFIG_DIR / "external.json"  # other OpenAI servers in the router (Strata, vLLM, ...)
 EMBED_MODEL = "ggml-org/embeddinggemma-300M-GGUF:Q8_0"  # 300 MB, many languages, runs on the CPU
 DEFAULT_EXAMPLES = {
     "threshold": 0.05,
@@ -5194,6 +5533,7 @@ class Router:
         except (OSError, ValueError):
             pass
         self.embedder: Optional[Embedder] = None  # set by serve; started when mode is "examples"
+        self.external: list[dict] = []  # other OpenAI servers (external.json)
 
     @property
     def big(self) -> Backend:
@@ -5207,8 +5547,8 @@ class Router:
         """Replaces the hosts' backends, keeping health and counters of the
         ones that stay."""
         with self.lock:
-            old = {(b.source, b.base): b for b in self.backends if b.source != "local"}
-            keep = [b for b in self.backends if b.source == "local"]
+            old = {(b.source, b.base): b for b in self.backends if b.source not in ("local", "external")}
+            keep = [b for b in self.backends if b.source in ("local", "external")]
             for h in hosts:
                 prev = old.get((h.source, h.base))
                 if prev:
@@ -5222,6 +5562,60 @@ class Router:
                 else:
                     keep.append(h)
             self.backends = keep
+
+    def load_external(self) -> None:
+        try:
+            self.external = json.loads(ROUTER_EXTERNAL.read_text())
+        except (OSError, ValueError):
+            self.external = []
+        self._apply_external()
+
+    def _apply_external(self) -> None:
+        from urllib.parse import urlsplit
+
+        backs = []
+        for e in self.external:
+            backs.append(Backend(e["role"], e["url"], e.get("key") or "", e["name"], group=e["name"],
+                                 where=urlsplit(e["url"]).netloc or e["url"], source="external",
+                                 ctx=int(e.get("ctx") or 0), upstream_model=e.get("model") or ""))
+        with self.lock:
+            old = {(b.base, b.label): b for b in self.backends if b.source == "external"}
+            keep = [b for b in self.backends if b.source != "external"]
+            for b in backs:
+                prev = old.get((b.base, b.label))
+                if prev:
+                    prev.name, prev.key, prev.ctx, prev.upstream_model = b.name, b.key, b.ctx, b.upstream_model
+                keep.append(prev or b)
+            self.backends = keep
+
+    def set_external(self, items: list) -> str:
+        out, names = [], set()
+        saved = {e["name"]: e.get("key") or "" for e in self.external}
+        for e in items or []:
+            name = str(e.get("name") or "").strip()[:60]
+            url = str(e.get("url") or "").strip().rstrip("/")
+            url = url[:-3] if url.endswith("/v1") else url
+            if not name and not url:
+                continue
+            if not name or not re.match(r"^https?://[^/\s]+", url):
+                return f"„{name or url}“: Name und eine Adresse wie http://192.168.1.50:8080 nötig."
+            if name.lower() in names or name.lower() in (self.public_name.lower(), "privatelm"):
+                return f"Den Namen „{name}“ gibt es schon."
+            names.add(name.lower())
+            ctx = str(e.get("ctx") or "").strip()
+            key = str(e.get("key") or "").strip()
+            key = saved.get(name, "") if key == "__keep__" else key
+            out.append({"name": name, "url": url, "key": key,
+                        "role": e.get("role") if e.get("role") in ("big", "fast", "extra") else "extra",
+                        "model": str(e.get("model") or "").strip()[:120], "ctx": int(ctx) if ctx.isdigit() else 0})
+        self.external = out
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            ROUTER_EXTERNAL.write_text(json.dumps(out, indent=1))
+        except OSError as e:
+            return f"could not save: {e}"
+        self._apply_external()
+        return ""
 
     # State -----------------------------------------------------------------
 
@@ -5243,6 +5637,10 @@ class Router:
                 self.prefer_fast = bool(body["prefer_fast"])
         if isinstance(body.get("examples"), dict):
             err = self._set_examples(body["examples"])
+            if err:
+                return {**self.info(), "error": err}
+        if isinstance(body.get("external"), list):
+            err = self.set_external(body["external"])
             if err:
                 return {**self.info(), "error": err}
         if body.get("test") is not None:
@@ -5345,6 +5743,8 @@ class Router:
             emb = self.embedder
             return {"available": True, "enabled": self.enabled, "mode": self.mode, "prefer_fast": self.prefer_fast,
                     "examples": self.examples,
+                    "external": [{k: v for k, v in e.items() if k != "key"} | {"has_key": bool(e.get("key"))}
+                                 for e in getattr(self, "external", [])],
                     "embedder": {"state": emb.state, "error": emb.error, "model": EMBED_MODEL} if emb else None,
                     "fast": brief(fast), "big": brief(self.big),
                     "has_fast": any(b.name == "fast" for b in self.backends),
@@ -5368,6 +5768,14 @@ class Router:
                 except OSError as e:
                     b.healthy = False
                     b.status = "loading" if "503" in str(e) else "down"
+                    if b.source == "external" and "503" not in str(e):  # not every server has /health
+                        try:
+                            req = urllib.request.Request(b.base + "/v1/models", headers={
+                                "Authorization": f"Bearer {b.key}"} if b.key else {})
+                            with urllib.request.urlopen(req, timeout=3) as r:
+                                b.healthy, b.status = r.status == 200, "ready"
+                        except OSError:
+                            pass
                 if b.healthy and time.time() - b.ctx_at > 60:
                     # what the server really has (a planner may have shrunk it to fit)
                     b.ctx_at = time.time()
@@ -5665,6 +6073,11 @@ class Router:
                 if backend.key:
                     headers["Authorization"] = f"Bearer {backend.key}"
                 path = (u.path.rstrip("/") + self.path) if u.path not in ("", "/") else self.path
+                if backend.upstream_model and raw:
+                    try:  # an external server may want its own model name
+                        raw = json.dumps({**json.loads(raw), "model": backend.upstream_model}).encode()
+                    except (ValueError, TypeError):
+                        pass
                 with router.lock:
                     alone = backend.inflight == 0
                     backend.inflight += 1
@@ -6060,6 +6473,14 @@ class HostManager:
         if body.get("wake"):
             self.wake(hid, force=True)
             return self.info()
+        if body.get("tune"):
+            try:
+                res = self._call(self.hosts[hid], "/tune", {"action": str(body["tune"])}, timeout=10)
+            except Exception as e:  # noqa: BLE001
+                return {**self.info(), "error": f"autotune: {e}"}
+            if res.get("error"):
+                return {**self.info(), "error": res["error"]}
+            return self.info()
         if body.get("layout"):
             h = dict(self.hosts[hid], path="")  # the PC's first host answers for the layout
             try:
@@ -6127,7 +6548,7 @@ class HostManager:
                               "pc": h.get("pc"), "path": h.get("path") or "",
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
-                                                       "gpus", "layout_owner", "slot", "gpu", "switching")},
+                                                       "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]
@@ -6358,6 +6779,8 @@ CATALOG = [
     ("qwen3.8-27b", "unsloth/Qwen3.8-27B-GGUF", "Q4_K_M", "groß, dicht: lohnt den Verbund"),
     ("qwen3-32b", "bartowski/Qwen_Qwen3-32B-GGUF", "Q4_K_M", "groß, dicht: lohnt den Verbund"),
     ("qwen3.6-35b-a3b", "unsloth/Qwen3.6-35B-A3B-GGUF", "UD-Q4_K_M", "MoE: schnell bei viel RAM im Master"),
+    ("qwen3.8-flash-next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ3_XXS",
+     "MoE 125B (6B aktiv), ≈ 82 GB: ein Host mit GPU und ≥ 96 GB RAM, danach Autotune"),
 ]
 MODEL_DIRS = ["~/models", "~/Models", "~/Downloads", "/srv/models", "/opt/models", "~/.cache/llama.cpp",
               "~/.cache/huggingface/hub", "~/.lmstudio/models", "~/.cache/lm-studio/models"]
@@ -6772,6 +7195,16 @@ def main() -> None:
                    help="with the router: which model to measure (default big)")
     b.add_argument("--iface", help="count only these interfaces, e.g. eth0 (default: all but lo)")
     b.set_defaults(fn=cmd_bench)
+
+    tu = sub.add_parser("tune", help="autotune: measure batch size, threads and MoE settings for a model here "
+                                     "(stop the service first); serve uses the result")
+    tu.add_argument("-m", "--model", required=True)
+    tu.add_argument("--ctx", type=int, default=None)
+    tu.add_argument("--kv-cache", dest="kv", choices=list(KV_BYTES), default="f16")
+    tu.add_argument("--ram-limit", type=float)
+    tu.add_argument("--port", type=int, default=18080)
+    tu.add_argument("--scan-timeout", type=float, default=1.0)
+    tu.set_defaults(fn=cmd_tune, api_key="", extra=[], mtp=0)
 
     tm = sub.add_parser("tune-moe", help="measure the best MoE expert cache and CPU share here (stop the server first)")
     tm.add_argument("-m", "--model", required=True)

@@ -215,6 +215,12 @@
   .kv { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 0.85rem; }
   .kv span b { font-weight: 600; }
   .note { font-size: 0.84rem; color: var(--muted); }
+  .tune-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+  .ext-list { display: grid; gap: 8px; }
+  .ext-row { display: grid; grid-template-columns: 1fr 1.6fr 1fr 0.9fr 0.7fr 1fr auto; gap: 6px; align-items: center; }
+  .ext-row input, .ext-row select { font: inherit; font-size: 0.88rem; padding: 6px 8px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--surface); color: var(--text); min-width: 0; }
+  @media (max-width: 860px) { .ext-row { grid-template-columns: 1fr 1fr; } }
   .note.bad { color: var(--bad); }
 
   /* LAN + footer */
@@ -282,6 +288,13 @@
           </div>
         </form>
         <div class="note" id="ctx-note"></div>
+        <div class="tune-row">
+          <span class="muted">Autotune</span>
+          <button class="btn quiet" type="button" id="tune-start">Autotune starten</button>
+          <button class="btn quiet" type="button" id="tune-cancel" hidden>Abbrechen</button>
+          <button class="btn quiet" type="button" id="tune-reset" hidden>Ergebnis verwerfen</button>
+        </div>
+        <div class="note" id="tune-note" aria-live="polite"></div>
       </details>
     </div>
     <div class="pill" id="state"><span class="dot"></span><span>Verbinde …</span></div>
@@ -342,6 +355,16 @@
       </form>
       <ul class="ex-scores" id="ex-scores" aria-live="polite"></ul>
     </div>
+    <details class="examples" id="external">
+      <summary><b>Externe Server</b> <span class="muted" id="ext-count"></span></summary>
+      <p class="muted" style="margin:0">Andere OpenAI-kompatible Server im Router, z. B. Strata oder vLLM auf einem PC im Netz. Clients erreichen sie über den Namen; mit Rolle „schnell“ oder „groß“ entscheidet auch der Router über sie.</p>
+      <div class="ext-list" id="ext-list"></div>
+      <div class="row">
+        <button class="btn quiet" type="button" id="ext-add">Server hinzufügen</button>
+        <button class="btn" type="button" id="ext-save">Speichern</button>
+        <span class="muted" id="ext-msg" role="status"></span>
+      </div>
+    </details>
   </section>
   <p class="router-off" id="router-off" hidden></p>
 
@@ -508,8 +531,27 @@ $("ctx-form").addEventListener("submit", async (ev) => {
   ev.target.querySelector("button").disabled = false;
 });
 
+function renderTune(s) {
+  const r = s.rebalance || {}, job = r.tune_job, running = job && job.state === "running";
+  $("tune-start").hidden = !!running;
+  $("tune-cancel").hidden = !running;
+  $("tune-reset").hidden = running || !r.tuned;
+  $("tune-start").textContent = r.tuned ? "Autotune erneut" : "Autotune starten";
+  $("tune-note").textContent = tuneText(job, r.tuned)
+    || "Probiert auf diesem PC einige Einstellungen (Batch-Größe, CPU-Threads, Anteil der CPU bei MoE-Experten) und behält die schnellste. Das Modell startet dabei mehrmals neu, je nach Größe 5 bis 30 Minuten.";
+}
+async function tuneAction(action) {
+  if (action === "start" && !confirm("Autotune starten? Das Modell steht währenddessen nicht zur Verfügung (5 bis 30 Minuten).")) return;
+  try { const r = await api("/api/tune", { method: "POST", body: JSON.stringify({ action }) }); if (r.error) alert(r.error); }
+  catch (e) { /* next poll */ }
+}
+$("tune-start").addEventListener("click", () => tuneAction("start"));
+$("tune-cancel").addEventListener("click", () => tuneAction("cancel"));
+$("tune-reset").addEventListener("click", () => tuneAction("reset"));
+
 function renderModelSwitch(s) {
   renderCtx(s);
+  renderTune(s);
   const ms = s.models || {}, pick = $("model-pick");
   const sig = JSON.stringify([(ms.local || []).map((m) => m.path), (ms.catalog || []).map((c) => c.key), s.plan.model]);
   if (pick.dataset.sig !== sig) {
@@ -826,6 +868,7 @@ function renderRouter(s) {
     <td class="num" title="${b.measured ? "gemessen" : "geschätzt"}">${b.tps ? (b.measured ? "" : "≈ ") + nf(b.tps, 1) : "–"}</td>
     <td class="num">${b.inflight}</td><td class="num">${nf(b.served, 0)}</td></tr>`).join("");
   renderExamples(r);
+  renderExternal(r);
   const ff = $("fastfirst-switch");
   if (!ff.dataset.busy) ff.setAttribute("aria-checked", String(!!r.prefer_fast));
   $("fastfirst-explain").textContent = r.prefer_fast
@@ -844,7 +887,18 @@ function renderRouter(s) {
 
 const HOST_STATE = { idle: ["", "frei"], preparing: ["warn", "bereitet vor"], downloading: ["warn", "lädt herunter"],
   loading: ["warn", "lädt das Modell"], ready: ["ok", "bereit"], error: ["bad", "Fehler"], unreachable: ["bad", "nicht erreichbar"],
-  asleep: ["", "schläft oder aus"] };
+  asleep: ["", "schläft oder aus"], tuning: ["warn", "Autotune läuft"] };
+
+function tuneText(job, tuned) {
+  // one line about the autotune: running, failed, or its result
+  if (job && job.state === "running") return `Autotune: ${job.text}${job.total ? ` (Schritt ${job.step}/${job.total})` : ""}`;
+  if (job && job.state === "error") return `Autotune beendet: ${job.text}`;
+  if (tuned && tuned.score) {
+    const b = tuned.base || tuned.score, f = Object.entries(tuned.flags || {}).map(([k, v]) => `${k} ${v}`).join(", ");
+    return `Autotune: ${f || "Plan war schon am schnellsten"} · Antwort ${nf(b.tg, 1)} → ${nf(tuned.score.tg, 1)} Token/s, Prompt ${nf(b.pp, 0)} → ${nf(tuned.score.pp, 0)} Token/s`;
+  }
+  return "";
+}
 const hostEdits = {};  // host id -> form values the user is typing, kept across refreshes
 
 function renderHosts(s) {
@@ -891,6 +945,9 @@ function renderHosts(s) {
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${x.gpu ? " · " + esc(x.gpu) : gpus ? " · " + gpus : ""}</div></div>
         <div class="pill"><span class="dot ${cls}"></span><span>${txt}</span></div></div>
       ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${layoutRow}${sleepRow}${roleRow}
+      ${x.state === "ready" || x.state === "tuning" || x.tuned || x.tune_job ? `<div class="kv"><span class="note">${esc(tuneText(x.tune_job, x.tuned) || "Autotune: misst die schnellsten Einstellungen für dieses Modell auf diesem PC.")}</span>${
+        x.tune_job && x.tune_job.state === "running" ? `<button class="btn quiet small" type="button" data-htune="cancel">Abbrechen</button>`
+        : x.state === "ready" ? `<button class="btn quiet small" type="button" data-htune="start">${x.tuned ? "Autotune erneut" : "Autotune"}</button>${x.tuned ? `<button class="btn quiet small" type="button" data-htune="reset">Verwerfen</button>` : ""}` : ""}</div>` : ""}
       <form>
         <label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
@@ -926,6 +983,11 @@ $("hosts").addEventListener("submit", (ev) => {
 $("hosts").addEventListener("click", (ev) => {
   const card = ev.target.closest(".host"); if (!card) return;
   if (ev.target.matches("[data-unload]")) { delete hostEdits[card.dataset.id]; hostAction({ host: card.dataset.id, unload: true }); }
+  if (ev.target.matches("[data-htune]")) {
+    const act = ev.target.dataset.htune;
+    if (act === "start" && !confirm("Autotune auf diesem Host starten? Sein Modell steht währenddessen nicht zur Verfügung (5 bis 30 Minuten).")) return;
+    ev.target.disabled = true; hostAction({ host: card.dataset.id, tune: act });
+  }
   if (ev.target.matches("[data-hwake]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, wake: true }); }
   if (ev.target.matches("[data-hsleep]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, sleep: true }); }
   const lay = ev.target.closest("[data-layout]");
@@ -980,6 +1042,50 @@ function renderExamples(r) {
       <textarea data-k="examples" aria-label="Beispielsätze für ${esc(c.name)}">${esc((c.examples || []).join("\n"))}</textarea></div>`;
   }).join("");
 }
+
+let extDraft = null;
+function renderExternal(r) {
+  const box = $("external");
+  box.hidden = !r.available;
+  if (box.hidden) return;
+  const list = r.external || [];
+  const st = (e) => { const b = (r.backends || []).find((x) => x.source === "external" && x.group === e.name); return b ? (STATUS_TEXT[b.status] || b.status) : ""; };
+  $("ext-count").textContent = list.length ? `(${list.map((e) => `${e.name}: ${st(e)}`).join(", ")})` : "";
+  if (box.contains(document.activeElement)) return;
+  if (!extDraft) extDraft = list.map((e) => ({ ...e, key: "" }));
+  $("ext-list").innerHTML = extDraft.map((e, i) => `<div class="ext-row" data-i="${i}">
+    <input data-k="name" value="${esc(e.name || "")}" placeholder="Name, z. B. strata" aria-label="Name">
+    <input data-k="url" value="${esc(e.url || "")}" placeholder="http://192.168.1.50:8080" aria-label="Adresse">
+    <input data-k="key" value="" type="password" placeholder="${e.has_key ? "Schlüssel gesetzt (leer: behalten)" : "API-Schlüssel (optional)"}" aria-label="API-Schlüssel">
+    <select data-k="role" aria-label="Rolle">${["extra", "big", "fast"].map((v) => `<option value="${v}"${v === (e.role || "extra") ? " selected" : ""}>${{ extra: "nur per Name", big: "groß", fast: "schnell" }[v]}</option>`).join("")}</select>
+    <input data-k="ctx" value="${e.ctx || ""}" inputmode="numeric" placeholder="Kontext" aria-label="Kontext">
+    <input data-k="model" value="${esc(e.model || "")}" placeholder="Modellname dort (optional)" aria-label="Modellname">
+    <button class="btn quiet small" type="button" data-xdel="${i}" aria-label="Entfernen">✕</button></div>`).join("");
+}
+function extRead() {
+  document.querySelectorAll("#ext-list .ext-row").forEach((el) => {
+    const e = extDraft[+el.dataset.i];
+    el.querySelectorAll("[data-k]").forEach((f) => { e[f.dataset.k] = f.value.trim(); });
+  });
+}
+$("ext-list").addEventListener("click", (ev) => {
+  const i = ev.target.dataset && ev.target.dataset.xdel; if (i === undefined) return;
+  extRead(); extDraft.splice(+i, 1); ev.target.blur(); renderExternal(last.router);
+});
+$("ext-add").addEventListener("click", () => { extRead(); extDraft.push({ role: "extra" }); $("ext-add").blur(); renderExternal(last.router); });
+$("ext-save").addEventListener("click", async () => {
+  extRead();
+  const old = last.router.external || [];
+  // an empty key field keeps the saved key: the server never sends keys back
+  const items = extDraft.map((e) => ({ ...e, key: e.key || ((old.find((o) => o.name === e.name) || {}).has_key ? "__keep__" : "") }));
+  $("ext-msg").textContent = "Speichert …";
+  try {
+    const r = await api("/api/router", { method: "POST", body: JSON.stringify({ external: items }) });
+    if (r.error) { $("ext-msg").textContent = r.error; return; }
+    extDraft = null; $("ext-msg").textContent = "Gespeichert."; $("ext-save").blur();
+    last.router = { ...last.router, ...r }; renderRouter(last);
+  } catch (e) { $("ext-msg").textContent = "Speichern fehlgeschlagen."; }
+});
 
 function exRead() {
   document.querySelectorAll("#ex-cats .ex-cat").forEach((el) => {
