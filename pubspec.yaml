@@ -1,7 +1,7 @@
 name: privatelm
 description: AI Chat — Local/Cloud LLM Assistant
 publish_to: "none"
-version: 1.6.2+22
+version: 1.7.0+23
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
