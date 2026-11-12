@@ -11,7 +11,7 @@ Der Name kommt von den Myrmidonen, griechisch μύρμηξ, „Ameise“: viele,
 ## Was es kann
 
 - **Ein Modell über mehrere Rechner verteilen.** Ein Master verteilt die Layer auf seine GPU(s) und auf Worker (PCs mit GPU oder RAM, Handys). Die schnellsten Geräte füllt er zuerst und plant automatisch neu, wenn Geräte dazukommen oder wegfallen.
-- **Mehrere ganze Modelle, ein Endpunkt.** Hosts laden je ein ganzes Modell, der Router des Masters verteilt die Anfragen nach Name, Regeln und Auslastung. Ein PC mit mehreren GPUs nutzt sie für ein großes Modell oder gibt jeder GPU ein eigenes, umschaltbar im Dashboard.
+- **Mehrere ganze Modelle, ein Endpunkt.** Hosts laden je ein ganzes Modell, der Router des Masters verteilt die Anfragen nach Name, Regeln oder Beispielsätzen (Embedding-Modell), Auslastung und freiem Kontext. Ein PC mit mehreren GPUs nutzt sie für ein großes Modell oder gibt jeder GPU ein eigenes, umschaltbar im Dashboard.
 - **Schneller dank Messungen.** Der Planer lernt aus echten Messungen. Ein Entwurfsmodell (Speculative Decoding), MTP und ein MoE-Expertencache bringen zusätzliches Tempo.
 - **Selbstverwaltend.** Wake-on-LAN und Schlaf, immer die schnellste Verbindung (Kabel vor WLAN). Das Modell und die Rolle eines PCs lassen sich im Dashboard umstellen.
 - **Installation in einem Schritt.** Das Installationsskript erledigt Treiber (NVIDIA inklusive älterer Karten und Secure Boot), CUDA oder Vulkan, den Build, die Firewall und die Dienste.

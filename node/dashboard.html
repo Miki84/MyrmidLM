@@ -104,6 +104,17 @@
   .ver-badge.new { background: var(--c0); border-color: var(--c0); color: #0f1e28; }
   #reb-events li { grid-template-columns: 62px 1fr; }
   @media (max-width: 900px) { .router, .rebalance { grid-template-columns: 1fr; } }
+  .examples { grid-column: 1 / -1; border-top: 1px solid var(--line); padding-top: 16px; display: grid; gap: 12px; }
+  .examples input, .examples select, .examples textarea { font: inherit; font-size: 0.9rem; padding: 7px 9px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--surface); color: var(--text); min-width: 0; }
+  .examples textarea { width: 100%; min-height: 7.5em; resize: vertical; box-sizing: border-box; }
+  .ex-cats { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+  .ex-cat { border: 1px solid var(--line); border-radius: 10px; padding: 10px; display: grid; gap: 8px; }
+  .ex-cat .row, .examples .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .ex-cat .row input { flex: 1 1 6em; }
+  .ex-cat .row select { flex: 1 1 8em; max-width: 60%; }
+  .ex-scores { list-style: none; margin: 0; padding: 0; font-size: 0.88rem; display: grid; gap: 4px; }
+  .ex-scores .bar { display: inline-block; height: 8px; border-radius: 4px; background: var(--c0); vertical-align: middle; margin-right: 8px; }
   .router-off { margin-bottom: 16px; color: var(--muted); font-size: 0.9rem; }
   .backends { margin-top: 4px; }
   .model-switch { margin-top: 10px; font-size: 0.88rem; }
@@ -295,6 +306,7 @@
         <div class="seg-ctl" role="group" aria-labelledby="mode-label">
           <button type="button" data-mode="heuristic" aria-pressed="true">Regeln</button>
           <button type="button" data-mode="model" aria-pressed="false">Schnelles Modell</button>
+          <button type="button" data-mode="examples" aria-pressed="false">Beispiele</button>
         </div>
       </div>
     </div>
@@ -303,6 +315,23 @@
       <div class="share" id="share" aria-hidden="true"></div>
       <div class="muted" style="font-size:.84rem" id="share-text"></div>
       <ul class="decisions" id="decisions" aria-label="Letzte Entscheidungen"></ul>
+    </div>
+    <div class="examples" id="examples" hidden>
+      <div class="panel-head" style="margin:0"><h3 style="margin:0;font-size:1rem">Beispielsätze</h3><span class="muted" id="ex-state"></span></div>
+      <p class="muted" style="margin:0">Ein kleines Embedding-Modell vergleicht jede Anfrage mit diesen Sätzen; die Kategorie mit dem ähnlichsten Satz entscheidet. Ziel kann „schnell“, „groß“ oder ein Modell per Name sein (z. B. ein Coder-Modell für Code). Ein Satz pro Zeile.</p>
+      <div class="ex-cats" id="ex-cats"></div>
+      <div class="row">
+        <button class="btn quiet" type="button" id="ex-add">Kategorie hinzufügen</button>
+        <label class="muted" for="ex-th">Vorsprung fürs schnelle Modell</label>
+        <input id="ex-th" type="number" min="0" max="0.5" step="0.01" style="width:5.5em">
+        <button class="btn" type="button" id="ex-save">Speichern</button>
+        <span class="muted" id="ex-msg" role="status"></span>
+      </div>
+      <form class="row" id="ex-test">
+        <input id="ex-test-text" placeholder="Testsatz, z. B. „Schreib mir ein Bash-Skript für Backups“" style="flex:1">
+        <button class="btn quiet" type="submit">Testen</button>
+      </form>
+      <ul class="ex-scores" id="ex-scores" aria-live="polite"></ul>
     </div>
   </section>
   <p class="router-off" id="router-off" hidden></p>
@@ -730,7 +759,9 @@ function renderRouter(s) {
   $("router-explain").textContent = !r.has_fast
     ? `Kein schnelles Modell: Anfragen gehen an die großen Modelle (${bigName}), ${r.prefer_fast ? "jeweils an das, das am schnellsten fertig wird" : "jeweils an das mit den wenigsten laufenden Anfragen"}. Mit dem Namen aus der Tabelle lässt sich jedes Modell gezielt ansprechen.`
     : r.enabled
-    ? (r.mode === "model"
+    ? (r.mode === "examples"
+      ? `Ein Embedding-Modell vergleicht jede Anfrage mit deinen Beispielsätzen (unten). Ähnelt sie „leicht“ deutlich mehr als dem Rest, antwortet ${fastName}, sonst ${bigName}. Werkzeuge, Bilder und langer Kontext gehen immer ans große Modell.`
+      : r.mode === "model"
       ? `Das schnelle Modell schätzt jede Anfrage ein. Einfache beantwortet ${fastName}, alles andere ${bigName}.`
       : `Kurze, einfache Anfragen beantwortet ${fastName}, alles mit Code, Analyse, Werkzeugen, Bildern oder langem Kontext ${bigName}.`)
     : `Aus: Alle Anfragen gehen an ${bigName}. Mit dem Modellnamen „fast“ lässt sich das schnelle Modell trotzdem gezielt ansprechen.`;
@@ -742,6 +773,7 @@ function renderRouter(s) {
     <td>${STATUS_TEXT[b.status] || esc(b.status)}${b.role === "fast" && b.source === "local" && fastTps ? `, ${nf(fastTps, 1)} Token/s` : ""}</td>
     <td class="num" title="${b.measured ? "gemessen" : "geschätzt"}">${b.tps ? (b.measured ? "" : "≈ ") + nf(b.tps, 1) : "–"}</td>
     <td class="num">${b.inflight}</td><td class="num">${nf(b.served, 0)}</td></tr>`).join("");
+  renderExamples(r);
   const ff = $("fastfirst-switch");
   if (!ff.dataset.busy) ff.setAttribute("aria-checked", String(!!r.prefer_fast));
   $("fastfirst-explain").textContent = r.prefer_fast
@@ -864,6 +896,47 @@ $("lan").addEventListener("click", async (ev) => {
   ev.target.disabled = true;
   try { await api("/api/wake", { method: "POST", body: JSON.stringify({ id }) }); } catch (e) { /* next poll */ }
 });
+
+const EMB_STATE = { off: "aus", downloading: "Embedding-Modell wird geladen (≈ 300 MB) …", loading: "Embedding-Modell startet …",
+  ready: "Embedding-Modell bereit", error: "Embedding-Modell: Fehler" };
+let exDraft = null;  // the categories being edited (kept across refreshes until saved)
+
+function exTargets(r) {
+  const opts = [["fast", "schnell"], ["big", "groß"]];
+  const seen = new Set();
+  (r.backends || []).forEach((b) => { const n = b.group || b.model; if (n && !seen.has(n)) { seen.add(n); opts.push([n, n]); } });
+  return opts;
+}
+
+function renderExamples(r) {
+  const box = $("examples");
+  box.hidden = r.mode !== "examples" || !r.enabled;
+  if (box.hidden) return;
+  const e = r.embedder || {};
+  $("ex-state").textContent = (EMB_STATE[e.state] || e.state || "") + (e.error ? `: ${e.error}` : "");
+  if (box.contains(document.activeElement)) return;  // don't rebuild what someone is editing
+  if (!exDraft) exDraft = JSON.parse(JSON.stringify(r.examples || { threshold: 0.05, categories: [] }));
+  $("ex-th").value = exDraft.threshold ?? 0.05;
+  const targets = exTargets(r);
+  $("ex-cats").innerHTML = exDraft.categories.map((c, i) => {
+    const opts = targets.some(([v]) => v === c.target) ? targets : [...targets, [c.target, c.target + " (nicht da)"]];
+    return `<div class="ex-cat" data-i="${i}">
+      <div class="row"><input data-k="name" value="${esc(c.name)}" aria-label="Name der Kategorie">
+        <select data-k="target" aria-label="Ziel">${opts.map(([v, t]) => `<option value="${esc(v)}"${v === c.target ? " selected" : ""}>→ ${esc(t)}</option>`).join("")}</select>
+        <button class="btn quiet small" type="button" data-del="${i}" aria-label="Kategorie entfernen">✕</button></div>
+      <textarea data-k="examples" aria-label="Beispielsätze für ${esc(c.name)}">${esc((c.examples || []).join("\n"))}</textarea></div>`;
+  }).join("");
+}
+
+function exRead() {
+  document.querySelectorAll("#ex-cats .ex-cat").forEach((el) => {
+    const c = exDraft.categories[+el.dataset.i];
+    c.name = el.querySelector('[data-k="name"]').value.trim();
+    c.target = el.querySelector('[data-k="target"]').value;
+    c.examples = el.querySelector('[data-k="examples"]').value.split("\n").map((x) => x.trim()).filter(Boolean);
+  });
+  exDraft.threshold = parseFloat($("ex-th").value) || 0;
+}
 
 async function setRouter(body) {
   const sw = $("router-switch");
@@ -1020,6 +1093,37 @@ $("bench-btn").addEventListener("click", async () => {
   $("bench-btn").disabled = true;
   $("bench-out").textContent = "Test läuft, das dauert je nach Modell bis zu einer Minute.";
   try { await api("/api/bench", { method: "POST" }); } catch (e) { $("bench-out").textContent = "Test konnte nicht starten."; }
+});
+
+$("ex-cats").addEventListener("click", (ev) => {
+  const i = ev.target.dataset && ev.target.dataset.del; if (i === undefined) return;
+  exRead(); exDraft.categories.splice(+i, 1); ev.target.blur(); renderExamples(last.router);
+});
+$("ex-add").addEventListener("click", () => {
+  exRead(); exDraft.categories.push({ name: "code", target: "big", examples: [] }); $("ex-add").blur(); renderExamples(last.router);
+});
+$("ex-save").addEventListener("click", async () => {
+  exRead();
+  $("ex-msg").textContent = "Speichert …";
+  try {
+    const r = await api("/api/router", { method: "POST", body: JSON.stringify({ examples: exDraft }) });
+    if (r.error) { $("ex-msg").textContent = r.error; return; }
+    exDraft = null; $("ex-msg").textContent = "Gespeichert.";
+    $("ex-save").blur(); last.router = { ...last.router, ...r }; renderRouter(last);
+  } catch (e) { $("ex-msg").textContent = "Speichern fehlgeschlagen."; }
+});
+$("ex-test").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const text = $("ex-test-text").value.trim(); if (!text) return;
+  $("ex-scores").innerHTML = "<li class=\"muted\">Prüft …</li>";
+  try {
+    const r = await api("/api/router", { method: "POST", body: JSON.stringify({ test: text }) });
+    const t = r.test || {};
+    if (t.error) { $("ex-scores").innerHTML = `<li class="muted">${esc(t.error)}</li>`; return; }
+    const name = { fast: "schnelles Modell", big: "großes Modell" }[t.target] || t.target;
+    $("ex-scores").innerHTML = `<li><b>→ ${esc(name)}</b> <span class="muted">(${esc(t.reason)}, gespeicherte Sätze)</span></li>`
+      + t.scores.map((x) => `<li><span class="bar" style="width:${Math.max(2, 160 * Math.max(0, x.score))}px"></span>${esc(x.name)} ${nf(x.score, 2)}</li>`).join("");
+  } catch (e) { $("ex-scores").innerHTML = '<li class="muted">Test fehlgeschlagen.</li>'; }
 });
 
 $("fastfirst-switch").addEventListener("click", async () => {

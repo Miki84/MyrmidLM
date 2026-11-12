@@ -1497,6 +1497,9 @@ def cmd_serve(args) -> None:
     public_name = args.model_name
     router = Router(backends, args.fast_ctx, enabled, mode, public_name, sp.key)
     router.on_timings = sup.on_timings
+    router.embedder = Embedder(public_port + 3)
+    if mode == "examples":
+        router.embedder.ensure()
     try:
         router.prefer_fast = bool(json.loads(ROUTER_STATE.read_text()).get("prefer_fast"))
     except (OSError, ValueError, AttributeError):
@@ -4951,6 +4954,7 @@ class Backend:
     served: int = 0
     asleep: bool = False  # a host that sleeps (or is off) and can be woken
     est_tps: float = 0.0  # the planner's estimate (tokens/s)
+    ctx_at: float = 0.0  # when ctx was last read from the server
     tps: float = 0.0  # measured on requests it ran alone (moving average)
 
     @property
@@ -4959,6 +4963,107 @@ class Backend:
 
 
 ROLE_WORDS = {"fast": ("fast", "schnell", "small"), "big": ("big", "large", "groß", "gross")}
+
+# Routing by examples: a small embedding model compares each request with
+# example sentences; the closest category decides (fast, big, or a model by
+# its client name, e.g. a coder model for code). Edited in the dashboard.
+ROUTER_EXAMPLES = CONFIG_DIR / "router-examples.json"
+EMBED_MODEL = "ggml-org/embeddinggemma-300M-GGUF:Q8_0"  # 300 MB, many languages, runs on the CPU
+DEFAULT_EXAMPLES = {
+    "threshold": 0.05,
+    "categories": [
+        {"name": "leicht", "target": "fast", "examples": [
+            "Was ist die Hauptstadt von Frankreich?", "Übersetze das ins Englische.",
+            "Fasse diesen Absatz in einem Satz zusammen.", "Korrigiere die Rechtschreibung.",
+            "Wie spät ist es in New York?", "Schreib eine kurze Antwort auf diese Mail.",
+            "What does this word mean?", "Give me a synonym for fast."]},
+        {"name": "schwer", "target": "big", "examples": [
+            "Refaktoriere dieses Modul und erkläre die Änderungen.", "Finde den Fehler in diesem Code.",
+            "Entwirf eine Architektur für ein verteiltes System.", "Beweise, dass die Aussage stimmt.",
+            "Vergleiche die Vor- und Nachteile und gib eine begründete Empfehlung.",
+            "Schreib ein Skript, das die Logdateien auswertet und Berichte erstellt.",
+            "Analyze this contract and list the risks.", "Plan the migration step by step."]},
+    ],
+}
+
+
+class ContextTooLong(Exception):
+    """No model the request may go to has room for it."""
+
+    def __init__(self, need: int, biggest: int, what: str):
+        super().__init__(f"{what}: about {need} tokens, the largest context is {biggest}")
+        self.need, self.biggest, self.what = need, biggest, what
+
+
+class Embedder:
+    """The router's embedding model: its own small llama-server on the CPU of
+    the master, started (and downloaded) the first time routing by examples
+    is switched on."""
+
+    def __init__(self, port: int):
+        import threading
+
+        self.port = port
+        self.state, self.error = "off", ""
+        self.proc: Optional[subprocess.Popen] = None
+        self.lock = threading.Lock()
+        self.cache: dict[str, list[float]] = {}
+
+    @property
+    def base(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def ensure(self) -> None:
+        import threading
+
+        with self.lock:
+            if self.state in ("downloading", "loading", "ready"):
+                return
+            self.state, self.error = "downloading", ""
+        threading.Thread(target=self._start, daemon=True).start()
+
+    def _start(self) -> None:
+        try:
+            dest = Path("/srv/models") if os.access("/srv/models", os.W_OK) else CONFIG_DIR / "models"
+            path = Path(env("EMBED_MODEL") or "")
+            if not path.is_file():
+                path = fetch_model(env("EMBED_MODEL") or EMBED_MODEL, dest, quiet=True)
+            self.state = "loading"
+            cmd = [str(find_bin("llama-server")), "-m", str(path), "--embeddings", "--pooling", "mean", "--host", "127.0.0.1",
+                   "--port", str(self.port), "-ngl", "0", "-c", "2048", "-b", "2048", "-ub", "2048",
+                   "--threads", str(max(1, min(4, (os.cpu_count() or 2) // 2)))]
+            log(f"Router: embedding model {path.name} on the CPU (port {self.port})")
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not _wait_healthy(self.base, self.proc, timeout=300):
+                raise RuntimeError("the embedding model did not start")
+            self.state = "ready"
+        except Exception as e:  # noqa: BLE001 - routing falls back to the rules
+            self.state, self.error = "error", str(e)[:300]
+            log(f"Router: embedding model failed: {e}")
+
+    def stop(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Normalized vectors; examples stay cached."""
+        import math
+        import urllib.request
+
+        todo = [t for t in dict.fromkeys(texts) if t not in self.cache]
+        if todo:
+            req = urllib.request.Request(self.base + "/v1/embeddings",
+                                         data=json.dumps({"input": todo}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())["data"]
+            for t, d in zip(todo, sorted(data, key=lambda x: x.get("index", 0))):
+                v = d["embedding"]
+                n = math.sqrt(sum(x * x for x in v)) or 1.0
+                self.cache[t] = [x / n for x in v]
+            if len(self.cache) > 2000:  # requests come and go, examples stay
+                self.cache = {k: v for k, v in list(self.cache.items())[-1000:]}
+        return [self.cache[t] for t in texts]
 
 
 class Router:
@@ -4982,6 +5087,14 @@ class Router:
         self.waker = None  # callback(backend) -> backend once awake, or None: wake a sleeping host
         self.last_request = 0.0  # when the last request came in (updates wait for a quiet moment)
         self.prefer_fast = False  # within a group: the fastest first, slower ones only when it is busy
+        self.examples: dict = json.loads(json.dumps(DEFAULT_EXAMPLES))
+        try:
+            saved = json.loads(ROUTER_EXAMPLES.read_text())
+            if isinstance(saved, dict) and isinstance(saved.get("categories"), list):
+                self.examples = saved
+        except (OSError, ValueError):
+            pass
+        self.embedder: Optional[Embedder] = None  # set by serve; started when mode is "examples"
 
     @property
     def big(self) -> Backend:
@@ -5025,14 +5138,104 @@ class Router:
         with self.lock:
             if "enabled" in body:
                 self.enabled = bool(body["enabled"])
-            if body.get("mode") in ("heuristic", "model"):
+            if body.get("mode") in ("heuristic", "model", "examples"):
                 self.mode = body["mode"]
             if "prefer_fast" in body:
                 self.prefer_fast = bool(body["prefer_fast"])
+        if isinstance(body.get("examples"), dict):
+            err = self._set_examples(body["examples"])
+            if err:
+                return {**self.info(), "error": err}
+        if body.get("test") is not None:
+            return {**self.info(), "test": self.test_examples(str(body["test"]))}
+        if self.mode == "examples" and self.embedder:
+            self.embedder.ensure()
         self.save()
         log(f"Router {'on' if self.enabled else 'off'} ({self.mode}); "
             f"{'fastest first' if self.prefer_fast else 'fewest running requests'} within a group")
         return self.info()
+
+    def _set_examples(self, ex: dict) -> str:
+        cats = []
+        for c in ex.get("categories") or []:
+            name = str(c.get("name") or "").strip()[:40]
+            target = str(c.get("target") or "").strip()[:80]
+            lines = [str(x).strip()[:500] for x in (c.get("examples") or []) if str(x).strip()][:50]
+            if not name or not target or not lines:
+                continue
+            cats.append({"name": name, "target": target, "examples": lines})
+        if not any(c["target"] == "big" for c in cats):
+            return "Mindestens eine Kategorie muss ans große Modell gehen (Ziel „groß“)."
+        try:
+            th = min(0.5, max(0.0, float(ex.get("threshold", 0.05))))
+        except (TypeError, ValueError):
+            th = 0.05
+        with self.lock:
+            self.examples = {"threshold": th, "categories": cats[:12]}
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            ROUTER_EXAMPLES.write_text(json.dumps(self.examples, indent=1, ensure_ascii=False))
+        except OSError as e:
+            return f"could not save: {e}"
+        return ""
+
+    def score_examples(self, text: str) -> Optional[list[dict]]:
+        """Each category's best similarity to the text, best first (None: no embedding model)."""
+        e = self.embedder
+        if not e or e.state != "ready" or not text.strip():
+            return None
+        cats = self.examples.get("categories") or []
+        lines = [x for c in cats for x in c["examples"]]
+        try:
+            vecs = e.embed(lines + [text[:2000]])
+            e.error = ""
+        except (OSError, ValueError, KeyError) as x:
+            e.error = f"Embedding fehlgeschlagen: {x}"[:300]
+            return None
+        q = vecs[-1]
+        out, i = [], 0
+        for c in cats:
+            n = len(c["examples"])
+            best = max((sum(a * b for a, b in zip(q, v)) for v in vecs[i:i + n]), default=0.0)
+            out.append({"name": c["name"], "target": c["target"], "score": round(best, 3)})
+            i += n
+        return sorted(out, key=lambda x: -x["score"])
+
+    def decide_examples(self, text: str) -> Optional[tuple[str, str]]:
+        """(target, reason): fast, big or a client name. Fast only with a clear
+        lead over the rest; unsure means big."""
+        scores = self.score_examples(text)
+        if not scores:
+            return None
+        best = scores[0]
+        rest = max((x["score"] for x in scores if x["target"] != best["target"]), default=0.0)
+        why = f"Beispiele: {best['name']} ({best['score']:.2f})"
+        if best["target"] == "fast" and best["score"] - rest < float(self.examples.get("threshold", 0.05)):
+            return "big", f"Beispiele: unsicher ({best['name']} {best['score']:.2f} / {rest:.2f})"
+        return best["target"], why
+
+    def test_examples(self, text: str) -> dict:
+        scores = self.score_examples(text)
+        if scores is None:
+            e = self.embedder
+            return {"error": (e.error if e and e.state == "ready" and e.error else "")
+                    or "Das Embedding-Modell ist noch nicht bereit."}
+        target, why = self.decide_examples(text) or ("big", "")
+        return {"scores": scores, "target": target, "reason": why}
+
+    def need(self, body: dict) -> tuple[int, int]:
+        """Rough tokens a request needs (prompt, tools, room to answer): a
+        careful estimate for choosing, and an optimistic one for refusing."""
+        msgs = body.get("messages")
+        if msgs is None:
+            msgs = [{"content": body.get("prompt", "")}]
+        chars = sum(len(_message_text(m.get("content"))[0]) + 16 for m in msgs)
+        chars += len(json.dumps(body.get("tools") or body.get("functions") or []))
+        try:
+            answer = min(2048, int(body.get("max_tokens") or body.get("max_completion_tokens") or 256))
+        except (TypeError, ValueError):
+            answer = 256
+        return int(chars / 3.2) + 64 + answer, int(chars / 4.2) + 16
 
     def info(self) -> dict:
         def brief(b: Optional[Backend]) -> Optional[dict]:
@@ -5040,7 +5243,10 @@ class Router:
 
         with self.lock:
             fast = self.fast or next((b for b in self.backends if b.name == "fast"), None)
+            emb = self.embedder
             return {"available": True, "enabled": self.enabled, "mode": self.mode, "prefer_fast": self.prefer_fast,
+                    "examples": self.examples,
+                    "embedder": {"state": emb.state, "error": emb.error, "model": EMBED_MODEL} if emb else None,
                     "fast": brief(fast), "big": brief(self.big),
                     "has_fast": any(b.name == "fast" for b in self.backends),
                     "counts": dict(self.counts), "recent": list(self.recent[-12:]),
@@ -5063,6 +5269,18 @@ class Router:
                 except OSError as e:
                     b.healthy = False
                     b.status = "loading" if "503" in str(e) else "down"
+                if b.healthy and time.time() - b.ctx_at > 60:
+                    # what the server really has (a planner may have shrunk it to fit)
+                    b.ctx_at = time.time()
+                    try:
+                        req = urllib.request.Request(b.base + "/props", headers={"Authorization": f"Bearer {b.key}"}
+                                                     if b.key else {})
+                        with urllib.request.urlopen(req, timeout=3) as r:
+                            n = int((json.loads(r.read()).get("default_generation_settings") or {}).get("n_ctx") or 0)
+                        if n > 0:
+                            b.ctx = n
+                    except (OSError, ValueError, TypeError):
+                        pass
             time.sleep(3)
 
     # Decision ----------------------------------------------------------------
@@ -5089,47 +5307,95 @@ class Router:
         """A sleeping member to wake when none is ready."""
         return next((b for b in cands if b.asleep), None)
 
-    def _pick_role(self, role: str, reason: str) -> tuple[Backend, str]:
-        b = self.choose(self.role(role))
+    @staticmethod
+    def fits(cands: list[Backend], need: int) -> list[Backend]:
+        """The ones with room for the request (unknown context: assumed to fit)."""
+        return [b for b in cands if not need or not b.ctx or need <= b.ctx]
+
+    def _too_long(self, cands: list[Backend], loose: int, what: str) -> None:
+        """Refuses when even the optimistic estimate fits none (and says so like OpenAI does)."""
+        known = [b.ctx for b in cands if b.ctx]
+        if known and len(known) == len(cands) and loose > max(known):
+            raise ContextTooLong(loose, max(known), what)
+
+    def _pick_role(self, role: str, reason: str, need: int = 0, loose: int = 0) -> tuple[Backend, str]:
+        cands = self.fits(self.role(role), need)
+        if self.role(role) and not cands:
+            reason += f", {'schnelles' if role == 'fast' else 'großes'} Modell hat zu wenig Kontext"
+        b = self.choose(cands)
         if b:
             return b, reason
-        b = self.sleeper(self.role(role))
+        b = self.sleeper(cands)
         if b and self.waker:
             return b, f"{reason}, Host wird geweckt"
         other = "big" if role == "fast" else "fast"
-        b = self.choose(self.role(other))
+        b = self.choose(self.fits(self.role(other), need))
         if b:
-            return b, f"{reason}, aber {'schnelles' if role == 'fast' else 'großes'} Modell nicht bereit"
-        b = self.choose(self.backends)
-        return (b or self.big), reason + ", nichts anderes bereit"
+            return b, reason if not cands and self.role(role) else \
+                f"{reason}, aber {'schnelles' if role == 'fast' else 'großes'} Modell nicht bereit"
+        b = self.choose(self.fits(self.backends, need))
+        if b:
+            return b, reason + ", nichts anderes bereit"
+        self._too_long([x for x in self.backends if x.healthy or x.asleep], loose, "every model")
+        # nothing fits the careful estimate: the one with the most room tries
+        roomy = sorted((x for x in self.backends if x.healthy), key=lambda x: -(x.ctx or 10**9))
+        return (roomy[0] if roomy else self.big), reason + ", größter Kontext"
+
+    def _pick_group(self, group: list[Backend], reason: str, need: int, loose: int) -> tuple[Backend, str]:
+        fitting = self.fits(group, need)
+        b = self.choose(fitting)
+        if b:
+            return b, reason
+        b = self.sleeper(fitting)
+        if b and self.waker:
+            return b, f"{reason}, Host wird geweckt"
+        if not fitting:
+            self._too_long(group, loose, group[0].group or group[0].label)
+            roomy = sorted((x for x in group if x.healthy), key=lambda x: -(x.ctx or 10**9))
+            if roomy:
+                return roomy[0], reason + ", größter Kontext"
+        return group[0], f"{reason}, aber nicht bereit"
+
+    def group(self, name: str) -> list[Backend]:
+        name = name.lower()
+        return [b for b in self.backends if name in (b.group.lower(), b.label.lower())]
 
     def decide(self, body: dict, headers) -> tuple[Backend, str]:
+        """Which model answers. Raises ContextTooLong when none has room."""
+        need, loose = self.need(body)
         forced = ((headers.get("X-Myrmid-Route") or headers.get("X-PrivateLM-Route") or "").strip()
                   or str(body.get("model", "")).strip()).lower()
         # "privatelm" was the router's name before the rename: clients set up then keep working
         if forced and forced not in (self.public_name.lower(), "privatelm"):
-            group = [b for b in self.backends if forced in (b.group.lower(), b.label.lower())]
+            group = self.group(forced)
             if group:
-                b = self.choose(group)
-                if b:
-                    return b, "Modell angefordert"
-                b = self.sleeper(group)
-                if b and self.waker:
-                    return b, "Modell angefordert, Host wird geweckt"
-                return group[0], "Modell angefordert, aber nicht bereit"
+                return self._pick_group(group, "Modell angefordert", need, loose)
             for role, words in ROLE_WORDS.items():
                 if forced in words:
-                    return self._pick_role(role, "angefordert")
+                    return self._pick_role(role, "angefordert", need, loose)
         if not self.enabled:
-            return self._pick_role("big", "Router aus")
-        if not self.choose(self.role("fast")):
-            return self._pick_role("big", "kein schnelles Modell bereit")
+            return self._pick_role("big", "Router aus", need, loose)
+        by_example = None
+        if self.mode == "examples":
+            msgs = body.get("messages") or [{"role": "user", "content": body.get("prompt", "")}]
+            users = [_message_text(m.get("content"))[0] for m in msgs if m.get("role", "user") == "user"]
+            by_example = self.decide_examples(users[-1] if users else "")
+            if by_example and by_example[0] not in ("fast", "big"):
+                group = self.group(by_example[0])  # a category for a model by name, e.g. code
+                if group:
+                    return self._pick_group(group, by_example[1], need, loose)
+                by_example = ("big", by_example[1] + f", „{by_example[0]}“ nicht da")
+        if not self.choose(self.fits(self.role("fast"), need)):
+            return self._pick_role("big", "kein schnelles Modell bereit" if not self.choose(self.role("fast"))
+                                   else "Kontext zu groß fürs schnelle Modell", need, loose)
         if not self.choose(self.role("big")):
-            return self._pick_role("fast", "großes Modell nicht bereit")
+            return self._pick_role("fast", "großes Modell nicht bereit", need, loose)
         route, reason = self.classify(body)
         if route == "fast" and self.mode == "model":
             route, reason = self.ask_fast_model(body, reason)
-        return self._pick_role(route, reason)
+        elif route == "fast" and self.mode == "examples":
+            route, reason = by_example or ("fast", reason + " (Beispiele nicht bereit)")
+        return self._pick_role(route, reason, need, loose)
 
     def classify(self, body: dict) -> tuple[str, str]:
         """Rules first (what the small model can't do), then the shape of the
@@ -5269,7 +5535,16 @@ class Router:
                     pass
                 if path.rstrip("/") in ("/v1/chat/completions", "/chat/completions", "/v1/completions",
                                         "/completions", "/completion") and isinstance(body, dict):
-                    backend, reason = router.decide(body, self.headers)
+                    try:
+                        backend, reason = router.decide(body, self.headers)
+                    except ContextTooLong as e:
+                        # In OpenAI's words, so clients (opencode, ...) shorten the conversation themselves
+                        return self._json(400, {"error": {
+                            "message": f"This model's maximum context length is {e.biggest} tokens. However, your "
+                                       f"messages resulted in about {e.need} tokens. (MyrmidLM: no model has room "
+                                       f"for this request; give one more context in the dashboard.)",
+                            "type": "invalid_request_error", "param": "messages",
+                            "code": "context_length_exceeded"}})
                     chars = len(json.dumps(body.get("messages") or body.get("prompt") or ""))
                     router.record(backend, reason, chars, bool(body.get("stream")))
                 else:
@@ -6344,7 +6619,7 @@ def main() -> None:
     s.add_argument("--fast-ctx", type=int, default=8192, help="context of the fast model (default 8192)")
     s.add_argument("--router", choices=["auto", "on", "off"], default="auto",
                    help="route requests between the models (auto: last setting from the dashboard, else on)")
-    s.add_argument("--router-mode", choices=["heuristic", "model"],
+    s.add_argument("--router-mode", choices=["heuristic", "model", "examples"],
                    help="heuristic: rules on the request; model: the fast model judges (default: last setting)")
     s.add_argument("--model-name", default="myrmid", help="model name clients see with the router")
     s.add_argument("--moe-cache", default="auto",
