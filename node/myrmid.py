@@ -556,7 +556,17 @@ class ModelInfo:
         return self.layer_mb - self.expert_mb + self.expert_mb * used
 
 
-def gguf_info(path: str, ctx: int) -> ModelInfo:
+KV_BYTES = {"f16": 2.0, "q8_0": 34 / 32, "q4_0": 18 / 32}  # bytes per cached value
+
+
+def kv_flags(kv: Optional[str]) -> list[str]:
+    """llama-server options for a quantized KV cache (needs flash attention)."""
+    if not kv or kv == "f16" or kv not in KV_BYTES:
+        return []
+    return ["-ctk", kv, "-ctv", kv, "-fa", "on"]
+
+
+def gguf_info(path: str, ctx: int, kv_type: Optional[str] = "f16") -> ModelInfo:
     """Layer count, sizes and KV cache size from the GGUF header and tensor
     table (tensor sizes are exact: taken from the data offsets)."""
     scalar = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
@@ -627,7 +637,7 @@ def gguf_info(path: str, ctx: int) -> ModelInfo:
     v_dim = a("attention.value_length", k_dim)
     vocab = kv.get("tokenizer.ggml.tokens")
     n_vocab = vocab[1] if isinstance(vocab, tuple) else a("vocab_size", 0) or 0
-    kv_layer = ctx * n_head_kv * (k_dim + v_dim) * 2  # f16 K and V
+    kv_layer = ctx * n_head_kv * (k_dim + v_dim) * KV_BYTES.get(kv_type or "f16", 2.0)  # K and V
     exps = sum(v for k, v in sizes.items() if re.match(r"^blk\.\d+\.ffn_(up|down|gate|gate_up)_(ch|)exps", k))
     n_expert = a("expert_count", 0)
     n_used = a("expert_used_count", 0)
@@ -1129,10 +1139,16 @@ def ctx_steps(args) -> tuple[int, ...]:
 
 
 def restore_ctx_choice(args) -> None:
-    """The dashboard's context setting wins over --ctx."""
+    """The dashboard's context and KV cache settings win over --ctx / --kv-cache."""
     try:
-        top = int(json.loads(CTX_STATE.read_text()).get("max") or 0)
+        d = json.loads(CTX_STATE.read_text())
+        top = int(d.get("max") or 0)
     except (OSError, ValueError, TypeError, AttributeError):
+        return
+    if d.get("kv") in KV_BYTES:
+        args.kv = d["kv"]
+        log(f"KV cache chosen in the dashboard: {args.kv}")
+    if "max" not in d:
         return
     if top:
         log(f"Context chosen in the dashboard: up to {top}")
@@ -1169,7 +1185,7 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     model = str(Path(args.model).expanduser().resolve())
     if not Path(model).is_file():
         die(f"No such model: {model}")
-    m = gguf_info(model, args.ctx)
+    m = gguf_info(model, args.ctx, getattr(args, "kv", "f16"))
     if args.mtp and not m.n_nextn:
         die("This model has no MTP layers (nextn_predict_layers = 0). Use a model with MTP, "
             "or leave out --mtp.")
@@ -1425,6 +1441,7 @@ def _moe_command(args, model: str, m: ModelInfo, gpus: list[Device], moe: MoePla
 
 def _finish_command(args, cmd: list[str], model: str, tps: float, info: Optional[dict] = None) -> ServerPlan:
     cmd += ["--metrics"]  # for the dashboard
+    cmd += kv_flags(getattr(args, "kv", "f16"))
     if args.mtp:
         cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(args.mtp)]
     elif getattr(args, "draft_opts", None):
@@ -2145,13 +2162,14 @@ def apply_calibration(units: list[Unit], calib: "Calibration", quiet: bool = Fal
 
 
 def estimate_plan_full(units: list[Unit], model_path: str, ctx: int, out_label: str, prune: bool,
-                       calib: Optional["Calibration"] = None) -> Optional[tuple[float, list[Unit], ModelInfo]]:
+                       calib: Optional["Calibration"] = None,
+                       kv: Optional[str] = "f16") -> Optional[tuple[float, list[Unit], ModelInfo]]:
     """(tokens/s the planner expects, the units it would use, the model at
     -c ctx), or None if the model doesn't fit. With calib, speeds use the
     current factors."""
     import dataclasses
 
-    m = gguf_info(model_path, ctx)
+    m = gguf_info(model_path, ctx, kv)
     per = m.per_layer_mb()
     trial = []
     for u in units:
@@ -2167,10 +2185,10 @@ def estimate_plan_full(units: list[Unit], model_path: str, ctx: int, out_label: 
 
 
 def estimate_plan(units: list[Unit], model_path: str, ctx: int, out_label: str,
-                  prune: bool) -> Optional[float]:
+                  prune: bool, kv: Optional[str] = "f16") -> Optional[float]:
     """Tokens/s the planner expects for these units at -c ctx, or None if
     the model doesn't fit."""
-    r = estimate_plan_full(units, model_path, ctx, out_label, prune)
+    r = estimate_plan_full(units, model_path, ctx, out_label, prune, kv=kv)
     return r[0] if r else None
 
 
@@ -2251,6 +2269,7 @@ class Supervisor:
                     "events": list(self.events[-8:]), "ctx_auto": self.ctx_auto,
                     "ctx": self.args.ctx, "ctx_max": int(getattr(self.args, "ctx_top", 0) or 0),
                     "ctx_choices": list(CTX_CHOICES), "ctx_train": self._ctx_train(),
+                    "kv": getattr(self.args, "kv", "f16"), "kv_choices": list(KV_BYTES),
                     "gain_pct": round((REBALANCE_GAIN - 1) * 100)}
 
     # Server ------------------------------------------------------------------
@@ -2354,6 +2373,11 @@ class Supervisor:
         up to 8192). Smaller ones are tried when it doesn't fit."""
         import threading
 
+        kv = body.get("kv") or getattr(self.args, "kv", "f16")
+        if kv not in KV_BYTES:
+            return {"error": "invalid KV cache type"}
+        if "max" not in body:  # only the cache type: the context stays as chosen
+            body = {**body, "max": getattr(self.args, "ctx_top", 0) or 0} if self.ctx_auto else {**body, "keep": True}
         try:
             top = int(body.get("max") or 0)
         except (TypeError, ValueError):
@@ -2363,13 +2387,16 @@ class Supervisor:
         with self.lock:
             if self.model_job and self.model_job.get("state") in ("resolving", "downloading", "loading"):
                 return {"error": "a model change is running"}
-            self.args.ctx_top, self.args.ctx, self.ctx_auto = top, None, True
+            self.args.kv = kv
+            if not body.get("keep"):  # "keep": --ctx of the service stays fixed
+                self.args.ctx_top, self.args.ctx, self.ctx_auto = top, None, True
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            CTX_STATE.write_text(json.dumps({"max": top}))
+            saved = {"kv": kv} if body.get("keep") else {"max": top, "kv": kv}
+            CTX_STATE.write_text(json.dumps(saved))
         except OSError as e:
             log(f"Could not save the context choice ({e})")
-        label = f"bis {top}" if top else "automatisch"
+        label = (f"bis {top}" if top else "automatisch") + f", KV-Cache {kv}"
         threading.Thread(target=self.replan, args=(f"Context: {label}", f"Kontext: {label}, lade neu."),
                          daemon=True).start()
         return self.info()
@@ -2480,7 +2507,8 @@ class Supervisor:
         sp, a = self.sp, self.args
         if not self.enabled or self.pending or sp.info.get("mode") != "layers":
             return
-        r = estimate_plan_full(sp.units, sp.model_path, a.ctx, sp.out_label, a.workers == "auto", self.calib)
+        r = estimate_plan_full(sp.units, sp.model_path, a.ctx, sp.out_label, a.workers == "auto", self.calib,
+                               kv=getattr(a, "kv", "f16"))
         if r is None:
             return
         tps_new, trial, m = r
@@ -2625,13 +2653,14 @@ class Supervisor:
             return
         prune = a.workers == "auto"
         cur_ctx = a.ctx
-        cur = estimate_plan(sp.units, sp.model_path, cur_ctx, sp.out_label, prune) or sp.estimate_tps
+        cur = estimate_plan(sp.units, sp.model_path, cur_ctx, sp.out_label, prune,
+                            getattr(a, "kv", "f16")) or sp.estimate_tps
         names = ", ".join(u.label for u in extra)
         noun = "Neuer Worker" if len(extra) == 1 else "Neue Worker"
         for ctx in (ctx_steps(a) if self.ctx_auto else (cur_ctx,)):
             if ctx < cur_ctx:
                 break
-            tps = estimate_plan(sp.units + extra, sp.model_path, ctx, sp.out_label, prune)
+            tps = estimate_plan(sp.units + extra, sp.model_path, ctx, sp.out_label, prune, getattr(a, "kv", "f16"))
             if tps is None:
                 continue
             if ctx > cur_ctx:
@@ -4488,7 +4517,8 @@ class HostAgent:
             return {"error": "model missing"}
         a = {"model": model, "name": str(body.get("name") or "").strip(),
              "role": body.get("role") if body.get("role") in ("big", "fast", "extra") else "big",
-             "ctx": int(body["ctx"]) if str(body.get("ctx") or "").isdigit() else None}
+             "ctx": int(body["ctx"]) if str(body.get("ctx") or "").isdigit() else None,
+             "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16"}
         with self.lock:
             self.job += 1
             self.assignment, self.restarts = a, 0
@@ -4587,7 +4617,7 @@ class HostAgent:
             if not current():
                 return
             self._set("loading")
-            ns = argparse.Namespace(model=str(path), ctx=a.get("ctx"), mtp=0, workers="off",
+            ns = argparse.Namespace(model=str(path), ctx=a.get("ctx"), kv=a.get("kv") or "f16", mtp=0, workers="off",
                                     ram_limit=self.ram_limit_gb, api_key=self.key, host="127.0.0.1",
                                     port=self.api_port, extra=list(self.args.extra or []), scan_timeout=1.0,
                                     only_devices=[self.gpu.name] if self.gpu else None)
@@ -5755,6 +5785,8 @@ class HostManager:
                 a["name"] = v
             elif k == "ctx" and v.isdigit():
                 a["ctx"] = int(v)
+            elif k == "kv" and v in KV_BYTES:
+                a["kv"] = v
         if not a["match"] or not a["model"]:
             die(f"--assign {text}: expected HOST=MODEL[,role=big|fast|extra][,name=NAME][,ctx=N]")
         return a
@@ -5869,7 +5901,7 @@ class HostManager:
     def _apply_cli(self, hid: str, h: dict) -> None:
         for a in list(self.pending_cli):
             if a["match"] in (hid, h["name"], h["addr"], f"{h['addr']}:{h['port']}"):
-                self.assign[hid] = {k: a[k] for k in ("model", "role", "name", "ctx")}
+                self.assign[hid] = {k: a.get(k) for k in ("model", "role", "name", "ctx", "kv")}
                 self.pending_cli.remove(a)
                 self.save()
 
@@ -5885,7 +5917,8 @@ class HostManager:
                 self._send(hid, "/unload", {})
             return
         keys = ("model", "role", "name", "ctx")
-        if have and all(have.get(k) == want.get(k) for k in keys):
+        if have and all(have.get(k) == want.get(k) for k in keys) \
+                and (have.get("kv") or "f16") == (want.get("kv") or "f16"):  # hosts before 1.6.2 know only f16
             return
         last = self.pushed.get(hid)
         if last and last[0] == json.dumps(want, sort_keys=True) and time.time() - last[1] < 60:
@@ -6047,7 +6080,7 @@ class HostManager:
                     want = (self.hosts[old_first].get("status") or {}).get("assignment")
                 new_first = pc if body["layout"] == "split" else f"{pc}-gpu0"
                 if want:
-                    self.assign[new_first] = {k: want.get(k) for k in ("model", "role", "name", "ctx")}
+                    self.assign[new_first] = {k: want.get(k) for k in ("model", "role", "name", "ctx", "kv")}
                     self.pushed.pop(new_first, None)
             self.save()
             self.rescan, self.last_scan = True, 0
@@ -6070,7 +6103,8 @@ class HostManager:
             ctx = body.get("ctx")
             self.assign[hid] = {"model": model, "role": body.get("role") if body.get("role") in ("big", "fast", "extra")
                                 else "big", "name": str(body.get("name") or "").strip(),
-                                "ctx": int(ctx) if str(ctx or "").isdigit() else None}
+                                "ctx": int(ctx) if str(ctx or "").isdigit() else None,
+                                "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16"}
         self.save()
         self.pushed.pop(hid, None)
         threading.Thread(target=self.ensure, args=(hid,), daemon=True).start()
@@ -6124,7 +6158,7 @@ def plan_fast(args, devices: list[Device]) -> tuple[list[str], dict, dict]:
     model = str(Path(args.fast_model).expanduser().resolve())
     if not Path(model).is_file():
         die(f"No such model: {model}")
-    m = gguf_info(model, args.fast_ctx)
+    m = gguf_info(model, args.fast_ctx, getattr(args, "kv", "f16"))
     need = m.size_mb + m.kv_layer_mb * m.n_layer + GPU_RESERVE_MB
     gpus = usable_gpus(devices)
     dev: Optional[Device] = None
@@ -6140,7 +6174,7 @@ def plan_fast(args, devices: list[Device]) -> tuple[list[str], dict, dict]:
             log(f"Fast model ({need/1024:.1f} GB with cache) fits on no GPU here: it runs on the CPU.")
     port = args.port + 2
     cmd = [find_bin("llama-server"), "-m", model, "-c", str(args.fast_ctx), "--fit", "off",
-           "--host", "127.0.0.1", "--port", str(port), "--metrics"]
+           "--host", "127.0.0.1", "--port", str(port), "--metrics"] + kv_flags(getattr(args, "kv", "f16"))
     cmd += ["-ngl", "999", "--device", dev.name] if dev else ["-ngl", "0", "--device", "none"]
     reserve = {dev.name: need} if dev else {}
     if dev is None or dev.type == "igpu":
@@ -6686,6 +6720,9 @@ def main() -> None:
     s.add_argument("--fast-key", help="API key for --fast-url")
     s.add_argument("--fast-device", help="device for --fast-model, e.g. CUDA0 or CPU (default: best fit)")
     s.add_argument("--fast-ctx", type=int, default=8192, help="context of the fast model (default 8192)")
+    s.add_argument("--kv-cache", dest="kv", choices=list(KV_BYTES), default="f16",
+                   help="KV cache type of the big and the fast model: q8_0 halves its memory at almost no "
+                        "quality cost (default f16; the dashboard's choice wins)")
     s.add_argument("--router", choices=["auto", "on", "off"], default="auto",
                    help="route requests between the models (auto: last setting from the dashboard, else on)")
     s.add_argument("--router-mode", choices=["heuristic", "model", "examples"],

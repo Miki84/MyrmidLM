@@ -276,7 +276,8 @@
         <form id="ctx-form">
           <label for="ctx-pick" class="muted">Kontextfenster (maximal)</label>
           <div class="row">
-            <select id="ctx-pick"></select>
+            <select id="ctx-pick" aria-label="Kontextfenster"></select>
+            <select id="kv-pick" aria-label="KV-Cache" title="KV-Cache: q8_0 braucht halb so viel Speicher bei kaum messbarem Qualitätsverlust"></select>
             <button class="btn" type="submit">Übernehmen</button>
           </div>
         </form>
@@ -465,6 +466,8 @@ async function api(path, opts = {}) {
 
 /* ── Rendering ───────────────────────────────────────────────────────── */
 
+const KV_OPTS = [["f16", "f16 (voll)"], ["q8_0", "q8_0 (½ Speicher)"], ["q4_0", "q4_0 (¼, ungenauer)"]];
+
 function renderCtx(s) {
   const r = s.rebalance || {}, pick = $("ctx-pick");
   if (!r.ctx_choices) return;
@@ -481,19 +484,25 @@ function renderCtx(s) {
     pick.value = String(max);
     pick.dataset.sig = sig;
   }
+  const kvp = $("kv-pick");
+  if (kvp.dataset.v !== r.kv && document.activeElement !== kvp) {
+    kvp.innerHTML = KV_OPTS.map(([v, t]) => `<option value="${v}">KV-Cache ${t}</option>`).join("");
+    kvp.value = r.kv || "f16";
+    kvp.dataset.v = r.kv || "f16";
+  }
   $("ctx-note").textContent = (cur ? `Läuft mit ${cur.toLocaleString("de-DE")} Token Kontext. ` : "")
-    + "Passt der gewählte Wert nicht in den Speicher, nimmt der Master automatisch die Hälfte (bis 2.048). Mehr Kontext braucht mehr VRAM und kann den Cluster langsamer machen."
+    + "Passt der gewählte Wert nicht in den Speicher, nimmt der Master automatisch die Hälfte (bis 2.048). Mehr Kontext braucht mehr VRAM und kann den Cluster langsamer machen. "
+    + "Ein KV-Cache in q8_0 halbiert den Speicher für den Kontext bei kaum messbarem Qualitätsverlust (das schnelle Modell übernimmt ihn beim nächsten Neustart des Dienstes)."
     + (train ? ` Das Modell kann höchstens ${train.toLocaleString("de-DE")}.` : "");
 }
 
 $("ctx-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
-  const v = +$("ctx-pick").value;
-  if (v < 0) return;
-  if (!confirm("Kontext ändern? Das Modell wird neu geladen, laufende Anfragen brechen ab.")) return;
+  const v = +$("ctx-pick").value, kv = $("kv-pick").value;
+  if (!confirm("Kontext und KV-Cache übernehmen? Das Modell wird neu geladen, laufende Anfragen brechen ab.")) return;
   ev.target.querySelector("button").disabled = true;
   try {
-    const r = await api("/api/ctx", { method: "POST", body: JSON.stringify({ max: v }) });
+    const r = await api("/api/ctx", { method: "POST", body: JSON.stringify(v < 0 ? { kv } : { max: v, kv }) });
     if (r.error) alert(r.error);
   } catch (e) { /* next poll */ }
   ev.target.querySelector("button").disabled = false;
@@ -887,6 +896,7 @@ function renderHosts(s) {
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
         <label>Rolle<select name="role">${["big", "fast", "extra"].map((r) => `<option value="${r}"${r === role ? " selected" : ""}>${ROLE_TEXT[r]}</option>`).join("")}</select></label>
         <label>Kontext<input name="ctx" inputmode="numeric" value="${val("ctx")}" placeholder="automatisch"></label>
+        <label>KV-Cache<select name="kv">${KV_OPTS.map(([v, t]) => `<option value="${v}"${v === (e.kv ?? a.kv ?? "f16") ? " selected" : ""}>${t}</option>`).join("")}</select></label>
         <div class="acts"><button class="btn" type="submit">Laden</button>${x.assignment ? `<button class="btn quiet" type="button" data-unload>Entladen</button>` : ""}</div>
       </form></article>`;
   }).join("");
@@ -911,7 +921,7 @@ $("hosts").addEventListener("submit", (ev) => {
   const card = ev.target.closest(".host"), f = new FormData(ev.target);
   delete hostEdits[card.dataset.id];
   document.activeElement.blur();
-  hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx") });
+  hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx"), kv: f.get("kv") });
 });
 $("hosts").addEventListener("click", (ev) => {
   const card = ev.target.closest(".host"); if (!card) return;

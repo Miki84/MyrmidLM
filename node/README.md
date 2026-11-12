@@ -84,6 +84,7 @@ So plant `serve`:
 - `--ram-limit GB` begrenzt den RAM, den der Master selbst für das Modell hergibt.
 - **Handys** messen ihre Speicherbandbreite mit einer Kopierschleife. llama.cpp erreicht auf einem Handy-Prozessor wegen Rechenleistung und Drosselung etwa die Hälfte davon; der Planer rechnet deshalb mit der Hälfte. Sonst sähe ein Handy schneller aus als ein Laptop und bekäme das ganze Modell.
 - **Kontext:** Ohne `--ctx` startet `serve` mit 8.192 Tokens und halbiert bis 2.048, wenn das Modell sonst nicht passt. Im Dashboard („Modell und Kontext“) lässt sich das Maximum anheben (16.384 bis 131.072, höchstens was das Modell kann); die Wahl gilt vor `--ctx` und wird in `ctx.json` gespeichert.
+- **KV-Cache:** Standard f16. Mit q8_0 (Dashboard oder `--kv-cache q8_0`) braucht der Kontext halb so viel Speicher bei kaum messbarem Qualitätsverlust, q4_0 ein Viertel, aber ungenauer. Der Planer rechnet mit dem gewählten Format, Flash Attention wird dafür eingeschaltet. Gilt für das große und (ab dem nächsten Neustart) das schnelle Modell; Hosts haben die Option in ihrer Karte.
 
 **Neuverteilung (`--rebalance`, Standard an):** `serve` schaut alle 30 Sekunden ins Netz und plant neu, sobald keine Anfrage läuft,
 
