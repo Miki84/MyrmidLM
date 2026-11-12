@@ -83,7 +83,7 @@ So plant `serve`:
 - **MTP** (Multi-Token-Prediction, Modelle mit eingebauten Draft-Layern): `--mtp N` rät N Tokens voraus und prüft sie gemeinsam. Die Draft-Layer sitzen am Ende des Modells und bleiben wie die Ausgabeschicht auf dem Master; für den zweiten Kontext werden 1,3 GB reserviert. Die beste Tiefe hängt von der Temperatur ab (bei Temperatur 1 werden weniger Vorhersagen angenommen, Tiefe 1 kann dann schneller sein als 3). `myrmid tune-mtp -m modell.gguf --temp 0.7` probiert die Tiefen 0 bis 3 bei Ihrer Temperatur durch; vorher den laufenden Server stoppen, die Worker bedienen nur einen Master.
 - `--ram-limit GB` begrenzt den RAM, den der Master selbst für das Modell hergibt.
 - **Handys** messen ihre Speicherbandbreite mit einer Kopierschleife. llama.cpp erreicht auf einem Handy-Prozessor wegen Rechenleistung und Drosselung etwa die Hälfte davon; der Planer rechnet deshalb mit der Hälfte. Sonst sähe ein Handy schneller aus als ein Laptop und bekäme das ganze Modell.
-- **Kontext:** Ohne `--ctx` startet `serve` mit 8.192 Tokens und halbiert bis 2.048, wenn das Modell sonst nicht passt.
+- **Kontext:** Ohne `--ctx` startet `serve` mit 8.192 Tokens und halbiert bis 2.048, wenn das Modell sonst nicht passt. Im Dashboard („Modell und Kontext“) lässt sich das Maximum anheben (16.384 bis 131.072, höchstens was das Modell kann); die Wahl gilt vor `--ctx` und wird in `ctx.json` gespeichert.
 
 **Neuverteilung (`--rebalance`, Standard an):** `serve` schaut alle 30 Sekunden ins Netz und plant neu, sobald keine Anfrage läuft,
 

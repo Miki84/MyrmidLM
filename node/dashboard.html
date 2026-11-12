@@ -263,7 +263,7 @@
       <div class="title-row"><svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="34" height="34" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0f1e28"/><defs><polygon id="hlogo" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/></defs><g stroke="#0f1e28" stroke-width="22"><use href="#hlogo" x="512" y="512" fill="#f0b54a"/><use href="#hlogo" x="512" y="282" fill="#4fc3b4"/><use href="#hlogo" x="512" y="742" fill="#4fc3b4" opacity=".75"/><use href="#hlogo" x="313" y="397" fill="#4fc3b4" opacity=".9"/><use href="#hlogo" x="711" y="397" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="313" y="627" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="711" y="627" fill="#4fc3b4" opacity=".9"/></g><g stroke="#0f1e28" stroke-width="18" stroke-linecap="round"><path d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/></g><g fill="#0f1e28"><circle cx="512" cy="512" r="40"/></g><g fill="#0f1e28"><circle cx="512" cy="282" r="26"/><circle cx="512" cy="742" r="26"/><circle cx="313" cy="397" r="26"/><circle cx="711" cy="397" r="26"/><circle cx="313" cy="627" r="26"/><circle cx="711" cy="627" r="26"/></g></svg><h1>MyrmidLM-Cluster</h1><a class="ver-badge" id="ver-badge" href="#update-panel" hidden></a></div>
       <div class="model" id="model">Verbinde mit dem Master …</div>
       <details class="model-switch" id="model-switch">
-        <summary>Modell wechseln oder herunterladen</summary>
+        <summary>Modell und Kontext</summary>
         <form id="model-form">
           <label for="model-pick" class="muted">Modell</label>
           <div class="row">
@@ -273,6 +273,14 @@
           <input id="model-custom" name="custom" hidden placeholder="Hugging Face: user/repo:QUANT (z. B. bartowski/Qwen_Qwen3-8B-GGUF:Q4_K_M) oder Pfad zu einer .gguf-Datei">
         </form>
         <div class="note" id="model-job"></div>
+        <form id="ctx-form">
+          <label for="ctx-pick" class="muted">Kontextfenster (maximal)</label>
+          <div class="row">
+            <select id="ctx-pick"></select>
+            <button class="btn" type="submit">Übernehmen</button>
+          </div>
+        </form>
+        <div class="note" id="ctx-note"></div>
       </details>
     </div>
     <div class="pill" id="state"><span class="dot"></span><span>Verbinde …</span></div>
@@ -457,7 +465,42 @@ async function api(path, opts = {}) {
 
 /* ── Rendering ───────────────────────────────────────────────────────── */
 
+function renderCtx(s) {
+  const r = s.rebalance || {}, pick = $("ctx-pick");
+  if (!r.ctx_choices) return;
+  const train = r.ctx_train || 0, cur = r.ctx || (s.plan || {}).ctx || 0;
+  const max = r.ctx_auto ? (r.ctx_max || 0) : -1;  // -1: fixed by --ctx on the service
+  const sig = JSON.stringify([r.ctx_choices, train, max]);
+  if (pick.dataset.sig !== sig && document.activeElement !== pick) {
+    const opts = [[0, "automatisch (bis 8.192)"]].concat(r.ctx_choices
+      .filter((c) => !train || c <= train || c === r.ctx_max).map((c) => [c, `bis ${c.toLocaleString("de-DE")} Token`]));
+    if (train && !r.ctx_choices.includes(train) && train > 8192) opts.push([train, `bis ${train.toLocaleString("de-DE")} Token (Maximum des Modells)`]);
+    if (max > 0 && !opts.some(([v]) => v === max)) opts.push([max, `bis ${max.toLocaleString("de-DE")} Token`]);
+    if (max === -1) opts.unshift([-1, `fest ${(r.ctx || 0).toLocaleString("de-DE")} (--ctx im Dienst)`]);
+    pick.innerHTML = opts.map(([v, t]) => `<option value="${v}">${esc(t)}</option>`).join("");
+    pick.value = String(max);
+    pick.dataset.sig = sig;
+  }
+  $("ctx-note").textContent = (cur ? `Läuft mit ${cur.toLocaleString("de-DE")} Token Kontext. ` : "")
+    + "Passt der gewählte Wert nicht in den Speicher, nimmt der Master automatisch die Hälfte (bis 2.048). Mehr Kontext braucht mehr VRAM und kann den Cluster langsamer machen."
+    + (train ? ` Das Modell kann höchstens ${train.toLocaleString("de-DE")}.` : "");
+}
+
+$("ctx-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const v = +$("ctx-pick").value;
+  if (v < 0) return;
+  if (!confirm("Kontext ändern? Das Modell wird neu geladen, laufende Anfragen brechen ab.")) return;
+  ev.target.querySelector("button").disabled = true;
+  try {
+    const r = await api("/api/ctx", { method: "POST", body: JSON.stringify({ max: v }) });
+    if (r.error) alert(r.error);
+  } catch (e) { /* next poll */ }
+  ev.target.querySelector("button").disabled = false;
+});
+
 function renderModelSwitch(s) {
+  renderCtx(s);
   const ms = s.models || {}, pick = $("model-pick");
   const sig = JSON.stringify([(ms.local || []).map((m) => m.path), (ms.catalog || []).map((c) => c.key), s.plan.model]);
   if (pick.dataset.sig !== sig) {

@@ -537,6 +537,7 @@ class ModelInfo:
     n_expert_used: int = 0  # MoE: experts that run per token
     expert_mb: float = 0.0  # MoE: all experts of one layer
     n_nextn: int = 0  # MTP: draft layers at the end of the model
+    n_ctx_train: int = 0  # the context the model was trained for (0: unknown)
 
     def per_layer_mb(self) -> float:
         """Memory per layer: all weights plus KV cache."""
@@ -631,12 +632,14 @@ def gguf_info(path: str, ctx: int) -> ModelInfo:
     n_expert = a("expert_count", 0)
     n_used = a("expert_used_count", 0)
     nextn = a("nextn_predict_layers", 0)
+    train = a("context_length", 0)
     return ModelInfo(n_layer, n_embd, n_vocab, blk / n_layer / 2**20, kv_layer / 2**20,
                      out / 2**20, file_size / 2**20,
                      sizes.get("token_embd.weight", 0) / 2**20, "output.weight" not in sizes,
                      n_expert if isinstance(n_expert, int) else 0,
                      n_used if isinstance(n_used, int) else 0,
-                     exps / n_layer / 2**20, nextn if isinstance(nextn, int) else 0)
+                     exps / n_layer / 2**20, nextn if isinstance(nextn, int) else 0,
+                     train if isinstance(train, int) and train > 0 else 0)
 
 
 # ── Planning ─────────────────────────────────────────────────────────────────
@@ -1105,6 +1108,37 @@ class ServerPlan:
 
 
 CTX_STEPS = (8192, 4096, 2048)  # without --ctx: the first that fits
+CTX_STATE = CONFIG_DIR / "ctx.json"  # the context chosen in the dashboard
+CTX_CHOICES = (8192, 16384, 32768, 65536, 131072)
+
+
+def ctx_steps(args) -> tuple[int, ...]:
+    """The contexts to try, largest first: from the dashboard's maximum (or
+    8192) halving down to 2048, never above what the model was trained for."""
+    top = int(getattr(args, "ctx_top", 0) or CTX_STEPS[0])
+    try:
+        train = gguf_info(str(Path(args.model).expanduser().resolve()), CTX_STEPS[-1]).n_ctx_train
+    except (OSError, SystemExit, struct.error):
+        train = 0
+    if train >= CTX_STEPS[-1]:
+        top = min(top, train)
+    steps = [top]
+    while steps[-1] // 2 >= CTX_STEPS[-1]:
+        steps.append(steps[-1] // 2)
+    return tuple(steps)
+
+
+def restore_ctx_choice(args) -> None:
+    """The dashboard's context setting wins over --ctx."""
+    try:
+        top = int(json.loads(CTX_STATE.read_text()).get("max") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return
+    if top:
+        log(f"Context chosen in the dashboard: up to {top}")
+    else:
+        log("Context chosen in the dashboard: automatic")
+    args.ctx, args.ctx_top = None, top
 
 
 def build_server_fitting(args, quiet: bool = False, exit_on_fail: bool = True) -> ServerPlan:
@@ -1113,12 +1147,12 @@ def build_server_fitting(args, quiet: bool = False, exit_on_fail: bool = True) -
     exit_on_fail=False raises PlanTooBig instead of ending the program."""
     auto = args.ctx is None
     if auto:
-        args.ctx = CTX_STEPS[0]
+        args.ctx = ctx_steps(args)[0]
     while True:
         try:
             return build_server(args, quiet)
         except PlanTooBig as e:
-            if not auto or args.ctx <= CTX_STEPS[-1]:
+            if not auto or args.ctx // 2 < CTX_STEPS[-1]:
                 if auto:
                     args.ctx = None  # the next try starts at the top again
                 if not exit_on_fail:
@@ -1462,6 +1496,7 @@ def cmd_serve(args) -> None:
         else:
             fast_info = {"model": args.fast_url, "device": "eigener Server", "ctx": args.fast_ctx}
     restore_model_choice(args)
+    restore_ctx_choice(args)
     args.fast_reserve = dict(getattr(args, "reserve_mb", None) or {})
     setup_draft(args)
     # The router takes the public port; the big model listens locally on +1
@@ -2214,6 +2249,8 @@ class Supervisor:
                     "model_job": self.model_progress(),
                     "pending": self.pending, "now_requested": self.now_requested,
                     "events": list(self.events[-8:]), "ctx_auto": self.ctx_auto,
+                    "ctx": self.args.ctx, "ctx_max": int(getattr(self.args, "ctx_top", 0) or 0),
+                    "ctx_choices": list(CTX_CHOICES), "ctx_train": self._ctx_train(),
                     "gain_pct": round((REBALANCE_GAIN - 1) * 100)}
 
     # Server ------------------------------------------------------------------
@@ -2305,6 +2342,37 @@ class Supervisor:
         else:
             self.event("Model doesn't fit with the workers left; waiting for workers",
                        "Modell passt mit den verbliebenen Workern nicht. Wartet auf Worker.")
+
+    def _ctx_train(self) -> int:
+        try:
+            return gguf_info(str(Path(self.args.model).expanduser().resolve()), CTX_STEPS[-1]).n_ctx_train
+        except (OSError, SystemExit, struct.error):
+            return 0
+
+    def ctx_api(self, body: dict) -> dict:
+        """Dashboard: the largest context the master may use (0: automatic,
+        up to 8192). Smaller ones are tried when it doesn't fit."""
+        import threading
+
+        try:
+            top = int(body.get("max") or 0)
+        except (TypeError, ValueError):
+            return {"error": "invalid context"}
+        if top and not CTX_STEPS[-1] <= top <= 1048576:
+            return {"error": "context between 2048 and 1048576"}
+        with self.lock:
+            if self.model_job and self.model_job.get("state") in ("resolving", "downloading", "loading"):
+                return {"error": "a model change is running"}
+            self.args.ctx_top, self.args.ctx, self.ctx_auto = top, None, True
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CTX_STATE.write_text(json.dumps({"max": top}))
+        except OSError as e:
+            log(f"Could not save the context choice ({e})")
+        label = f"bis {top}" if top else "automatisch"
+        threading.Thread(target=self.replan, args=(f"Context: {label}", f"Kontext: {label}, lade neu."),
+                         daemon=True).start()
+        return self.info()
 
     # Switching the model ---------------------------------------------------------
 
@@ -2560,7 +2628,7 @@ class Supervisor:
         cur = estimate_plan(sp.units, sp.model_path, cur_ctx, sp.out_label, prune) or sp.estimate_tps
         names = ", ".join(u.label for u in extra)
         noun = "Neuer Worker" if len(extra) == 1 else "Neue Worker"
-        for ctx in (CTX_STEPS if self.ctx_auto else (cur_ctx,)):
+        for ctx in (ctx_steps(a) if self.ctx_auto else (cur_ctx,)):
             if ctx < cur_ctx:
                 break
             tps = estimate_plan(sp.units + extra, sp.model_path, ctx, sp.out_label, prune)
@@ -3206,6 +3274,7 @@ class Dashboard:
                                  "/api/rebalance": self.sup.api,
                                  "/api/role": self.switch_role,
                                  "/api/model": self.sup.model_api,
+                                 "/api/ctx": self.sup.ctx_api,
                                  "/api/update": lambda b: self.updater.api(b) if self.updater else {"ok": False},
                                  "/api/wake": lambda b: {"ok": self.sup.known.wake(str(b.get("id") or ""), force=True)},
                                  "/api/hosts": self.hosts.api if self.hosts else (lambda b: {"error": "no hosts"})},
