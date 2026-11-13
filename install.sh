@@ -12,7 +12,8 @@
 #
 # Optionen (alle optional, sonst wird gefragt):
 #   --role master|worker|host  Rolle dieses PCs
-#   --model DATEI|auto       Master: GGUF-Modell (auto: passendes wählen/laden)
+#   --model DATEI|auto|none  Master: GGUF-Modell (auto: passendes wählen/laden;
+#                            none: nur Router, z. B. als VM ohne GPU, Modelle auf Hosts)
 #   --workers MODUS          Master: auto (Standard) | all | off | IP:Port,IP:Port
 #   --master-ip IP[,IP]      Worker/Host: Ports nur für den Master öffnen (alle seine Adressen)
 #   --cluster-key KEY        Worker/Host: API-Key des Masters (dort: myrmid key)
@@ -40,7 +41,7 @@ SRC_DIR="$PREFIX/src"
 CONF=/etc/myrmid/myrmid.conf
 OLD_PREFIX="/opt/privatelm-node"  # before the rename
 
-ROLE="" MODEL="" WORKERS="" PORT="8080" BACKENDS="" MASTER_IP="" FAST_MODEL="-" CLUSTER_KEY=""
+ROUTER_ONLY=0 ROLE="" MODEL="" WORKERS="" PORT="8080" BACKENDS="" MASTER_IP="" FAST_MODEL="-" CLUSTER_KEY=""
 DRAFT="" HOST_SLEEP="" WANT_VERSION="" CHANNEL="" AUTO_UPDATE="on" LOCAL_SRC=""
 SERVICE=1 YES=0 DRY=0
 
@@ -141,7 +142,7 @@ fi
 if [[ -z "$ROLE" ]]; then
     echo
     echo "    Welche Rolle hat dieser PC?"
-    echo "      1) Master  – stellt das Modell bereit (OpenAI-API), nutzt die Worker"
+    echo "      1) Master  – OpenAI-API, Dashboard und Router; mit eigenem Modell oder nur als Router (auch in einer VM)"
     echo "      2) Worker  – leiht GPU und RAM an den Master (für ein Modell, das auf mehrere PCs verteilt wird)"
     echo "      3) Host    – lädt ein ganzes Modell auf die eigene GPU; der Router des Masters schickt Anfragen hin"
     case "$(ask "Auswahl 1, 2 oder 3" 2)" in
@@ -883,7 +884,8 @@ for i, e in enumerate(d["models"], 1):
     star = "  <- Empfehlung" if d["recommended"] == i - 1 else ""
     desc = f" ({e['desc']})" if e.get("desc") else ""
     print(f"      {i:>2}) {e['name']:<30} {e['size_mb']/1024:5.1f} GB  {state:<16} {src}{desc}{star}")
-print("       p) eigenen Pfad eingeben" + ("\n       0) ohne Router" if kind == "small" else ""))
+print("       p) eigenen Pfad eingeben" + ("\n       0) ohne Router" if kind == "small" else
+      "\n       n) kein eigenes Modell: nur Router (z. B. VM ohne GPU; Modelle laufen auf Hosts)"))
 PY
     local def
     def="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); r=d['recommended']; print('' if r is None else r+1)" "$tmp")"
@@ -895,6 +897,8 @@ PY
     sel="$(ask "Auswahl" "${def:-p}")"
     if [[ "$sel" == p ]]; then
         CHOSEN="$(ask "Pfad zum GGUF-Modell" "")"
+    elif [[ "$kind" == big && "$sel" == n ]]; then
+        CHOSEN="none"
     elif [[ "$kind" == small && "$sel" == 0 ]]; then
         CHOSEN=""
     elif [[ "$sel" =~ ^[0-9]+$ ]]; then
@@ -946,16 +950,24 @@ if [[ -z "$MODEL" || "$MODEL" == auto ]]; then
     choose_model big
     MODEL="$CHOSEN"
 fi
+ROUTER_ONLY=0
+if [[ "$MODEL" == none ]]; then
+    ROUTER_ONLY=1
+    info "Nur Router: Dieser PC lädt kein Modell; im Dashboard Hosts zuweisen (oder später ein Modell einschalten)."
+    WORKERS="${WORKERS:-off}"
+    [[ "$FAST_MODEL" == "-" ]] && FAST_MODEL=""
+else
 MODEL="${MODEL/#\~/$HOME}"
 [[ $DRY -eq 1 || -f "$MODEL" ]] || die "Modell nicht gefunden: ${MODEL:-(keine Angabe)}"
 MODEL="$(realpath -m "$MODEL")"
 [[ "$MODEL" != *" "* ]] || die "Der Modellpfad darf keine Leerzeichen enthalten: $MODEL"
+fi
 
 # Der Dienst läuft als eigener Benutzer und muss das Modell lesen können.
 service_can_read() {
     if [[ $EUID -eq 0 ]]; then runuser -u nobody -- test -r "$1"; else sudo -u nobody test -r "$1"; fi
 }
-if [[ $SERVICE -eq 1 && $DRY -eq 0 ]] && ! service_can_read "$MODEL" 2>/dev/null; then
+if [[ $ROUTER_ONLY -eq 0 && $SERVICE -eq 1 && $DRY -eq 0 ]] && ! service_can_read "$MODEL" 2>/dev/null; then
     warn "Der Dienst kann $MODEL nicht lesen (Home-Ordner sind meist gesperrt)."
     if ask_yn "Modell nach /srv/models kopieren?" j; then
         srun mkdir -p /srv/models
@@ -979,7 +991,7 @@ if [[ -z "$WORKERS" ]]; then
 fi
 PORT="$(ask "API-Port" "$PORT")"
 MTP=0
-if [[ $DRY -eq 0 ]] && python3 - "$MODEL" <<'PY' 2>/dev/null; then
+if [[ $DRY -eq 0 && $ROUTER_ONLY -eq 0 ]] && python3 - "$MODEL" <<'PY' 2>/dev/null; then
 import struct, sys
 f = open(sys.argv[1], "rb")
 assert f.read(4) == b"GGUF"

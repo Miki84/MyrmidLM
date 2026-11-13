@@ -1521,6 +1521,31 @@ def restore_model_choice(args) -> None:
         args.model = d["model"]
 
 
+MASTER_STATE = CONFIG_DIR / "master.json"  # {"own": bool}: does the master run a model itself?
+
+
+def master_owns_model(args) -> bool:
+    """False: router only (-m none, or switched off in the dashboard); the
+    models run on the hosts. The dashboard's choice wins over -m."""
+    own = str(args.model).lower() not in ("none", "off", "")
+    try:
+        own = bool(json.loads(MASTER_STATE.read_text()).get("own", own))
+    except (OSError, ValueError, AttributeError):
+        pass
+    if own and not Path(args.model).expanduser().is_file():
+        log(f"No model to load ({args.model}): router only")
+        own = False
+    return own
+
+
+def save_master_own(own: bool) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        MASTER_STATE.write_text(json.dumps({"own": own}))
+    except OSError as e:
+        log(f"Could not save the master mode ({e})")
+
+
 def save_model_choice(args, path: str) -> None:
     cli = getattr(args, "cli_model", None) or str(Path(args.model).expanduser().resolve())
     args.cli_model = cli
@@ -1563,12 +1588,18 @@ def cmd_serve(args) -> None:
     restore_model_choice(args)
     restore_ctx_choice(args)
     args.fast_reserve = dict(getattr(args, "reserve_mb", None) or {})
-    setup_draft(args)
+    own = master_owns_model(args)
+    if own:
+        setup_draft(args)
+    else:
+        args.draft_opts, args.draft_info = [], {}
+        log("Router only: this PC loads no model; requests go to the hosts (and external servers)")
     # The router takes the public port; the big model listens locally on +1
     # (the fast one on +2). The router is always there: hosts may join later.
     args.host, args.port = "127.0.0.1", public_port + 1
 
     sup = Supervisor(args, _rebalance_initial(args.rebalance))
+    sup.own = own
     if not sup.start_plan(initial=True):
         log(f"{sup.reason} Waiting for workers (checking every {REBALANCE_SCAN_S} s; "
             "the dashboard shows the state).")
@@ -1596,6 +1627,9 @@ def cmd_serve(args) -> None:
         mode = args.router_mode
     public_name = args.model_name
     router = Router(backends, args.fast_ctx, enabled, mode, public_name, sp.key)
+    router.local_big = backends[0]
+    router.set_local(own)
+    sup.on_own = router.set_local
     router.on_timings = sup.on_timings
     router.load_external()
     router.embedder = Embedder(public_port + 3)
@@ -1607,7 +1641,7 @@ def cmd_serve(args) -> None:
         pass
 
     def new_model(sp_new) -> None:
-        b = router.big
+        b = router.local_big
         b.label = b.group = sp_new.name
     sup.on_new_model = new_model
     if not router.start(public_host, public_port):
@@ -2428,6 +2462,8 @@ class Supervisor:
         self.known = Known()
         self.model_job: dict = {}
         self.tune_job: dict = {}  # the autotune running or last run
+        self.own = True  # False: router only, no model on this PC
+        self.on_own = None  # callback(bool) when that changes
         self.on_new_model = None  # callback(sp) after a model change
         self.last_calib_check = 0.0
         self.last_calib_save = 0.0
@@ -2468,7 +2504,7 @@ class Supervisor:
 
     def info(self) -> dict:
         with self.lock:
-            return {"enabled": self.enabled, "state": self.state, "reason": self.reason,
+            return {"enabled": self.enabled, "state": self.state, "reason": self.reason, "own": self.own,
                     "model_job": self.model_progress(),
                     "pending": self.pending, "now_requested": self.now_requested,
                     "events": list(self.events[-8:]), "ctx_auto": self.ctx_auto,
@@ -2480,6 +2516,48 @@ class Supervisor:
                     "gain_pct": round((REBALANCE_GAIN - 1) * 100)}
 
     # Server ------------------------------------------------------------------
+
+    def off_plan(self) -> ServerPlan:
+        """Router only: no model here, the key and an empty plan."""
+        a = self.args
+        key = a.api_key if a.api_key is not None else _api_key()
+        return ServerPlan([], "", key, 0.0, {"model": "", "mode": "off", "segments": [], "ctx": 0,
+                                             "machines": [{"id": "master", "role": "master",
+                                                           "host": socket.gethostname(), "layers": 0}]})
+
+    def master_api(self, body: dict) -> dict:
+        """Dashboard: the master's own model on or off (router only)."""
+        import threading
+
+        if "own" not in body:
+            return self.info()
+        on = bool(body["own"])
+        with self.lock:
+            if self.model_job and self.model_job.get("state") in ("resolving", "downloading", "loading"):
+                return {"error": "a model change is running"}
+            if self.tune_job.get("state") == "running":
+                return {"error": "the autotune is running"}
+            if on == self.own:
+                return self.info()
+            if on and not Path(self.args.model).expanduser().is_file():
+                return {"error": "Zuerst unter „Modell“ ein Modell wählen und laden."}
+            self.own = on
+        save_master_own(on)
+        if self.on_own:
+            self.on_own(on)
+        if on:
+            setup_draft(self.args)
+
+            def load() -> None:
+                self.replan("Own model on", "Eigenes Modell an, lade es.")
+                if self.state == "running" and self.on_new_model:
+                    self.on_new_model(self.sp)  # the router learns the model's name
+            threading.Thread(target=load, daemon=True).start()
+        else:
+            self.event("Router only: model unloaded", "Nur Router: eigenes Modell entladen, Anfragen gehen an die Hosts.")
+            self.stop_server()
+            self.start_plan()
+        return self.info()
 
     def placeholder(self) -> ServerPlan:
         """Plan stand-in while waiting for workers, so router and dashboard run."""
@@ -2503,6 +2581,11 @@ class Supervisor:
         doesn't fit with the workers there are. Only the first plan with
         rebalancing off ends the program instead (exit 2)."""
         a = self.args
+        if not self.own:
+            with self.lock:
+                self.sp = self.off_plan()
+                self.state, self.reason, self.proc = "off", "", None
+            return True
         if self.ctx_auto:
             a.ctx = None
         public = (a.host, a.port)
@@ -2719,6 +2802,11 @@ class Supervisor:
             self.event(f"Switching the model to {path.name}", f"Wechsle das Modell: {path.name}")
             save_model_choice(a, str(path))
             a.model = str(path)
+            if not self.own:  # choosing a model for the master means: run it here
+                self.own = True
+                save_master_own(True)
+                if self.on_own:
+                    self.on_own(True)
             if a.mtp and not gguf_info(str(path), CTX_STEPS[-1]).n_nextn:
                 log("The new model has no MTP layers: MTP off")
                 a.mtp = 0
@@ -3580,6 +3668,7 @@ class Dashboard:
                                  "/api/model": self.sup.model_api,
                                  "/api/ctx": self.sup.ctx_api,
                                  "/api/tune": self.sup.tune_api,
+                                 "/api/master": self.sup.master_api,
                                  "/api/update": lambda b: self.updater.api(b) if self.updater else {"ok": False},
                                  "/api/wake": lambda b: {"ok": self.sup.known.wake(str(b.get("id") or ""), force=True)},
                                  "/api/hosts": self.hosts.api if self.hosts else (lambda b: {"error": "no hosts"})},
@@ -5534,10 +5623,24 @@ class Router:
             pass
         self.embedder: Optional[Embedder] = None  # set by serve; started when mode is "examples"
         self.external: list[dict] = []  # other OpenAI servers (external.json)
+        self.local_big: Optional[Backend] = backends[0] if backends else None
 
     @property
     def big(self) -> Backend:
-        return next((b for b in self.backends if b.name == "big" and b.source == "local"), self.backends[0])
+        return next((b for b in self.backends if b.name == "big" and b.source == "local"),
+                    next((b for b in self.backends if b.name == "big"),
+                         self.backends[0] if self.backends else self.local_big))
+
+    def set_local(self, on: bool) -> None:
+        """The master's own model in the router (off: router only)."""
+        b = self.local_big
+        if b is None:
+            return
+        with self.lock:
+            if on and b not in self.backends:
+                self.backends.insert(0, b)
+            elif not on and b in self.backends:
+                self.backends.remove(b)
 
     @property
     def fast(self) -> Optional[Backend]:

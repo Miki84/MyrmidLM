@@ -270,6 +270,12 @@
       <div class="model" id="model">Verbinde mit dem Master …</div>
       <details class="model-switch" id="model-switch">
         <summary>Modell und Kontext</summary>
+        <div class="switch-row" style="margin:6px 0 4px">
+          <button class="switch" id="own-switch" role="switch" aria-checked="true" aria-labelledby="own-label" type="button"></button>
+          <span id="own-label">Eigenes Modell auf diesem PC</span>
+        </div>
+        <div class="note" id="own-note"></div>
+        <div id="own-box">
         <form id="model-form">
           <label for="model-pick" class="muted">Modell</label>
           <div class="row">
@@ -279,6 +285,7 @@
           <input id="model-custom" name="custom" hidden placeholder="Hugging Face: user/repo:QUANT (z. B. bartowski/Qwen_Qwen3-8B-GGUF:Q4_K_M) oder Pfad zu einer .gguf-Datei">
         </form>
         <div class="note" id="model-job"></div>
+        <div id="own-only">
         <form id="ctx-form">
           <label for="ctx-pick" class="muted">Kontextfenster (maximal)</label>
           <div class="row">
@@ -295,6 +302,8 @@
           <button class="btn quiet" type="button" id="tune-reset" hidden>Ergebnis verwerfen</button>
         </div>
         <div class="note" id="tune-note" aria-live="polite"></div>
+        </div>
+        </div>
       </details>
     </div>
     <div class="pill" id="state"><span class="dot"></span><span>Verbinde …</span></div>
@@ -375,7 +384,7 @@
     <datalist id="model-list"></datalist>
   </section>
 
-  <section class="panel" aria-labelledby="split-title">
+  <section class="panel" id="split-panel" aria-labelledby="split-title">
     <div class="panel-head">
       <h2 id="split-title">Modell-Aufteilung</h2>
       <span class="muted" id="split-sub"></span>
@@ -389,7 +398,7 @@
     <p class="split-note" id="split-note"></p>
   </section>
 
-  <section class="panel rebalance" aria-labelledby="reb-title">
+  <section class="panel rebalance" id="reb-panel" aria-labelledby="reb-title">
     <div class="router-controls">
       <div class="panel-head" style="margin:0"><h2 id="reb-title">Neuverteilung</h2></div>
       <div class="switch-row">
@@ -549,7 +558,30 @@ $("tune-start").addEventListener("click", () => tuneAction("start"));
 $("tune-cancel").addEventListener("click", () => tuneAction("cancel"));
 $("tune-reset").addEventListener("click", () => tuneAction("reset"));
 
+function renderOwn(s) {
+  const r = s.rebalance || {}, own = r.own !== false, sw = $("own-switch");
+  if (!sw.dataset.busy) sw.setAttribute("aria-checked", String(own));
+  $("own-only").hidden = !own;
+  $("split-panel").hidden = !own;
+  $("reb-panel").hidden = !own;
+  $("own-note").textContent = own
+    ? "Aus: Dieser PC lädt kein Modell und verteilt nur die Anfragen an die Hosts und externe Server (z. B. als VM ohne GPU)."
+    : "Nur Router: Dieser PC lädt kein Modell. Wählen Sie unten ein Modell und laden es, oder schalten Sie ein, um das zuletzt gewählte wieder zu laden.";
+}
+$("own-switch").addEventListener("click", async () => {
+  const sw = $("own-switch"), on = sw.getAttribute("aria-checked") !== "true";
+  if (!confirm(on ? "Eigenes Modell auf dem Master wieder laden?"
+    : "Eigenes Modell entladen? Der Master verteilt dann nur noch an Hosts und externe Server. Laufende Anfragen an sein Modell brechen ab.")) return;
+  sw.dataset.busy = "1"; sw.setAttribute("aria-checked", String(on));
+  try {
+    const r = await api("/api/master", { method: "POST", body: JSON.stringify({ own: on }) });
+    if (r.error) { alert(r.error); sw.setAttribute("aria-checked", String(!on)); }
+  } catch (e) { /* next poll */ }
+  delete sw.dataset.busy;
+});
+
 function renderModelSwitch(s) {
+  renderOwn(s);
   renderCtx(s);
   renderTune(s);
   const ms = s.models || {}, pick = $("model-pick");
@@ -611,6 +643,15 @@ document.addEventListener("click", (ev) => {
 
 function renderHeader(s) {
   const p = s.plan, m = s.master;
+  if (p.mode === "off") {  // router only
+    const hs = ((s.hosts || {}).hosts || []).filter((h) => h.state === "ready");
+    $("model").innerHTML = `<strong>Nur Router</strong> &nbsp; Modelle laufen auf ${hs.length} Host${hs.length === 1 ? "" : "s"} &nbsp;<span class="muted">Master auf ${esc(m.host)}</span>`;
+    const ready = ((s.router || {}).backends || []).some((b) => b.status === "ready");
+    const up = m.uptime_s || 0;
+    const upText = up >= 3600 ? `${Math.floor(up / 3600)} Std. ${Math.floor(up % 3600 / 60)} Min.` : `${Math.floor(up / 60)} Min.`;
+    $("state").innerHTML = `<span class="dot ${ready ? "ok" : "bad"}"></span><span>${ready ? "Bereit" : "Kein Modell bereit"}</span><span class="muted">seit ${upText}</span>`;
+    return;
+  }
   const kind = p.kind === "moe" ? `MoE, ${p.n_expert_used} von ${p.n_expert} Experten aktiv` : "dicht";
   $("model").innerHTML = `<strong>${esc(p.model)}</strong> &nbsp; ${nf(p.size_gb, 1)} GB, ${p.n_layer} Layer, ${kind}, Kontext ${p.ctx.toLocaleString("de-DE")}${p.mtp ? `, MTP-Tiefe ${p.mtp}` : ""} &nbsp;<span class="muted">auf ${esc(m.host)}</span>`;
   const st = m.llama?.status, busy = (m.llama?.metrics?.requests_processing || 0) > 0;
@@ -631,7 +672,8 @@ function renderLive(s) {
   const cal = s.calibration || {}, spec = p.draft || p.mtp;
   const est = `Plan-Schätzung: ${nf(p.estimate_tps, 1)} Token/s${spec ? " ohne Entwurf" : ""}`
     + (cal.measured_tps ? `, gemessen ${nf(cal.measured_tps, 1)} ${spec ? "Durchläufe/s" : "Token/s"} (${cal.n} Anfragen)` : "") + ".";
-  $("rate-note").textContent = p.mode === "waiting" ? "Das Modell passt noch nicht: Es fehlen Worker."
+  $("rate-note").textContent = p.mode === "off" ? "Nur Router: Die Werte der Modelle stehen bei den Hosts und im Router."
+    : p.mode === "waiting" ? "Das Modell passt noch nicht: Es fehlen Worker."
     : busy ? `Generiert gerade. ${est}`
     : shown ? `Letzte Generierung. ${est}`
     : `Wartet auf die erste Anfrage. ${est}`;
