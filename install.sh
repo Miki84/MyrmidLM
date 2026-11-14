@@ -186,6 +186,12 @@ VENDORS="$(gpu_vendors || true)"
 if [[ -n "$VENDORS" ]]; then ok "GPUs: $VENDORS"; else warn "Keine GPU gefunden, es wird nur die CPU genutzt."; fi
 has_vendor() { [[ " $VENDORS " == *" $1 "* ]]; }
 
+# apt_has PACKAGE: installable here? (apt-cache show also succeeds for a name
+# that other packages only refer to, e.g. nvidia-vulkan-icd on Ubuntu)
+apt_has() {
+    [[ "$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')" =~ ^[0-9] ]]
+}
+
 pkg_install() {
     case "$PM" in
         apt) srun apt-get install -y "$@" ;;
@@ -269,7 +275,7 @@ install_nvidia_smi() {
     [[ -r /proc/driver/nvidia/version ]] && ver="$(grep -o 'Kernel Module[^0-9]*[0-9]*' /proc/driver/nvidia/version | grep -o '[0-9]*$' || true)"
     case "$DISTRO" in
         ubuntu|pop|linuxmint|elementary|zorin)
-            if [[ -n "$ver" ]] && apt-cache show "nvidia-utils-$ver-server" >/dev/null 2>&1 && dpkg -l | grep -q "nvidia-.*-$ver-server"; then
+            if [[ -n "$ver" ]] && apt_has "nvidia-utils-$ver-server" && dpkg -l | grep -q "nvidia-.*-$ver-server"; then
                 pkg_install "nvidia-utils-$ver-server"
             elif [[ -n "$ver" ]]; then
                 pkg_install "nvidia-utils-$ver"
@@ -293,12 +299,13 @@ install_nvidia_driver() {  # install_nvidia_driver GENERATION
         debian)
             debian_enable_nonfree
             if [[ "$gen" == kepler ]]; then
-                apt-cache show nvidia-tesla-470-driver >/dev/null 2>&1 || \
+                apt_has nvidia-tesla-470-driver || \
                     die "Für Kepler-Karten hat ${PRETTY_NAME:-Debian} keinen Treiber mehr (470 gibt es nur bis Debian 12)."
                 pkg_install "linux-headers-$(uname -r)" nvidia-tesla-470-driver firmware-misc-nonfree
             else
                 # nvidia-smi is only "recommended" there: without it the dashboard has no GPU values
-                pkg_install "linux-headers-$(uname -r)" nvidia-driver nvidia-smi nvidia-vulkan-icd firmware-misc-nonfree
+                pkg_install "linux-headers-$(uname -r)" nvidia-driver nvidia-smi firmware-misc-nonfree
+                apt_has nvidia-vulkan-icd && pkg_install nvidia-vulkan-icd
             fi ;;
         fedora)
             fedora_enable_rpmfusion
@@ -389,7 +396,7 @@ install_cuda() {  # install_cuda PACKAGE DEFAULT_ANSWER
             "https://developer.download.nvidia.com/compute/cuda/repos/$repo/x86_64/cuda-keyring_1.1-1_all.deb"
         srun dpkg -i "$tmp/cuda-keyring.deb"
         srun apt-get update
-        apt-cache show "$pkg" >/dev/null 2>&1 || { warn "Paket $pkg gibt es für $repo nicht."; return 1; }
+        apt_has "$pkg" || { warn "Paket $pkg gibt es für $repo nicht."; return 1; }
     else
         srun dnf config-manager addrepo --from-repofile="https://developer.download.nvidia.com/compute/cuda/repos/$repo/x86_64/cuda-$repo.repo" 2>/dev/null || \
             srun dnf config-manager --add-repo "https://developer.download.nvidia.com/compute/cuda/repos/$repo/x86_64/cuda-$repo.repo"
@@ -466,14 +473,15 @@ if [[ $USE_VULKAN -eq 1 ]]; then
     step "Vulkan (AMD, Intel$( [[ $USE_CUDA -eq 0 ]] && has_vendor nvidia && echo ", NVIDIA ohne CUDA"))"
     case "$PM" in
         apt)
-            if ! apt-cache show glslc >/dev/null 2>&1; then
+            if ! apt_has glslc; then
                 die "Paket glslc fehlt in ${PRETTY_NAME:-dieser Version} (z. B. Ubuntu 22.04).
        Lösung: Vulkan SDK von LunarG installieren (vulkan.lunarg.com) oder Ubuntu 24.04 verwenden.
        Danach das Skript erneut starten."
             fi
             pkg_install libvulkan-dev glslc spirv-headers mesa-vulkan-drivers vulkan-tools
-            # NVIDIA without CUDA runs on Vulkan: Debian packs its Vulkan driver separately.
-            if has_vendor nvidia && have nvidia-smi && apt-cache show nvidia-vulkan-icd >/dev/null 2>&1; then
+            # NVIDIA without CUDA runs on Vulkan: Debian packs its Vulkan driver separately
+            # (Ubuntu's driver packages bring it along).
+            if has_vendor nvidia && have nvidia-smi && apt_has nvidia-vulkan-icd; then
                 pkg_install nvidia-vulkan-icd
             fi ;;
         dnf) pkg_install vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers vulkan-tools ;;
