@@ -209,10 +209,10 @@
   .meter .k { color: var(--muted); }
   .meter .v { text-align: right; min-width: 92px; }
   .bar { height: 8px; border-radius: 4px; background: color-mix(in srgb, var(--line) 80%, transparent); overflow: hidden; }
-  .bar > i { display: block; height: 100%; width: 0; background: var(--c); border-radius: 4px; transition: width .6s ease; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--c, var(--c0)); border-radius: 4px; transition: width .6s ease; }
   .bar.hot > i { background: var(--warn); }
   .bar.full > i { background: var(--bad); }
-  .kv { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 0.85rem; }
+  .kv { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 0.85rem; align-items: center; align-content: flex-start; }
   .kv span b { font-weight: 600; }
   .note { font-size: 0.84rem; color: var(--muted); }
   /* ── Test chat ─────────────────────────────────────────── */
