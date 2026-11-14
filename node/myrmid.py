@@ -3157,6 +3157,7 @@ class SystemStats:
             "cpu_pct": round(cpu, 1),
             "cpu_name": next((d.description for d in self.devices if d.type == "cpu"), ""),
             "load": os.getloadavg()[0],
+            "cpu_temp_c": cpu_temp(),
             "ram_total_mb": mem.get("MemTotal", 0),
             "ram_used_mb": mem.get("MemTotal", 0) - mem.get("MemAvailable", 0),
             "net_rx_kbps": round((rx - rx0) / span / 1024, 1),
@@ -3205,6 +3206,36 @@ class SystemStats:
             if g["mem_total_mb"] or g["util_pct"] is not None:
                 out.append(g)
         return out
+
+
+CPU_SENSORS = ("k10temp", "zenpower", "coretemp", "cpu_thermal", "cpu-thermal", "soc_thermal")
+
+
+def cpu_temp(sys_root: str = "/sys") -> Optional[float]:
+    """The CPU's temperature as a whole (the package, not each core); with
+    two sockets the hotter one. None without a sensor (VMs)."""
+    best: Optional[float] = None
+    for hw in Path(sys_root, "class/hwmon").glob("hwmon*"):
+        name = _read(hw / "name")
+        if name not in CPU_SENSORS:
+            continue
+        temps = {}
+        for f in hw.glob("temp*_input"):
+            label = _read(hw / f.name.replace("_input", "_label")) or f.name
+            temps[label] = _num(_read(f), 1000)
+        # AMD: Tctl/Tdie is the whole chip; Intel: "Package id N"; else the first sensor
+        pick = next((v for k, v in temps.items() if k in ("Tdie", "Tctl") and v), None) \
+            or max((v for k, v in temps.items() if k.startswith("Package") and v), default=None) \
+            or next((v for k, v in sorted(temps.items()) if v), None)
+        if pick is not None and (best is None or pick > best):
+            best = pick
+    if best is None:
+        for z in Path(sys_root, "class/thermal").glob("thermal_zone*"):
+            if _read(z / "type") in ("x86_pkg_temp", "cpu-thermal", "cpu_thermal", "soc-thermal"):
+                v = _num(_read(z / "temp"), 1000)
+                if v is not None and (best is None or v > best):
+                    best = v
+    return best
 
 
 def _read(p: Path) -> str:

@@ -215,6 +215,9 @@
   .kv { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 0.85rem; }
   .kv span b { font-weight: 600; }
   .note { font-size: 0.84rem; color: var(--muted); }
+  .temp-warm { color: #c98a12; font-weight: 600; }
+  .temp-hot { color: var(--bad, #c0392b); font-weight: 600; }
+  .host-stats { display: grid; gap: 6px; margin: 4px 0; }
   .tune-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
   .ext-list { display: grid; gap: 8px; }
   .ext-row { display: grid; grid-template-columns: 1fr 1.6fr 1fr 0.9fr 0.7fr 1fr auto; gap: 6px; align-items: center; }
@@ -794,9 +797,15 @@ function meter(label, pct, valueText, warnAt = 85, fullAt = 96) {
   return `<div class="meter"><span class="k">${esc(label)}</span><span class="bar ${cls}" role="meter" aria-label="${esc(label)}" aria-valuenow="${Math.round(p)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${p}%"></i></span><span class="v num">${valueText}</span></div>`;
 }
 
+function tempText(t) {  // " · 62 °C", warm from 80 °C, hot from 90 °C
+  if (t == null) return "";
+  const cls = t >= 90 ? "temp-hot" : t >= 80 ? "temp-warm" : "";
+  return ` · <span class="${cls}">${nf(t, 0)} °C</span>`;
+}
+
 function gpuBlock(g) {
   const memPct = g.mem_total_mb ? 100 * g.mem_used_mb / g.mem_total_mb : null;
-  const extra = [g.temp_c != null ? `${nf(g.temp_c, 0)} °C` : "", g.power_w != null ? `${nf(g.power_w, 0)} W` : ""].filter(Boolean).join(", ");
+  const extra = [g.temp_c != null ? tempText(g.temp_c).slice(3) : "", g.power_w != null ? `${nf(g.power_w, 0)} W` : ""].filter(Boolean).join(", ");
   return `<div class="gpu"><div class="gpu-name"><span>${esc(g.name)}</span><span>${extra}</span></div>
     ${meter("Auslastung", g.util_pct, g.util_pct == null ? "–" : nf(g.util_pct, 0) + " %")}
     ${meter("VRAM", memPct, `${gb(g.mem_used_mb)} / ${gb(g.mem_total_mb)}`, 92, 98)}</div>`;
@@ -821,7 +830,7 @@ function machineCard(s, id, st, extra) {
     <div class="machine-body">
       <div class="kv"><span><b class="num">${layers}</b> Layer</span>${isOut ? "<span>Ausgabeschicht</span>" : ""}${st.rtt != null ? `<span>Antwortzeit <b class="num">${nf(st.rtt, 1)} ms</b></span>` : ""}${calText(s, id)}</div>
       ${gpus || (stats.host ? `<div class="note">Keine GPU-Messwerte (Intel-GPU oder ohne Treiberwerkzeug).</div>` : "")}
-      ${stats.host ? meter("CPU", stats.cpu_pct, nf(stats.cpu_pct, 0) + " %") : ""}
+      ${stats.host ? meter("CPU", stats.cpu_pct, nf(stats.cpu_pct, 0) + " %" + tempText(stats.cpu_temp_c)) : ""}
       ${stats.host ? meter("RAM", ramPct, `${gb(stats.ram_used_mb)} / ${gb(stats.ram_total_mb)}`, 90, 97) : ""}
       ${stats.host ? `<div class="kv"><span>Netz empfangen <b class="num">${rateText(stats.net_rx_kbps)}</b></span><span>gesendet <b class="num">${rateText(stats.net_tx_kbps)}</b></span></div>` : ""}
       ${extra || ""}
@@ -943,6 +952,16 @@ function tuneText(job, tuned) {
 }
 const hostEdits = {};  // host id -> form values the user is typing, kept across refreshes
 
+function hostStats(x) {
+  // the host's GPUs (a GPU slot card: just its own) and the CPU as a whole
+  const st = x.stats || {};
+  if (!st.host || x.asleep) return "";
+  let gpus = st.gpus || [];
+  if (x.slot != null && gpus[x.slot]) gpus = [gpus[x.slot]];
+  return `<div class="host-stats">${gpus.map(gpuBlock).join("")}
+    ${meter("CPU", st.cpu_pct, nf(st.cpu_pct, 0) + " %" + tempText(st.cpu_temp_c))}</div>`;
+}
+
 function renderHosts(s) {
   const h = s.hosts || {}, list = h.hosts || [];
   const models = new Set((h.catalog || []).map((c) => c.key));
@@ -988,7 +1007,7 @@ function renderHosts(s) {
     return `<article class="host" data-id="${esc(x.id)}">
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${x.gpu ? " · " + esc(x.gpu) : gpus ? " · " + gpus : ""}</div></div>
         <div class="pill"><span class="dot ${cls}"></span><span>${txt}</span></div></div>
-      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${layoutRow}${sleepRow}${roleRow}
+      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${hostStats(x)}${layoutRow}${sleepRow}${roleRow}
       ${x.state === "ready" || x.state === "tuning" || x.tuned || x.tune_job ? `<div class="kv"><span class="note">${esc(tuneText(x.tune_job, x.tuned) || "Autotune: misst die schnellsten Einstellungen für dieses Modell auf diesem PC.")}</span>${
         x.tune_job && x.tune_job.state === "running" ? `<button class="btn quiet small" type="button" data-htune="cancel">Abbrechen</button>`
         : x.state === "ready" ? `<button class="btn quiet small" type="button" data-htune="start">${x.tuned ? "Autotune erneut" : "Autotune"}</button>${x.tuned ? `<button class="btn quiet small" type="button" data-htune="reset">Verwerfen</button>` : ""}` : ""}</div>` : ""}
