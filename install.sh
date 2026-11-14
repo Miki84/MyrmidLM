@@ -189,7 +189,8 @@ has_vendor() { [[ " $VENDORS " == *" $1 "* ]]; }
 # apt_has PACKAGE: installable here? (apt-cache show also succeeds for a name
 # that other packages only refer to, e.g. nvidia-vulkan-icd on Ubuntu)
 apt_has() {
-    [[ "$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')" =~ ^[0-9] ]]
+    # LC_ALL=C: a German system says "Installationskandidat:" instead of "Candidate:"
+    [[ "$(LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')" =~ ^[0-9] ]]
 }
 
 pkg_install() {
