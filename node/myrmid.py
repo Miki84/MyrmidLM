@@ -14,7 +14,7 @@ Workers advertise themselves exactly like worker phones do
 PC like any other phone. The service types, the privatelm:// QR codes and
 the ids keep their PrivateLM names: they are the protocol the app (and
 phones running older builds) speak, MyrmidLM is a fork of PrivateLM. Phones and PC must run the same llama.cpp RPC
-protocol (rpc9); build.sh builds the commit the app vendors.
+protocol (rpc10); build.sh builds the commit the app vendors.
 
 The RPC protocol has no authentication: run workers only on a network you
 trust (home LAN, or a VPN such as NetBird/WireGuard with --host set to the
@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-RPC_VERSION = "rpc9"
+RPC_VERSION = "rpc10"
 WORKER_TYPE = "_privatelm._tcp.local."
 SERVER_TYPE = "_privatelm-api._tcp.local."
 HOST_TYPE = "_privatelm-host._tcp.local."  # PCs that load whole models for a master's router
