@@ -947,8 +947,10 @@ function renderHosts(s) {
   const h = s.hosts || {}, list = h.hosts || [];
   const models = new Set((h.catalog || []).map((c) => c.key));
   list.forEach((x) => (x.models || []).forEach((m) => models.add(m)));
-  $("model-list").innerHTML = [...models].map((m) => `<option value="${esc(m)}">`).join("")
+  // Rebuilt only when it changes: replacing it every poll closes or scrolls the open suggestion list
+  const opts = [...models].map((m) => `<option value="${esc(m)}">`).join("")
     + (h.catalog || []).map((c) => `<option value="${esc(c.key)}">${esc(c.desc)}</option>`).join("");
+  if ($("model-list").dataset.sig !== opts) { $("model-list").innerHTML = opts; $("model-list").dataset.sig = opts; }
   $("hosts-sub").textContent = list.length ? `${list.length} ${list.length === 1 ? "Host" : "Hosts"} im Netz` : "";
   $("hosts-note").textContent = h.off
     ? "Hosts brauchen einen API-Key auf dem Master (er ist ihr Cluster-Schlüssel)."
