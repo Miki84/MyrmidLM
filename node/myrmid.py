@@ -1253,8 +1253,17 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
             break
     budgets = [d.free_mb * GPU_SHARE - GPU_RESERVE_MB - (out_extra if d is out_gpu else 0)
                for d in local_gpus]
+    # A vision model's image part goes to llama.cpp's main GPU (the first),
+    # with room to encode an image; without a GPU it costs RAM.
+    proj = None if str(getattr(args, "mmproj", "auto")).lower() == "off" else find_mmproj(model)
+    args._mmproj = str(proj) if proj else ""
+    proj_mb = proj.stat().st_size / 2**20 + 400 if proj else 0.0
+    if proj and budgets:
+        budgets[0] -= proj_mb
     host_budget = host_available_mb() * HOST_SHARE - HOST_RESERVE_MB
     host_budget -= getattr(args, "reserve_mb", {}).get("__host__", 0)  # router's fast model in RAM
+    if proj and not budgets:
+        host_budget -= proj_mb
     if args.ram_limit is not None:
         host_budget = min(host_budget, args.ram_limit * 1024)
     # An integrated GPU has no memory of its own: what it reports as free is
@@ -1487,6 +1496,10 @@ def _finish_command(args, cmd: list[str], model: str, tps: float, info: Optional
             apply_tune(cmd, tuned.get("flags") or {})
             if info is not None:
                 info["tuned"] = {"flags": tuned.get("flags"), "at": tuned.get("at"), "score": tuned.get("score")}
+    if getattr(args, "_mmproj", ""):
+        cmd += ["--mmproj", args._mmproj]
+        if info is not None:
+            info["vision"] = Path(args._mmproj).name
     if getattr(args, "ple_mb", 0):
         # The n-gram table is only looked up (a few rows per token): host memory,
         # mmap'd, so with too little RAM the OS reads it from the SSD as needed.
@@ -5626,6 +5639,7 @@ class Backend:
     ctx_at: float = 0.0  # when ctx was last read from the server
     tps: float = 0.0  # measured on requests it ran alone (moving average)
     upstream_model: str = ""  # external server: the model name it wants in requests
+    vision: Optional[bool] = None  # reads images (from the server's /props; None: not known yet)
 
     @property
     def speed(self) -> float:
@@ -5656,6 +5670,14 @@ DEFAULT_EXAMPLES = {
             "Analyze this contract and list the risks.", "Plan the migration step by step."]},
     ],
 }
+
+
+class NoVision(Exception):
+    """The request has images, and the model it may go to can't read them."""
+
+
+def has_images(body: dict) -> bool:
+    return any(_message_text(m.get("content"))[1] for m in body.get("messages") or [] if isinstance(m, dict))
 
 
 class ContextTooLong(Exception):
@@ -5974,6 +5996,10 @@ class Router:
         if msgs is None:
             msgs = [{"content": body.get("prompt", "")}]
         chars = sum(len(_message_text(m.get("content"))[0]) + 16 for m in msgs)
+        # an image costs roughly a thousand tokens or more, depending on its size and the model
+        chars += 4000 * sum(1 for m in msgs if isinstance(m, dict) for part in (m.get("content") or [])
+                            if isinstance(part, dict) and part.get("type") in ("image_url", "input_image", "image")) \
+            if any(isinstance(m, dict) and isinstance(m.get("content"), list) for m in msgs) else 0
         chars += len(json.dumps(body.get("tools") or body.get("functions") or []))
         try:
             answer = min(2048, int(body.get("max_tokens") or body.get("max_completion_tokens") or 256))
@@ -5990,6 +6016,7 @@ class Router:
             emb = self.embedder
             return {"available": True, "enabled": self.enabled, "mode": self.mode, "prefer_fast": self.prefer_fast,
                     "examples": self.examples,
+                    "vision": [b.group or b.label for b in self.backends if b.vision],
                     "external": [{k: v for k, v in e.items() if k != "key"} | {"has_key": bool(e.get("key"))}
                                  for e in getattr(self, "external", [])],
                     "embedder": {"state": emb.state, "error": emb.error, "model": EMBED_MODEL} if emb else None,
@@ -5998,7 +6025,7 @@ class Router:
                     "counts": dict(self.counts), "recent": list(self.recent[-12:]),
                     "backends": [{"role": b.name, "group": b.group, "model": b.label, "where": b.where,
                                   "source": b.source, "status": "asleep" if b.asleep else b.status,
-                                  "inflight": b.inflight, "served": b.served, "ctx": b.ctx,
+                                  "inflight": b.inflight, "served": b.served, "ctx": b.ctx, "vision": b.vision,
                                   "tps": round(b.speed, 1), "measured": b.tps > 0} for b in self.backends]}
 
     def watch_health(self) -> None:
@@ -6030,9 +6057,12 @@ class Router:
                         req = urllib.request.Request(b.base + "/props", headers={"Authorization": f"Bearer {b.key}"}
                                                      if b.key else {})
                         with urllib.request.urlopen(req, timeout=3) as r:
-                            n = int((json.loads(r.read()).get("default_generation_settings") or {}).get("n_ctx") or 0)
+                            props = json.loads(r.read())
+                        n = int((props.get("default_generation_settings") or {}).get("n_ctx") or 0)
                         if n > 0:
                             b.ctx = n
+                        if isinstance(props.get("modalities"), dict):
+                            b.vision = bool(props["modalities"].get("vision"))
                     except (OSError, ValueError, TypeError):
                         pass
             time.sleep(3)
@@ -6120,13 +6150,27 @@ class Router:
         forced = ((headers.get("X-Myrmid-Route") or headers.get("X-PrivateLM-Route") or "").strip()
                   or str(body.get("model", "")).strip()).lower()
         # "privatelm" was the router's name before the rename: clients set up then keep working
+        images = has_images(body)
         if forced and forced not in (self.public_name.lower(), "privatelm"):
             group = self.group(forced)
             if group:
+                if images and all(b.vision is False for b in group):
+                    raise NoVision(f"„{group[0].group or group[0].label}“ kann keine Bilder lesen")
                 return self._pick_group(group, "Modell angefordert", need, loose)
             for role, words in ROLE_WORDS.items():
                 if forced in words:
                     return self._pick_role(role, "angefordert", need, loose)
+        if images:
+            # only to a model that reads images: the big/fast one if it does, else any
+            vis = [b for b in self.backends if b.vision]
+            if vis:
+                for role in ("big", "fast"):
+                    cands = [b for b in vis if b.name == role]
+                    if cands and (self.choose(self.fits(cands, need)) or self.sleeper(cands)):
+                        return self._pick_group(cands, "Bild: Modell mit Bildverständnis", need, loose)
+                return self._pick_group(vis, "Bild: Modell mit Bildverständnis", need, loose)
+            if self.backends and all(b.vision is False for b in self.backends if b.healthy):
+                raise NoVision("Kein Modell im Cluster kann Bilder lesen")
         if not self.enabled:
             return self._pick_role("big", "Router aus", need, loose)
         by_example = None
@@ -6291,6 +6335,11 @@ class Router:
                                         "/completions", "/completion") and isinstance(body, dict):
                     try:
                         backend, reason = router.decide(body, self.headers)
+                    except NoVision as e:
+                        return self._json(400, {"error": {
+                            "message": f"{e}. Ein Vision-Modell laden (z. B. qwen3-vl-8b, mit seinem mmproj) und das "
+                                       "Bild an dieses schicken oder den Router wählen lassen (model: myrmid).",
+                            "type": "invalid_request_error", "param": "messages", "code": "model_not_vision"}})
                     except ContextTooLong as e:
                         # In OpenAI's words, so clients (opencode, ...) shorten the conversation themselves
                         return self._json(400, {"error": {
@@ -7032,6 +7081,8 @@ CATALOG = [
     ("qwen3.8-27b", "unsloth/Qwen3.8-27B-GGUF", "Q4_K_M", "groß, dicht: lohnt den Verbund"),
     ("qwen3-32b", "bartowski/Qwen_Qwen3-32B-GGUF", "Q4_K_M", "groß, dicht: lohnt den Verbund"),
     ("qwen3.6-35b-a3b", "unsloth/Qwen3.6-35B-A3B-GGUF", "UD-Q4_K_M", "MoE: schnell bei viel RAM im Master"),
+    ("qwen3-vl-4b", "Qwen/Qwen3-VL-4B-Instruct-GGUF", "Q4_K_M", "Vision: liest Bilder, Fotos, Scans (OCR); 6-GB-GPU"),
+    ("qwen3-vl-8b", "Qwen/Qwen3-VL-8B-Instruct-GGUF", "Q4_K_M", "Vision: Bilder, Dokumente, OCR; ab 8 GB VRAM"),
     ("qwen3.8-flash-next", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ3_XXS",
      "MoE 125B (6B aktiv), ≈ 82 GB: ein Host mit GPU und ≥ 96 GB RAM, danach Autotune"),
 ]
@@ -7101,7 +7152,7 @@ def local_models() -> list[dict]:
                 if m:  # all parts together
                     size = sum(q.stat().st_size for q in real.parent.glob(SPLIT_RE.sub("-*-of-" + m.group(2) + ".gguf", real.name)))
                 out.append({"source": "local", "name": p.stem, "path": str(real), "size_mb": size // 2**20,
-                            "arch": _gguf_arch(str(real))})
+                            "arch": _gguf_arch(str(real)), "vision": bool(find_mmproj(str(p)))})
     return sorted(out, key=lambda x: x["size_mb"])
 
 
@@ -7117,11 +7168,15 @@ def hf_resolve(repo: str, quant: str) -> dict:
     with urllib.request.urlopen(req, timeout=20) as r:
         data = json.loads(r.read())
     q = quant.lower()
-    files = []
+    files, projs = [], []
     for sib in data.get("siblings", []):
         fn = sib.get("rfilename", "")
         low = fn.lower()
-        if not low.endswith(".gguf") or "mmproj" in low:
+        if low.endswith(".gguf") and "mmproj" in low:  # the vision part of a vision model
+            lfs = sib.get("lfs") or {}
+            projs.append({"file": fn, "size": sib.get("size") or lfs.get("size") or 0, "sha256": lfs.get("sha256")})
+            continue
+        if not low.endswith(".gguf"):
             continue
         base = low.rsplit("/", 1)[-1]
         if not (base.endswith(f"-{q}.gguf") or base.endswith(f".{q}.gguf") or f"-{q}-0000" in base
@@ -7141,8 +7196,47 @@ def hf_resolve(repo: str, quant: str) -> dict:
     else:
         files = [first]
     arch = (data.get("gguf") or {}).get("architecture", "")
-    return {"repo": repo, "quant": quant, "files": files, "size_mb": sum(f["size"] for f in files) // 2**20,
-            "arch": arch, "name": Path(first["file"]).stem.split("-00001-of-")[0]}
+    proj = pick_mmproj(projs)
+    return {"repo": repo, "quant": quant, "files": files,
+            "size_mb": (sum(f["size"] for f in files) + (proj["size"] if proj else 0)) // 2**20,
+            "arch": arch, "name": Path(first["file"]).stem.split("-00001-of-")[0], "mmproj": proj}
+
+
+def pick_mmproj(projs: list[dict]) -> Optional[dict]:
+    """The vision part to use when a repo has several: F16 (the usual and
+    the safest: a quantized one costs image quality), then BF16, Q8_0, any."""
+    def rank(p: dict) -> tuple:
+        low = p["file"].lower()
+        order = next((i for i, k in enumerate(("f16", "bf16", "q8_0", "f32")) if re.search(rf"[-_.]{k}\.gguf$", low)
+                      and not (k == "f16" and "bf16" in low)), 9)
+        return order, p["size"]
+    return sorted(projs, key=rank)[0] if projs else None
+
+
+def mmproj_sidecar(model: Path) -> Path:
+    """The file noting which vision part belongs to a model (written at download)."""
+    base = re.sub(r"-\d{5}-of-\d{5}$", "", model.stem)
+    return model.with_name(base + ".mmproj")
+
+
+def find_mmproj(model: str) -> Optional[Path]:
+    """The vision part (mmproj) of a model: the one noted at download, else
+    the only mmproj file in its folder whose name matches the model's."""
+    path = Path(model).expanduser()
+    try:
+        side = mmproj_sidecar(path)
+        if side.is_file():
+            p = path.with_name(side.read_text().strip())
+            return p if p.is_file() else None
+        base = re.sub(r"-\d{5}-of-\d{5}$", "", path.stem).lower()
+        base = re.sub(r"[-_.](ud-)?(i?q\d[\w]*|f16|bf16|f32)$", "", base)
+        norm = lambda x: re.sub(r"[^a-z0-9]", "", x)  # noqa: E731
+        cands = [p for p in path.parent.glob("*.gguf") if "mmproj" in p.name.lower()
+                 and norm(base) and (norm(base) in norm(p.stem.lower()) or
+                                     norm(p.stem.lower().replace("mmproj", "")).startswith(norm(base)[:12]))]
+        return cands[0] if len(cands) == 1 else None
+    except OSError:
+        return None
 
 
 def memory_budget(use_workers: bool) -> tuple[int, int]:
@@ -7266,6 +7360,18 @@ def fetch_model(target: str, out_dir: Path, force: bool = False, quiet: bool = F
         paths.append(dest)
         with _download_lock(dest):
             _fetch_file(r, f, dest, quiet)
+    proj = r.get("mmproj")
+    if proj:  # a vision model: its image part, noted next to the model
+        name = Path(proj["file"]).name
+        if name.lower() in ("mmproj-f16.gguf", "mmproj-bf16.gguf", "mmproj-q8_0.gguf", "mmproj.gguf"):
+            name = f"{r['name']}-{name}"  # generic names of different repos would overwrite each other
+        dest = out_dir / name
+        with _download_lock(dest):
+            _fetch_file(r, proj, dest, quiet)
+        try:
+            mmproj_sidecar(paths[0]).write_text(dest.name)
+        except OSError as e:
+            log(f"Could not note the vision part ({e})")
     return paths[0]
 
 

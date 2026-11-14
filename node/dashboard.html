@@ -251,6 +251,14 @@
   .chat-in textarea { flex: 1; font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
     background: var(--surface-2, var(--surface)); color: var(--text); resize: none; min-height: 2.6em; max-height: 40vh; }
   .chat-empty { color: var(--muted); margin: auto; text-align: center; max-width: 520px; }
+  .chat-att { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 16px 0; background: var(--surface); }
+  .chat-att:empty { display: none; }
+  .chat-att figure, .msg.user .imgs img { position: relative; margin: 0; }
+  .chat-att img { height: 64px; border-radius: 8px; border: 1px solid var(--line); display: block; }
+  .chat-att button { position: absolute; top: -6px; right: -6px; border-radius: 50%; width: 22px; height: 22px; padding: 0; line-height: 1; }
+  .msg.user .imgs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; justify-content: flex-end; }
+  .msg.user .imgs img { max-height: 160px; max-width: 240px; border-radius: 8px; }
+  .chat-in.drop textarea { outline: 2px dashed var(--c0); }
   @media (max-width: 760px) { .chat-cols.two { grid-template-columns: 1fr; } .chat-cols.two .chat-col + .chat-col { border-left: 0; border-top: 1px solid var(--line); } .chat-set { grid-template-columns: 1fr; } }
   .temp-warm { color: #c98a12; font-weight: 600; }
   .temp-hot { color: var(--bad, #c0392b); font-weight: 600; }
@@ -314,8 +322,11 @@
     <div class="chat-col" id="chat-c0" aria-live="polite"></div>
     <div class="chat-col" id="chat-c1" aria-live="polite" hidden></div>
   </div>
+  <div class="chat-att" id="chat-att" aria-label="Angehängte Bilder"></div>
   <form class="chat-in" id="chat-form">
-    <textarea id="chat-text" rows="1" placeholder="Nachricht … (Enter sendet, Umschalt+Enter neue Zeile)"></textarea>
+    <input type="file" id="chat-file" accept="image/*" multiple hidden>
+    <button class="btn quiet" type="button" id="chat-attach" title="Bild anhängen (auch per Einfügen oder Ziehen), z. B. für OCR">📎</button>
+    <textarea id="chat-text" rows="1" placeholder="Nachricht … (Enter sendet, Umschalt+Enter neue Zeile; Bilder einfügen oder hineinziehen)"></textarea>
     <button class="btn" type="submit" id="chat-send">Senden</button>
     <button class="btn quiet" type="button" id="chat-stop" hidden>Stopp</button>
   </form>
@@ -564,7 +575,9 @@ const chat = { cols: [[], []], busy: false, ctrl: [] };
 try { Object.assign(chat, JSON.parse(localStorage.getItem("myrmid_chat") || "{}"), { busy: false, ctrl: [] }); } catch (e) { /* fresh */ }
 function chatSave() {
   try {
-    localStorage.setItem("myrmid_chat", JSON.stringify({ cols: chat.cols, m1: $("chat-m1").value, m2: $("chat-m2").value,
+    // images stay out of the browser storage (too big); the text remembers there was one
+    const cols = chat.cols.map((c) => c.map((m) => m.images ? { ...m, images: undefined, imgs_n: m.images.length } : m));
+    localStorage.setItem("myrmid_chat", JSON.stringify({ cols, m1: $("chat-m1").value, m2: $("chat-m2").value,
       cmp: $("chat-cmp").getAttribute("aria-checked") === "true", sys: $("chat-sys").value,
       temp: $("chat-temp").value, max: $("chat-max").value }));
   } catch (e) { /* storage full or off */ }
@@ -578,7 +591,7 @@ function chatModels() {
     const n = b.group || b.model;
     if (!n || seen.has(n)) return;
     seen.add(n);
-    opts.push([n, `${n}${b.source === "external" ? " (extern)" : ""}${b.status !== "ready" ? " – " + (STATUS_TEXT[b.status] || b.status) : ""}`]);
+    opts.push([n, `${n}${b.vision ? " · Bilder" : ""}${b.source === "external" ? " (extern)" : ""}${b.status !== "ready" ? " – " + (STATUS_TEXT[b.status] || b.status) : ""}`]);
   });
   for (const id of ["chat-m1", "chat-m2"]) {
     const sel = $(id), cur = sel.value || chat[id === "chat-m1" ? "m1" : "m2"] || (id === "chat-m1" ? "myrmid" : "big");
@@ -631,7 +644,8 @@ function chatRender(i) {
     ? `<div class="chat-col-head">${esc($(i ? "chat-m2" : "chat-m1").selectedOptions[0]?.textContent || "")}</div>` : "";
   const stick = col.scrollHeight - col.scrollTop - col.clientHeight < 60;
   col.innerHTML = head + (msgs.length ? msgs.map((m) => m.role === "user"
-    ? `<div class="msg user">${esc(m.content)}</div>`
+    ? `<div class="msg user">${m.images ? `<div class="imgs">${m.images.map((u) => `<img src="${u}" alt="Bild">`).join("")}</div>`
+        : m.imgs_n ? `<div class="note">(${m.imgs_n} Bild${m.imgs_n > 1 ? "er" : ""})</div>` : ""}${esc(m.content)}</div>`
     : `<div class="msg bot${m.error ? " err" : ""}">${m.think ? `<details class="think"${m.thinking ? " open" : ""}><summary>Gedanken${m.thinking ? " …" : ""}</summary><div>${esc(m.think)}</div></details>` : ""}
         <div class="body">${m.error ? esc(m.error) : md(m.content || (m.pending ? "…" : ""))}</div>${chatMeta(m)}</div>`).join("")
     : `<div class="chat-empty">Fragen Sie etwas. Die Anfrage geht über die API des Masters, mit Router, wie bei opencode. Unter jeder Antwort steht, welches Modell auf welchem Rechner geantwortet hat, warum, und wie schnell.${i === 0 ? "<br><br>Mit „Vergleich“ geht dieselbe Frage an zwei Modelle nebeneinander." : ""}</div>`);
@@ -649,7 +663,11 @@ function chatCompare(on) {
 async function chatAsk(i, model) {
   const msgs = chat.cols[i];
   const sys = $("chat-sys").value.trim();
-  const history = msgs.filter((m) => !m.error && !m.pending).map((m) => ({ role: m.role, content: m.content }));
+  const history = msgs.filter((m) => !m.error && !m.pending).map((m) => ({ role: m.role,
+    content: m.images && m.images.length
+      ? [{ type: "text", text: m.content || "Was ist auf dem Bild? Gib den Text darin wörtlich wieder." },
+         ...m.images.map((u) => ({ type: "image_url", image_url: { url: u } }))]
+      : m.content }));
   const bot = { role: "assistant", content: "", pending: true };
   msgs.push(bot);
   chatRender(i);
@@ -708,12 +726,14 @@ async function chatAsk(i, model) {
 }
 
 async function chatSend(text) {
-  if (chat.busy || !text.trim()) return;
+  if (chat.busy || (!text.trim() && !chat.att.length)) return;
+  const images = chat.att.splice(0);
+  chatAttRender();
   chat.busy = true;
   $("chat-send").hidden = true; $("chat-stop").hidden = false;
   const cmp = $("chat-cmp").getAttribute("aria-checked") === "true";
   const cols = cmp ? [0, 1] : [0];
-  cols.forEach((i) => chat.cols[i].push({ role: "user", content: text }));
+  cols.forEach((i) => chat.cols[i].push({ role: "user", content: text, ...(images.length ? { images } : {}) }));
   await Promise.all(cols.map((i) => chatAsk(i, $(i ? "chat-m2" : "chat-m1").value)));
   chat.ctrl = []; chat.busy = false;
   $("chat-send").hidden = false; $("chat-stop").hidden = true;
@@ -735,6 +755,40 @@ function chatOpen(open) {
     if (location.hash !== "#chat") history.replaceState(null, "", "#chat");
   } else if (location.hash === "#chat") history.replaceState(null, "", location.pathname);
 }
+
+chat.att = [];
+function chatAttRender() {
+  $("chat-att").innerHTML = chat.att.map((u, i) => `<figure><img src="${u}" alt="Anhang ${i + 1}"><button class="btn small" type="button" data-attdel="${i}" aria-label="Bild entfernen">✕</button></figure>`).join("");
+}
+function chatAddImage(file) {
+  // scaled to at most 2048 px (enough for reading text) and sent as JPEG
+  if (!file || !file.type.startsWith("image/")) return;
+  const img = new Image(), url = URL.createObjectURL(file);
+  img.onload = () => {
+    const k = Math.min(1, 2048 / Math.max(img.width, img.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+    const g = c.getContext("2d");
+    g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height);
+    g.drawImage(img, 0, 0, c.width, c.height);
+    chat.att.push(c.toDataURL("image/jpeg", 0.9));
+    URL.revokeObjectURL(url);
+    chatAttRender();
+  };
+  img.src = url;
+}
+$("chat-attach").addEventListener("click", () => $("chat-file").click());
+$("chat-file").addEventListener("change", (ev) => { [...ev.target.files].forEach(chatAddImage); ev.target.value = ""; });
+$("chat-att").addEventListener("click", (ev) => { const i = ev.target.dataset && ev.target.dataset.attdel; if (i !== undefined) { chat.att.splice(+i, 1); chatAttRender(); } });
+$("chat-text").addEventListener("paste", (ev) => {
+  const files = [...(ev.clipboardData || {}).items || []].filter((it) => it.type.startsWith("image/")).map((it) => it.getAsFile());
+  if (files.length) { ev.preventDefault(); files.forEach(chatAddImage); }
+});
+["dragover", "dragleave", "drop"].forEach((t) => $("chat-form").addEventListener(t, (ev) => {
+  ev.preventDefault();
+  $("chat-form").classList.toggle("drop", t === "dragover");
+  if (t === "drop") [...ev.dataTransfer.files].forEach(chatAddImage);
+}));
 
 $("chat-open").addEventListener("click", () => chatOpen(true));
 $("chat-close").addEventListener("click", () => { chatSave(); chatOpen(false); });
