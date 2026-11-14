@@ -1856,6 +1856,21 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
     {"flags", "score", "results"}; raises RuntimeError if nothing ran."""
     say = progress or (lambda *_: None)
     stop = cancelled or (lambda: False)
+    moe = None
+    if "--cpu-moe" in base_cmd and "-m" in base_cmd:
+        # First the expert cache: llama.cpp's own test picks its size and CPU
+        # share (6 starts); the variants below build on it.
+        say("Experten-Cache: llama.cpp misst Cache-Größe und CPU-Anteil (6 Starts) …", 0, 0)
+        try:
+            mib, share, _ = moe_cache_tune(base_cmd, base_cmd[base_cmd.index("-m") + 1], cancelled=stop)
+            base_cmd = apply_tune(list(base_cmd), {"--moe-cache-mib": mib, "--moe-cache-cpu-share": share})
+            moe = {"mib": mib, "share": share}
+            log(f"Autotune: expert cache {mib} MiB, CPU share {share:g}")
+        except RuntimeError as e:
+            if stop():
+                raise
+            log(f"Autotune: expert cache test skipped ({e})")
+            moe = {"error": str(e)[:200]}
     base_cmd = apply_tune(list(base_cmd), {"--port": port, "--host": "127.0.0.1"})
     dims = _tune_variants(base_cmd)
     total = 1 + sum(len(v) - 1 for _, v in dims)
@@ -1906,7 +1921,12 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
                 best, best_flags = r, dict(r["flags"])
     if best is None:
         raise RuntimeError("keine Variante ist gestartet: " + (results[0].get("error") or ""))
-    return {"flags": best_flags, "label": tune_label(best_flags), "score": {k: best[k] for k in ("pp", "tg", "secs")},
+    label = tune_label(best_flags)
+    if moe and "mib" in moe:
+        label = f"Cache {moe['mib']:,} MB".replace(",", ".") + (f", CPU-Anteil {moe['share']:g}"
+                                                                 if "--moe-cache-cpu-share" not in best_flags else "") \
+            + ("" if label == "Plan" else ", " + label)
+    return {"flags": best_flags, "label": label, "moe": moe, "score": {k: best[k] for k in ("pp", "tg", "secs")},
             "base": {k: base[k] for k in ("pp", "tg", "secs")} if base and "secs" in base else None,
             "results": results, "at": int(time.time())}
 
@@ -1925,6 +1945,62 @@ def cmd_tune(args) -> None:
           f"{res['score']['tg']} t/s answer. Saved; serve uses it from now on.")
 
 
+def moe_cache_tune(cmd_full: list[str], model: str, max_mib: Optional[int] = None,
+                   cancelled=None) -> tuple[int, float, str]:
+    """llama.cpp's moe-cache-tune.py on a planned command: the best expert
+    cache size and CPU share for this PC (saved to moe-tune.json, which the
+    planner uses). Returns (MiB, share, the script's summary). Raises
+    RuntimeError when it can't."""
+    try:
+        script = find_bin("moe-cache-tune.py")
+    except SystemExit:
+        raise RuntimeError("moe-cache-tune.py fehlt neben llama-server (build.sh erneut ausführen)") from None
+    cmd, skip = [], 0
+    for a in cmd_full:  # the script sets cache, share, host and port itself
+        if skip:
+            skip -= 1
+            continue
+        if a in ("--moe-cache-mib", "--moe-cache-cpu-share", "--host", "--port", "--api-key"):
+            skip = 1
+            continue
+        cmd.append(a)
+    if "--cpu-moe" not in cmd:
+        raise RuntimeError("kein MoE-Modell mit Experten im RAM")
+    out = CONFIG_DIR / "moe-tune-runs"
+    out.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen([sys.executable, script, "--out", str(out)] + (["--max-mib", str(max_mib)] if max_mib else [])
+                            + ["--"] + cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    import threading
+
+    outs: dict = {}
+    t = threading.Thread(target=lambda: outs.update(zip(("out", "err"), proc.communicate())), daemon=True)
+    t.start()
+    while t.is_alive():
+        t.join(2)
+        if cancelled and cancelled():
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)  # the script and the server it started
+            except ProcessLookupError:
+                pass
+            t.join(30)
+            raise RuntimeError("abgebrochen")
+    stdout, stderr = outs.get("out", ""), outs.get("err", "")
+    if "all experts fit on" in stdout:
+        raise RuntimeError("alle Experten passen auf die GPU: kein Cache nötig")
+    found = re.search(r"--moe-cache-mib (\d+) --moe-cache-cpu-share ([0-9.]+)", stdout)
+    if proc.returncode != 0 or not found:
+        raise RuntimeError("Cache-Test fehlgeschlagen: " + (stderr or stdout)[-600:].strip())
+    mib, share = int(found.group(1)), float(found.group(2))
+    try:
+        data = json.loads(MOE_TUNE_STATE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    data[str(Path(model).expanduser().resolve())] = {"mib": mib, "share": share, "at": int(time.time())}
+    MOE_TUNE_STATE.write_text(json.dumps(data, indent=1))
+    return mib, share, stdout
+
+
 def cmd_tune_moe(args) -> None:
     """Runs llama.cpp's moe-cache-tune.py on the plan serve would use here:
     it starts the server a few times at two cache sizes and three CPU shares,
@@ -1939,33 +2015,14 @@ def cmd_tune_moe(args) -> None:
         sp = build_server(args)
     except PlanTooBig as e:
         die(str(e), PLAN_FAILED)
-    cmd, skip = [], 0
-    for i, a in enumerate(sp.cmd):  # the script sets cache, share, host and port itself
-        if skip:
-            skip -= 1
-            continue
-        if a in ("--moe-cache-mib", "--moe-cache-cpu-share", "--host", "--port", "--api-key"):
-            skip = 1
-            continue
-        cmd.append(a)
-    if "--cpu-moe" not in cmd:
+    if "--cpu-moe" not in sp.cmd:
         die("This model doesn't need the MoE cache here: it fits on the GPU(s), or it isn't MoE.")
-    out = CONFIG_DIR / "moe-tune-runs"
-    out.mkdir(parents=True, exist_ok=True)
     log("Tuning the MoE cache: the server starts 6 times, this takes a few minutes (mostly loading)...")
-    r = subprocess.run([sys.executable, script, "--out", str(out)] + (["--max-mib", str(args.max_mib)]
-                       if args.max_mib else []) + ["--"] + cmd, capture_output=True, text=True)
-    print(r.stdout[-4000:])
-    found = re.search(r"--moe-cache-mib (\d+) --moe-cache-cpu-share ([0-9.]+)", r.stdout)
-    if r.returncode != 0 or not found:
-        die("Tuning failed:\n" + r.stderr[-2000:])
-    mib, share = int(found.group(1)), float(found.group(2))
     try:
-        data = json.loads(MOE_TUNE_STATE.read_text())
-    except (OSError, ValueError):
-        data = {}
-    data[str(Path(args.model).expanduser().resolve())] = {"mib": mib, "share": share, "at": int(time.time())}
-    MOE_TUNE_STATE.write_text(json.dumps(data, indent=1))
+        mib, share, report = moe_cache_tune(sp.cmd, args.model, args.max_mib)
+    except RuntimeError as e:
+        die(str(e))
+    print(report[-4000:])
     print(f"\nSaved: cache {mib} MiB, CPU share {share:g}. serve uses them for this model from now on "
           "(restart the service).")
 

@@ -869,7 +869,7 @@ function renderTune(s) {
   $("tune-reset").hidden = running || !r.tuned;
   $("tune-start").textContent = r.tuned ? "Autotune erneut" : "Autotune starten";
   $("tune-note").textContent = tuneText(job, r.tuned)
-    || "Probiert auf diesem PC einige Einstellungen (Batch-Größe, CPU-Threads, Anteil der CPU bei MoE-Experten) und behält die schnellste. Das Modell startet dabei mehrmals neu, je nach Größe 5 bis 30 Minuten.";
+    || "Probiert auf diesem PC einige Einstellungen (Batch-Größe, CPU-Threads, GPU-Aufteilung; bei MoE-Modellen mit Experten im RAM zuerst Größe und CPU-Anteil des Experten-Caches, dann den Lademodus) und behält die schnellste. Das Modell startet dabei mehrmals neu, je nach Größe 5 bis 60 Minuten.";
 }
 async function tuneAction(action) {
   if (action === "start" && !confirm("Autotune starten? Das Modell steht währenddessen nicht zur Verfügung (5 bis 30 Minuten).")) return;
