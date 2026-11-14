@@ -36,6 +36,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -3352,7 +3353,9 @@ def _start_http(host: str, port: int, handler_cls) -> Optional[object]:
 
 
 def _json_handler(get_routes: dict, post_routes: Optional[dict] = None, key: str = "",
-                  public: tuple = ()):
+                  public: tuple = (), streams: Optional[dict] = None):
+    """streams: POST paths whose function writes the answer itself
+    (fn(handler, raw_body)), e.g. a streamed chat answer."""
     from http.server import BaseHTTPRequestHandler
 
     class H(BaseHTTPRequestHandler):
@@ -3376,6 +3379,11 @@ def _json_handler(get_routes: dict, post_routes: Optional[dict] = None, key: str
 
         def _route(self, routes: dict, post: bool = False) -> None:
             path = self.path.split("?", 1)[0]
+            if post and streams and path in streams:
+                if not self._authorized(path):
+                    return self._send(401, b'{"error":"API key required"}')
+                n = int(self.headers.get("Content-Length") or 0)
+                return streams[path](self, self.rfile.read(n) if n else b"{}")
             fn = routes.get(path)
             if fn is None:
                 return self._send(404, b'{"error":"not found"}')
@@ -3448,6 +3456,7 @@ class Dashboard:
         import threading
 
         self.args, self.sup, self.router, self.hosts = args, sup, router, hosts
+        self.api_port = args.port  # the public API (args.port changes while the planner runs)
         self.base = big_base or f"http://127.0.0.1:{args.port}"
         self._fast_last: Optional[tuple[float, float]] = None
         self._fast_tps_last = 0.0
@@ -3744,6 +3753,44 @@ class Dashboard:
             self._models = {"local": local, "catalog": [{"key": k, "desc": d} for k, _r, _q, d in CATALOG]}
         return self._models
 
+    def chat(self, h, raw: bytes) -> None:
+        """The dashboard's test chat: passes the request to the cluster's own
+        API (router and all, like any client) and streams the answer back,
+        with the router's decision in the headers."""
+        import http.client
+
+        try:
+            body = json.loads(raw)
+            route = str(body.pop("_route", "") or "")
+        except ValueError:
+            return h._send(400, b'{"error":"bad request"}')
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.sp.key}"}
+        if route:
+            headers["X-Myrmid-Route"] = route
+        conn = http.client.HTTPConnection("127.0.0.1", self.api_port, timeout=900)
+        try:
+            conn.request("POST", "/v1/chat/completions", json.dumps(body).encode(), headers)
+            r = conn.getresponse()
+            h.send_response(r.status)
+            for k in ("Content-Type", "X-Myrmid-Backend", "X-Myrmid-Reason-Utf8"):
+                if r.getheader(k):
+                    h.send_header(k, r.getheader(k))
+            h.send_header("Cache-Control", "no-store")
+            h.end_headers()
+            while True:
+                chunk = r.read1(65536) if hasattr(r, "read1") else r.read(4096)
+                if not chunk:
+                    break
+                h.wfile.write(chunk)
+                h.wfile.flush()
+        except (OSError, http.client.HTTPException) as e:
+            try:
+                h._send(502, json.dumps({"error": {"message": f"Keine Antwort vom Router: {e}"}}).encode())
+            except OSError:
+                pass
+        finally:
+            conn.close()
+
     def _bench_watchdog(self) -> None:
         """A test that hangs (server stuck) frees the button after a while."""
         b = self.bench
@@ -3769,7 +3816,7 @@ class Dashboard:
                                  "/api/update": lambda b: self.updater.api(b) if self.updater else {"ok": False},
                                  "/api/wake": lambda b: {"ok": self.sup.known.wake(str(b.get("id") or ""), force=True)},
                                  "/api/hosts": self.hosts.api if self.hosts else (lambda b: {"error": "no hosts"})},
-                                key=self.sp.key, public=("/",))
+                                key=self.sp.key, public=("/",), streams={"/api/chat": self.chat})
         if not _start_http(self.args.host, self.args.dashboard_port, handler):
             return None
         threading.Thread(target=self.loop, daemon=True).start()
@@ -6298,6 +6345,7 @@ class Router:
                         self.send_header("X-Myrmid-Backend", f"{backend.group or backend.label}@{backend.where}"
                                          .encode("ascii", "replace").decode())
                         self.send_header("X-Myrmid-Reason", reason.encode("ascii", "replace").decode())
+                        self.send_header("X-Myrmid-Reason-Utf8", urllib.parse.quote(reason))
                         self.send_header("Transfer-Encoding", "chunked")
                         self.end_headers()
                         while True:
