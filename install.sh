@@ -262,6 +262,27 @@ fedora_enable_rpmfusion() {
     ok "RPM Fusion eingerichtet."
 }
 
+# The driver runs, but its tool nvidia-smi is missing (Debian installs it only
+# as a recommendation, minimal setups skip those): install just the tool.
+install_nvidia_smi() {
+    local ver=""
+    [[ -r /proc/driver/nvidia/version ]] && ver="$(grep -o 'Kernel Module[^0-9]*[0-9]*' /proc/driver/nvidia/version | grep -o '[0-9]*$' || true)"
+    case "$DISTRO" in
+        ubuntu|pop|linuxmint|elementary|zorin)
+            if [[ -n "$ver" ]] && apt-cache show "nvidia-utils-$ver-server" >/dev/null 2>&1 && dpkg -l | grep -q "nvidia-.*-$ver-server"; then
+                pkg_install "nvidia-utils-$ver-server"
+            elif [[ -n "$ver" ]]; then
+                pkg_install "nvidia-utils-$ver"
+            else
+                return 1
+            fi ;;
+        debian) pkg_install nvidia-smi ;;
+        fedora) pkg_install xorg-x11-drv-nvidia-cuda ;;
+        arch|endeavouros|manjaro|cachyos) pkg_install nvidia-utils ;;
+        *) return 1 ;;
+    esac
+}
+
 install_nvidia_driver() {  # install_nvidia_driver GENERATION
     local gen="$1" helper=""
     case "$DISTRO" in
@@ -276,7 +297,8 @@ install_nvidia_driver() {  # install_nvidia_driver GENERATION
                     die "Für Kepler-Karten hat ${PRETTY_NAME:-Debian} keinen Treiber mehr (470 gibt es nur bis Debian 12)."
                 pkg_install "linux-headers-$(uname -r)" nvidia-tesla-470-driver firmware-misc-nonfree
             else
-                pkg_install "linux-headers-$(uname -r)" nvidia-driver nvidia-vulkan-icd firmware-misc-nonfree
+                # nvidia-smi is only "recommended" there: without it the dashboard has no GPU values
+                pkg_install "linux-headers-$(uname -r)" nvidia-driver nvidia-smi nvidia-vulkan-icd firmware-misc-nonfree
             fi ;;
         fedora)
             fedora_enable_rpmfusion
@@ -395,7 +417,11 @@ if has_vendor nvidia; then
         kepler) info "Kepler-Karte: nur der Legacy-Treiber 470, kein aktuelles CUDA. Genutzt wird sie über Vulkan." ;;
         maxwell|pascal|volta) info "Ältere Karte: Treiber bis Version 580, CUDA höchstens 12.x (CUDA 13 kennt sie nicht mehr)." ;;
     esac
-    if [[ "$NV_GEN" != fermi ]] && { ! have nvidia-smi || ! nvidia-smi >/dev/null 2>&1; }; then
+    if [[ "$NV_GEN" != fermi && -r /proc/driver/nvidia/version ]] && ! have nvidia-smi; then
+        info "Der NVIDIA-Treiber läuft, aber nvidia-smi fehlt (das Dashboard zeigt sonst keine GPU-Werte). Installiere es ..."
+        install_nvidia_smi || warn "nvidia-smi konnte nicht installiert werden; das Modell läuft trotzdem, nur ohne GPU-Werte im Dashboard."
+    fi
+    if [[ "$NV_GEN" != fermi ]] && { ! have nvidia-smi || ! nvidia-smi >/dev/null 2>&1; } && [[ ! -r /proc/driver/nvidia/version ]]; then
         warn "Kein funktionierender NVIDIA-Treiber installiert (nur der freie nouveau-Treiber, den llama.cpp nicht nutzt)."
         if ask_yn "NVIDIA-Treiber jetzt installieren? Danach ist ein Neustart nötig." j; then
             install_nvidia_driver "$NV_GEN"
@@ -409,7 +435,8 @@ if has_vendor nvidia; then
         fi
         warn "Ohne NVIDIA-Treiber wird die NVIDIA-Karte nicht genutzt."
     elif [[ "$NV_GEN" != fermi ]]; then
-        ok "Treiber: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | paste -sd';' -)"
+        if have nvidia-smi; then ok "Treiber: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | paste -sd';' -)"
+        else ok "Treiber: $(head -1 /proc/driver/nvidia/version | grep -o 'Kernel Module.*' | cut -c1-60)"; fi
         if [[ -n "$CUDA_BIN" ]]; then
             ok "CUDA-Toolkit: $("$CUDA_BIN/nvcc" --version | grep -o 'release [0-9.]*')"
             USE_CUDA=1
