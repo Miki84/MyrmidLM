@@ -6566,8 +6566,9 @@ class HostManager:
                 self.pending_cli.remove(a)
                 self.save()
 
-    def ensure(self, hid: str) -> None:
-        """Sends the wanted assignment when the host has another one."""
+    def ensure(self, hid: str, force: bool = False) -> None:
+        """Sends the wanted assignment when the host has another one (force:
+        anyway, e.g. to retry after an error)."""
         h = self.hosts.get(hid)
         if not h or hid not in self.assign:
             return
@@ -6578,7 +6579,7 @@ class HostManager:
                 self._send(hid, "/unload", {})
             return
         keys = ("model", "role", "name", "ctx")
-        if have and all(have.get(k) == want.get(k) for k in keys) \
+        if not force and have and all(have.get(k) == want.get(k) for k in keys) \
                 and (have.get("kv") or "f16") == (want.get("kv") or "f16"):  # hosts before 1.6.2 know only f16
             return
         last = self.pushed.get(hid)
@@ -6776,7 +6777,9 @@ class HostManager:
                                 "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16"}
         self.save()
         self.pushed.pop(hid, None)
-        threading.Thread(target=self.ensure, args=(hid,), daemon=True).start()
+        # a click always reaches the host, also when it has this assignment already
+        # (after a failed download or start the same "Laden" must try again)
+        threading.Thread(target=self.ensure, args=(hid, True), daemon=True).start()
         return self.info()
 
     def info(self) -> dict:
@@ -7259,34 +7262,65 @@ def fetch_model(target: str, out_dir: Path, force: bool = False, quiet: bool = F
     for f in r["files"]:
         dest = out_dir / Path(f["file"]).name
         paths.append(dest)
-        if dest.exists() and (not f["size"] or dest.stat().st_size == f["size"]):
-            log(f"{dest.name} is already there")
-            continue
-        url = f"{HF_BASE}/{r['repo']}/resolve/main/{f['file']}"
-        part = dest.with_suffix(dest.suffix + ".part")
-        log(f"Downloading {dest.name} ({f['size']/2**30:.1f} GB) to {out_dir}")
-        if shutil.which("curl"):
-            cmd = ["curl", "-fL", "--retry", "5", "-C", "-", "-o", str(part), url]
-            if quiet:
-                cmd.insert(1, "-sS")
-            if os.environ.get("HF_TOKEN"):
-                cmd[1:1] = ["-H", f"Authorization: Bearer {os.environ['HF_TOKEN']}"]
-            if subprocess.run(cmd).returncode != 0:
-                raise ModelError(f"Download failed; run the same command again to resume ({part})")
-        else:
-            _download_urllib(url, part)
-        if f.get("sha256"):
-            log("Checking SHA-256...")
-            h = hashlib.sha256()
-            with open(part, "rb") as fh:
-                for chunk in iter(lambda: fh.read(8 << 20), b""):
-                    h.update(chunk)
-            if h.hexdigest() != f["sha256"]:
-                part.unlink(missing_ok=True)
-                raise ModelError(f"{dest.name}: checksum mismatch, file deleted; please try again")
-        part.rename(dest)
-        dest.chmod(0o644)
+        with _download_lock(dest):
+            _fetch_file(r, f, dest, quiet)
     return paths[0]
+
+
+def _download_lock(dest: Path):
+    """One download per file at a time: two GPU slots of a host loading the
+    same model wrote into the same .part file and broke it (checksum
+    mismatch). The second one waits, then finds the file there."""
+    import contextlib
+    import fcntl
+
+    @contextlib.contextmanager
+    def held():
+        lock = dest.with_name(dest.name + ".lock")
+        with open(lock, "a") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                log(f"{dest.name}: another download of this file is running, waiting for it")
+                fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        # the small .lock file stays: deleting it could let a third download
+        # lock a new file while the second still runs
+    return held()
+
+
+def _fetch_file(r: dict, f: dict, dest: Path, quiet: bool) -> None:
+    if dest.exists() and (not f["size"] or dest.stat().st_size == f["size"]):
+        log(f"{dest.name} is already there")
+        return
+    url = f"{HF_BASE}/{r['repo']}/resolve/main/{f['file']}"
+    part = dest.with_suffix(dest.suffix + ".part")
+    log(f"Downloading {dest.name} ({f['size']/2**30:.1f} GB) to {dest.parent}")
+    if shutil.which("curl"):
+        cmd = ["curl", "-fL", "--retry", "5", "-C", "-", "-o", str(part), url]
+        if quiet:
+            cmd.insert(1, "-sS")
+        if os.environ.get("HF_TOKEN"):
+            cmd[1:1] = ["-H", f"Authorization: Bearer {os.environ['HF_TOKEN']}"]
+        if subprocess.run(cmd).returncode != 0:
+            raise ModelError(f"Download failed; run the same command again to resume ({part})")
+    else:
+        _download_urllib(url, part)
+    if f.get("sha256"):
+        log("Checking SHA-256...")
+        h = hashlib.sha256()
+        with open(part, "rb") as fh:
+            for chunk in iter(lambda: fh.read(8 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != f["sha256"]:
+            part.unlink(missing_ok=True)
+            raise ModelError(f"{dest.name}: Prüfsumme falsch (Download beschädigt), Datei gelöscht. "
+                             "Noch einmal „Laden“ drücken.")
+    part.rename(dest)
+    dest.chmod(0o644)
 
 
 def cmd_download(args) -> None:
