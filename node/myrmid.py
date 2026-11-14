@@ -3772,7 +3772,7 @@ class Dashboard:
             conn.request("POST", "/v1/chat/completions", json.dumps(body).encode(), headers)
             r = conn.getresponse()
             h.send_response(r.status)
-            for k in ("Content-Type", "X-Myrmid-Backend", "X-Myrmid-Reason-Utf8"):
+            for k in ("Content-Type", "X-Myrmid-Backend-Utf8", "X-Myrmid-Reason-Utf8"):
                 if r.getheader(k):
                     h.send_header(k, r.getheader(k))
             h.send_header("Cache-Control", "no-store")
@@ -6344,6 +6344,8 @@ class Router:
                         self.send_header("X-Myrmid-Route", backend.name)
                         self.send_header("X-Myrmid-Backend", f"{backend.group or backend.label}@{backend.where}"
                                          .encode("ascii", "replace").decode())
+                        self.send_header("X-Myrmid-Backend-Utf8",
+                                         urllib.parse.quote(f"{backend.group or backend.label}@{backend.where}"))
                         self.send_header("X-Myrmid-Reason", reason.encode("ascii", "replace").decode())
                         self.send_header("X-Myrmid-Reason-Utf8", urllib.parse.quote(reason))
                         self.send_header("Transfer-Encoding", "chunked")
