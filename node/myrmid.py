@@ -1703,6 +1703,19 @@ TUNE_STATE = CONFIG_DIR / "tune.json"
 TUNE_PROMPT, TUNE_GEN = 3000, 160  # a typical opencode turn: long prompt, short answer
 
 
+def tune_label(flags: dict) -> str:
+    parts = []
+    for k, v in flags.items():
+        if k == "-sm" and v == "tensor":
+            parts.append("Tensor Split")
+        elif k == "--tensor-split":
+            if flags.get("-sm") != "tensor":
+                parts.append("über alle GPUs")
+        else:
+            parts.append(f"{k} {v}")
+    return ", ".join(parts) or "Plan"
+
+
 def tune_lookup(model: str, slot: str = "") -> dict:
     try:
         return json.loads(TUNE_STATE.read_text()).get(f"{Path(model).resolve()}|{slot}") or {}
@@ -1730,6 +1743,10 @@ def apply_tune(cmd: list[str], flags: dict) -> list[str]:
     for flag, value in flags.items():
         if flag == "--moe-cache-cpu-share" and "--cpu-moe" not in cmd:
             continue
+        if flag == "--tensor-split" and len(str(value).split(",")) != len(_gpu_split(cmd) or [0]):
+            continue  # the GPUs changed since the autotune
+        if flag == "-sm" and not (_gpu_split(cmd) and _tensor_ok(cmd)):
+            continue  # the plan no longer fits tensor split (CPU part, KV cache, workers)
         if flag in cmd:
             i = cmd.index(flag)
             if i + 1 < len(cmd):
@@ -1739,9 +1756,48 @@ def apply_tune(cmd: list[str], flags: dict) -> list[str]:
     return cmd
 
 
+def _gpu_split(cmd: list[str]) -> list[int]:
+    """The planned layers per local GPU (--tensor-split), [] with workers or one GPU."""
+    if "--rpc" in cmd or "--tensor-split" not in cmd:
+        return []
+    try:
+        ts = [int(x) for x in cmd[cmd.index("--tensor-split") + 1].split(",")]
+    except (ValueError, IndexError):
+        return []
+    return ts if len(ts) >= 2 else []
+
+
+def _tensor_ok(cmd: list[str]) -> bool:
+    """llama.cpp's tensor split: all on GPUs, no quantized KV cache, no MoE on the CPU."""
+    return not any(f in cmd for f in ("--cpu-moe", "--n-cpu-moe", "-ctk", "--rpc")) and \
+        not any(re.search(r"=CPU$", x) and "ple" not in x and "token_embd" not in x and "output" not in x
+                for x in cmd)
+
+
 def _tune_variants(cmd: list[str]) -> list[tuple[str, list]]:
-    """Settings to try, each a list of values (None: llama.cpp's default)."""
+    """Settings to try, each a list of values (None: the plan as it is); a
+    value is one flag's value, or a dict of flags set together."""
     dims: list[tuple[str, list]] = []
+    ts = _gpu_split(cmd)
+    if ts:
+        # Several GPUs here. Layer split over all of them reads long prompts
+        # faster even when the model fits on one (but writes no faster);
+        # tensor split writes 1.2-1.4x faster with dense models on fast PCIe
+        # links, reads slower, and hurts MoE models. Measured, not guessed.
+        even = ",".join("1" for _ in ts)
+        layouts: list = [None]
+        if sum(1 for c in ts if c) < len(ts):
+            layouts.append({"--tensor-split": even})
+        dense = True
+        try:
+            mi = cmd.index("-m")
+            dense = not gguf_info(cmd[mi + 1], 512).is_moe
+        except (ValueError, IndexError, OSError, SystemExit, struct.error):
+            pass
+        if dense and _tensor_ok(cmd):
+            layouts.append({"-sm": "tensor", "--tensor-split": even})
+        if len(layouts) > 1:
+            dims.append(("layout", layouts))
     if "--cpu-moe" in cmd:
         dims.append(("--moe-cache-cpu-share", [None, 0.25, 0.75]))
     dims.append(("-ub", [None, 1024, 2048]))
@@ -1789,7 +1845,7 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
         if sig in seen:
             return seen[sig]
         n = len(results) + 1
-        label = ", ".join(f"{k} {v}" for k, v in flags.items()) or "Plan"
+        label = tune_label(flags)
         say(f"{n}/{total}: {label} – lädt …", n, total)
         cmd = apply_tune(list(base_cmd), flags)
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1822,12 +1878,12 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
         for v in values[1:]:
             if stop():
                 raise RuntimeError("abgebrochen")
-            r = trial({**best_flags, flag: v})
+            r = trial({**best_flags, **(v if isinstance(v, dict) else {flag: v})})
             if r and "secs" in r and (best is None or r["secs"] < best["secs"] * 0.98):  # 2 %: noise
                 best, best_flags = r, dict(r["flags"])
     if best is None:
         raise RuntimeError("keine Variante ist gestartet: " + (results[0].get("error") or ""))
-    return {"flags": best_flags, "score": {k: best[k] for k in ("pp", "tg", "secs")},
+    return {"flags": best_flags, "label": tune_label(best_flags), "score": {k: best[k] for k in ("pp", "tg", "secs")},
             "base": {k: base[k] for k in ("pp", "tg", "secs")} if base and "secs" in base else None,
             "results": results, "at": int(time.time())}
 
@@ -3173,13 +3229,18 @@ class SystemStats:
             try:
                 res = subprocess.run(
                     ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,"
-                     "temperature.gpu,power.draw", "--format=csv,noheader,nounits"],
+                     "temperature.gpu,power.draw,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max",
+                     "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=5).stdout
                 for line in res.strip().splitlines():
                     f = [x.strip() for x in line.split(",")]
                     out.append({"name": f[0], "vendor": "NVIDIA", "util_pct": _num(f[1]),
                                 "mem_used_mb": _num(f[2]), "mem_total_mb": _num(f[3]),
-                                "temp_c": _num(f[4]), "power_w": _num(f[5])})
+                                "temp_c": _num(f[4]), "power_w": _num(f[5]),
+                                # the slot's link (the generation drops at idle to save power: max is what it can)
+                                "pcie_gen": _num(f[6]) if len(f) > 6 else None,
+                                "pcie_width": _num(f[7]) if len(f) > 7 else None,
+                                "pcie_width_max": _num(f[8]) if len(f) > 8 else None})
             except (OSError, subprocess.SubprocessError, IndexError):
                 pass
         names = {d.device_id.lower(): d.description for d in self.devices if d.device_id}
@@ -3199,7 +3260,10 @@ class SystemStats:
                  "util_pct": _num(_read(dev / "gpu_busy_percent")),
                  "mem_used_mb": _num(_read(dev / "mem_info_vram_used"), 2**20),
                  "mem_total_mb": _num(_read(dev / "mem_info_vram_total"), 2**20),
-                 "temp_c": None, "power_w": None}
+                 "temp_c": None, "power_w": None,
+                 "pcie_gen": PCIE_GEN.get(_read(dev / "max_link_speed").split(" ")[0]),
+                 "pcie_width": _num(_read(dev / "current_link_width")),
+                 "pcie_width_max": _num(_read(dev / "max_link_width"))}
             for hw in (dev / "hwmon").glob("hwmon*"):
                 g["temp_c"] = _num(_read(hw / "temp1_input"), 1000)
                 g["power_w"] = _num(_read(hw / "power1_average"), 1e6)
@@ -3207,6 +3271,8 @@ class SystemStats:
                 out.append(g)
         return out
 
+
+PCIE_GEN = {"2.5": 1, "5.0": 2, "8.0": 3, "16.0": 4, "32.0": 5, "64.0": 6}  # GT/s → generation
 
 CPU_SENSORS = ("k10temp", "zenpower", "coretemp", "cpu_thermal", "cpu-thermal", "soc_thermal")
 

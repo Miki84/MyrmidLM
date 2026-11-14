@@ -218,6 +218,8 @@
   .temp-warm { color: #c98a12; font-weight: 600; }
   .temp-hot { color: var(--bad, #c0392b); font-weight: 600; }
   .host-stats { display: grid; gap: 6px; margin: 4px 0; }
+  .pcie { font-size: 0.8rem; font-weight: 500; }
+  .pcie.temp-warm { color: #c98a12; font-weight: 600; }
   .tune-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
   .ext-list { display: grid; gap: 8px; }
   .ext-row { display: grid; grid-template-columns: 1fr 1.6fr 1fr 0.9fr 0.7fr 1fr auto; gap: 6px; align-items: center; }
@@ -803,10 +805,19 @@ function tempText(t) {  // " · 62 °C", warm from 80 °C, hot from 90 °C
   return ` · <span class="${cls}">${nf(t, 0)} °C</span>`;
 }
 
+function pcieText(g) {
+  // the slot's PCIe link; fewer lanes than the card can use slow down multi-GPU work
+  if (!g.pcie_width) return "";
+  const gen = g.pcie_gen ? ` ${nf(g.pcie_gen, 0)}.0` : "";
+  const narrow = g.pcie_width_max && g.pcie_width < g.pcie_width_max;
+  const title = narrow ? `Die Karte kann x${nf(g.pcie_width_max, 0)}, der Steckplatz liefert x${nf(g.pcie_width, 0)}. Für ein Modell über mehrere GPUs mit Layer Split reicht das, für Tensor Split nicht (der Autotune misst es).` : "PCIe-Anbindung des Steckplatzes";
+  return ` <span class="muted pcie${narrow ? " temp-warm" : ""}" title="${esc(title)}">· PCIe${gen} x${nf(g.pcie_width, 0)}</span>`;
+}
+
 function gpuBlock(g) {
   const memPct = g.mem_total_mb ? 100 * g.mem_used_mb / g.mem_total_mb : null;
   const extra = [g.temp_c != null ? tempText(g.temp_c).slice(3) : "", g.power_w != null ? `${nf(g.power_w, 0)} W` : ""].filter(Boolean).join(", ");
-  return `<div class="gpu"><div class="gpu-name"><span>${esc(g.name)}</span><span>${extra}</span></div>
+  return `<div class="gpu"><div class="gpu-name"><span>${esc(g.name)}${pcieText(g)}</span><span>${extra}</span></div>
     ${meter("Auslastung", g.util_pct, g.util_pct == null ? "–" : nf(g.util_pct, 0) + " %")}
     ${meter("VRAM", memPct, `${gb(g.mem_used_mb)} / ${gb(g.mem_total_mb)}`, 92, 98)}</div>`;
 }
@@ -843,8 +854,9 @@ function renderMachines(s) {
   const st = m.llama?.status;
   const mState = { ready: ["ok", "Bereit"], stopped: ["bad", "Beendet"], waiting: ["bad", "Wartet auf Worker"],
                    switching: ["warn", "Verteilt neu"] }[st] || ["warn", "Lädt"];
-  cards.push(machineCard(s, "master", { title: m.host, role: "Master, stellt das Modell bereit", stats: m.stats,
-    dot: mState[0], stateText: mState[1] }));
+  const off = (s.plan || {}).mode === "off";
+  cards.push(machineCard(s, "master", { title: m.host, role: off ? "Master, nur Router (kein eigenes Modell)" : "Master, stellt das Modell bereit", stats: m.stats,
+    dot: off ? "ok" : mState[0], stateText: off ? "Nur Router" : mState[1] }));
   for (const [id, w] of Object.entries(s.workers || {})) {
     let dot = "ok", stateText = "Online", extra = "";
     if (w.phone) {
@@ -945,7 +957,8 @@ function tuneText(job, tuned) {
   if (job && job.state === "running") return `Autotune: ${job.text}${job.total ? ` (Schritt ${job.step}/${job.total})` : ""}`;
   if (job && job.state === "error") return `Autotune beendet: ${job.text}`;
   if (tuned && tuned.score) {
-    const b = tuned.base || tuned.score, f = Object.entries(tuned.flags || {}).map(([k, v]) => `${k} ${v}`).join(", ");
+    const b = tuned.base || tuned.score, f = tuned.label && tuned.label !== "Plan" ? tuned.label
+      : Object.entries(tuned.flags || {}).map(([k, v]) => `${k} ${v}`).join(", ");
     return `Autotune: ${f || "Plan war schon am schnellsten"} · Antwort ${nf(b.tg, 1)} → ${nf(tuned.score.tg, 1)} Token/s, Prompt ${nf(b.pp, 0)} → ${nf(tuned.score.pp, 0)} Token/s`;
   }
   return "";
