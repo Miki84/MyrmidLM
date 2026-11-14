@@ -778,7 +778,9 @@ SupplementaryGroups=video render
 Restart=on-failure
 RestartSec=5
 # Exit 2 = the model doesn't fit: restarting won't help
-RestartPreventExitStatus=2${more:+
+RestartPreventExitStatus=2
+# llama.cpp darf MoE-Experten im RAM festhalten (-lm mlock, probiert der Autotune)
+LimitMEMLOCK=infinity${more:+
 $more}
 
 [Install]

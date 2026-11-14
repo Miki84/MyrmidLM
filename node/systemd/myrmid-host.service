@@ -21,6 +21,8 @@ Environment=XDG_CONFIG_HOME=/var/lib/myrmid
 SupplementaryGroups=video render
 Restart=on-failure
 RestartSec=5
+# Lets llama.cpp pin MoE experts in RAM (-lm mlock), tried by the autotune
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target

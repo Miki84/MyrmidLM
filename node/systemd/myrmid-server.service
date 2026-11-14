@@ -23,6 +23,8 @@ Restart=on-failure
 RestartSec=5
 # Exit 2 = the model doesn't fit: restarting won't help
 RestartPreventExitStatus=2
+# Lets llama.cpp pin MoE experts in RAM (-lm mlock), tried by the autotune
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target

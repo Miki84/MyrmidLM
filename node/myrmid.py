@@ -1722,6 +1722,10 @@ def tune_label(flags: dict) -> str:
     for k, v in flags.items():
         if k == "-sm" and v == "tensor":
             parts.append("Tensor Split")
+        elif k == "-lm":
+            parts.append({"dio": "Direct I/O", "mlock": "Experten fest im RAM (mlock)"}.get(str(v), f"-lm {v}"))
+        elif k == "--moe-cache-cpu-share":
+            parts.append(f"CPU-Anteil {v}")
         elif k == "--tensor-split":
             if flags.get("-sm") != "tensor":
                 parts.append("über alle GPUs")
@@ -1755,7 +1759,7 @@ def apply_tune(cmd: list[str], flags: dict) -> list[str]:
     """Sets each flag in the command (replacing its value), skipping flags
     that don't apply to this plan (the CPU share without the expert cache)."""
     for flag, value in flags.items():
-        if flag == "--moe-cache-cpu-share" and "--cpu-moe" not in cmd:
+        if flag in ("--moe-cache-cpu-share", "-lm") and "--cpu-moe" not in cmd:
             continue
         if flag == "--tensor-split" and len(str(value).split(",")) != len(_gpu_split(cmd) or [0]):
             continue  # the GPUs changed since the autotune
@@ -1813,7 +1817,12 @@ def _tune_variants(cmd: list[str]) -> list[tuple[str, list]]:
         if len(layouts) > 1:
             dims.append(("layout", layouts))
     if "--cpu-moe" in cmd:
-        dims.append(("--moe-cache-cpu-share", [None, 0.25, 0.75]))
+        # Experts in RAM feed the GPU's expert cache. Memory-mapped (the
+        # default) they aren't pinned and upload slowly; direct I/O or mlock
+        # pins them (measured on Qwen3.8-Flash-Next: up to +63 %). The CPU
+        # share decides how many cache misses the CPU computes itself.
+        dims.append(("-lm", [None, "dio", "mlock"]))
+        dims.append(("--moe-cache-cpu-share", [None, 0.5, 0.95]))
     dims.append(("-ub", [None, 1024, 2048]))
     cpu_work = "--cpu-moe" in cmd or "--n-cpu-moe" in cmd or \
         ("-ngl" in cmd and cmd[cmd.index("-ngl") + 1] == "0")
