@@ -206,6 +206,14 @@ step "Grundpakete installieren"
 case "$PM" in
     apt)
         srun apt-get update
+        # Ubuntu server images may come without universe (glslc, zeroconf) and multiverse (CUDA)
+        if [[ "$DISTRO" == ubuntu ]] && ! apt_has glslc; then
+            info "Aktiviere die Ubuntu-Paketquellen universe und multiverse ..."
+            pkg_install software-properties-common
+            srun add-apt-repository -y universe
+            srun add-apt-repository -y multiverse
+            srun apt-get update
+        fi
         pkg_install build-essential cmake git python3 python3-zeroconf qrencode pciutils curl ca-certificates ethtool ;;
     dnf)
         pkg_install gcc-c++ make cmake git python3 python3-zeroconf qrencode pciutils curl ethtool ;;
@@ -368,6 +376,7 @@ secure_boot_hint() {
 install_cuda() {  # install_cuda PACKAGE DEFAULT_ANSWER
     local pkg="$1" def="$2" repo="" tmp
     case "$DISTRO:$DISTRO_VER" in
+        ubuntu:26.04*) repo=ubuntu2604 ;;
         ubuntu:24.04*) repo=ubuntu2404 ;;
         ubuntu:22.04*) repo=ubuntu2204 ;;
         debian:12*) repo=debian12 ;;
@@ -375,6 +384,7 @@ install_cuda() {  # install_cuda PACKAGE DEFAULT_ANSWER
         fedora:*) repo="fedora${DISTRO_VER%%.*}" ;;
     esac
     case "${UBUNTU_CODENAME:-}" in  # Mint, Pop!_OS & Co.: the Ubuntu they are built on
+        resolute) repo="${repo:-ubuntu2604}" ;;
         noble) repo="${repo:-ubuntu2404}" ;;
         jammy) repo="${repo:-ubuntu2204}" ;;
     esac
@@ -385,7 +395,15 @@ install_cuda() {  # install_cuda PACKAGE DEFAULT_ANSWER
         CUDA_BIN=/opt/cuda/bin
         return 0
     fi
-    if [[ -z "$repo" ]] || ! curl -fsIL "https://developer.download.nvidia.com/compute/cuda/repos/$repo/x86_64/" >/dev/null 2>&1; then
+    if [[ -z "$repo" ]] || ! curl -fsIL "https://developer.download.nvidia.com/compute/cuda/repos/$repo/x86_64/cuda-keyring_1.1-1_all.deb" >/dev/null 2>&1; then
+        # Ubuntu 26.04 and later package CUDA themselves (multiverse)
+        if [[ "$PM" == apt && "$DISTRO" == ubuntu && "$pkg" == cuda-toolkit ]] && apt_has cuda-toolkit; then
+            ask_yn "CUDA-Toolkit aus den Ubuntu-Paketen installieren (ca. 4 GB, schnellste Variante)?" "$def" || return 1
+            pkg_install cuda-toolkit
+            find_cuda_bin
+            [[ -n "$CUDA_BIN" ]] || { warn "CUDA installiert, aber nvcc nicht gefunden."; return 1; }
+            return 0
+        fi
         info "Für ${PRETTY_NAME:-$DISTRO} hat NVIDIA kein CUDA-Paketarchiv."
         return 1
     fi
@@ -407,12 +425,21 @@ install_cuda() {  # install_cuda PACKAGE DEFAULT_ANSWER
     return 0
 }
 
+find_cuda_bin() {  # sets CUDA_BIN to the newest nvcc found
+    local d
+    CUDA_BIN=""
+    for d in /usr/local/cuda/bin $(ls -d /usr/local/cuda-*/bin 2>/dev/null | sort -V) /opt/cuda/bin /usr/lib/cuda/bin; do
+        [[ -x "$d/nvcc" ]] && CUDA_BIN="$d"
+    done
+    have nvcc && [[ -z "$CUDA_BIN" ]] && CUDA_BIN="$(dirname "$(command -v nvcc)")"
+    return 0
+}
+
 # ── 4. GPU-Treiber, CUDA, Vulkan ─────────────────────────────────────────────
 
 USE_CUDA=0 USE_VULKAN=0
 CUDA_BIN=""
-for d in /usr/local/cuda/bin /opt/cuda/bin; do [[ -x "$d/nvcc" ]] && CUDA_BIN="$d"; done
-have nvcc && CUDA_BIN="$(dirname "$(command -v nvcc)")"
+find_cuda_bin
 
 if has_vendor nvidia; then
     step "NVIDIA"
@@ -424,6 +451,14 @@ if has_vendor nvidia; then
         kepler) info "Kepler-Karte: nur der Legacy-Treiber 470, kein aktuelles CUDA. Genutzt wird sie über Vulkan." ;;
         maxwell|pascal|volta) info "Ältere Karte: Treiber bis Version 580, CUDA höchstens 12.x (CUDA 13 kennt sie nicht mehr)." ;;
     esac
+    if [[ "$NV_GEN" != fermi ]] && have nvidia-smi && nvidia-smi 2>&1 | grep -q "version mismatch"; then
+        warn "Der NVIDIA-Treiber wurde gerade aktualisiert, läuft aber noch in der alten Version (Driver/library version mismatch)."
+        echo "    ${B}Ein Neustart ist nötig. Danach das Skript erneut starten:${N}"
+        if [[ -f "${BASH_SOURCE[0]:-}" ]]; then echo "    bash $(realpath "${BASH_SOURCE[0]}") ${ORIG_ARGS[*]}"
+        else echo "    curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash -s -- ${ORIG_ARGS[*]}"; fi
+        if ask_yn "Jetzt neu starten?" j; then srun systemctl reboot; fi
+        exit 0
+    fi
     if [[ "$NV_GEN" != fermi && -r /proc/driver/nvidia/version ]] && ! have nvidia-smi; then
         info "Der NVIDIA-Treiber läuft, aber nvidia-smi fehlt (das Dashboard zeigt sonst keine GPU-Werte). Installiere es ..."
         install_nvidia_smi || warn "nvidia-smi konnte nicht installiert werden; das Modell läuft trotzdem, nur ohne GPU-Werte im Dashboard."
