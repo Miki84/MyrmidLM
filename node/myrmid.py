@@ -1068,19 +1068,27 @@ def moe_cache_plan(m: ModelInfo, gpus: list[Device], budgets: list[float], host_
     """All experts in RAM, attention/shared weights/KV on the GPU(s), the
     GPU memory left over as expert cache."""
     dense = m.layer_mb - m.expert_mb + m.kv_layer_mb
-    counts = [0] * len(gpus)
-    used = [0.0] * len(gpus)
-    g = 0
-    for _ in range(m.n_layer):
-        while g < len(gpus) and used[g] + dense > budgets[g]:
-            g += 1
-        if g == len(gpus):
-            return None
-        used[g] += dense
-        counts[g] += 1
+    # llama.cpp splits the cache over the GPUs like the layers (by
+    # --tensor-split): each GPU gets layers in proportion to its free memory,
+    # so that its part of the cache fits too. (Filling the first GPU with
+    # layers and counting the second one's free memory as cache put almost
+    # all of the cache on the full GPU: "cudaMalloc failed: out of memory".)
+    room = [max(0.0, b - MOE_CACHE_MARGIN_MB) for b in budgets]
+    total = sum(room)
+    if total <= 0:
+        return None
+    n = m.n_layer
+    raw = [n * r / total for r in room]
+    counts = [int(x) for x in raw]
+    for i in sorted(range(len(raw)), key=lambda i: raw[i] - counts[i], reverse=True)[:n - sum(counts)]:
+        counts[i] += 1
+    if any(c and c * dense > r for c, r in zip(counts, room)):
+        return None
     if m.n_layer * m.expert_mb + m.embd_mb > host_budget:
         return None
-    cache = int(sum(max(0.0, b - u - MOE_CACHE_MARGIN_MB) for b, u in zip(budgets, used)))
+    # the cache per layer is the same on every GPU: the tightest one decides
+    per_layer = min(r / c - dense for c, r in zip(counts, room) if c)
+    cache = int(n * max(0.0, per_layer))
     if max_mb is not None:
         cache = min(cache, max_mb)
     if cache < MOE_CACHE_MIN_MB:
