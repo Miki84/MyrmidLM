@@ -27,12 +27,19 @@
 #   --no-auto-update         neue Versionen bauen, aber nur auf Klick im Dashboard umstellen
 #   --repo URL               anderes Repo (Fork, Spiegel)
 #   --src DIR                lokalen Klon als Quelle nehmen (ohne Download)
+#   --docker                 Master nur als Router: im Docker-Container laufen lassen;
+#                            PC mit NVIDIA-GPU: llama.cpp im CUDA-Container bauen
+#                            (kein CUDA-Toolkit auf dem System)
+#   --native                 ohne Docker (alles direkt auf dem System)
+#   --plain                  Fragen als Text statt Auswahlmenü
 #   --no-service             keinen systemd-Dienst einrichten
 #   --yes                    Standardantworten ohne Rückfrage
 #   --dry-run                nur anzeigen, was passieren würde
 #
-# Das Skript kann gefahrlos erneut gestartet werden (z. B. nach einem
-# Neustart für den NVIDIA-Treiber): Erledigte Schritte werden übersprungen.
+# Ohne Optionen fragt das Skript alles in Auswahlmenüs ab und zeigt vor dem
+# Start eine Zusammenfassung. Es kann gefahrlos erneut gestartet werden (z. B.
+# nach einem Neustart für den NVIDIA-Treiber): Erledigte Schritte werden
+# übersprungen.
 set -euo pipefail
 
 REPO_URL="https://github.com/Miki84/MyrmidLM.git"
@@ -43,7 +50,8 @@ OLD_PREFIX="/opt/privatelm-node"  # before the rename
 
 ROUTER_ONLY=0 ROLE="" MODEL="" WORKERS="" PORT="8080" BACKENDS="" MASTER_IP="" FAST_MODEL="-" CLUSTER_KEY=""
 DRAFT="" HOST_SLEEP="" WANT_VERSION="" CHANNEL="" AUTO_UPDATE="on" LOCAL_SRC=""
-SERVICE=1 YES=0 DRY=0
+SERVICE=1 YES=0 DRY=0 DOCKER="" PLAIN=0
+RUN_DOCKER=0 BUILD_MODE=native
 
 ORIG_ARGS=("$@")  # to show the exact command for the rerun after a reboot
 while [[ $# -gt 0 ]]; do
@@ -63,10 +71,13 @@ while [[ $# -gt 0 ]]; do
         --host-sleep) HOST_SLEEP="$2"; shift 2 ;;
         --fast-model) FAST_MODEL="$2"; shift 2 ;;
         --backends) BACKENDS="$2"; shift 2 ;;
+        --docker) DOCKER=docker; shift ;;
+        --native) DOCKER=native; shift ;;
+        --plain) PLAIN=1; shift ;;
         --no-service) SERVICE=0; shift ;;
         --yes|-y) YES=1; shift ;;
         --dry-run) DRY=1; shift ;;
-        -h|--help) sed -n '2,34p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,42p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Unbekannte Option: $1 (--help zeigt alle)" >&2; exit 2 ;;
     esac
 done
@@ -96,10 +107,22 @@ run() {
 }
 srun() { run $SUDO "$@"; }
 
+# Auswahlmenüs mit Pfeiltasten (whiptail, bei Debian und Ubuntu dabei), sonst
+# Fragen als Text. --plain oder ein einfaches Terminal: immer Text.
+USE_WT=0
+if [[ $TTY_OK -eq 1 && $PLAIN -eq 0 && "${TERM:-dumb}" != dumb ]] && have whiptail; then USE_WT=1; fi
+WT_TITLE="MyrmidLM – Installation"
+wt() { whiptail --backtitle "$WT_TITLE" "$@" 3>&1 1>/dev/tty 2>&3 </dev/tty; }
+
 # ask "Frage" "Standard" -> Antwort auf stdout
 ask() {
     local q="$1" def="${2:-}" a
     if [[ $TTY_OK -eq 0 ]]; then echo "$def"; return; fi
+    if [[ $USE_WT -eq 1 ]]; then
+        a="$(wt --title "Eingabe" --inputbox "$q" 10 78 "$def")" || a="$def"
+        echo "$a"
+        return
+    fi
     read -r -p "    $q${def:+ [$def]}: " a </dev/tty
     echo "${a:-$def}"
 }
@@ -108,9 +131,66 @@ ask() {
 ask_yn() {
     local q="$1" def="${2:-j}" a hint="[J/n]"
     [[ $def == n ]] && hint="[j/N]"
+    if [[ $TTY_OK -eq 1 && $USE_WT -eq 1 ]]; then
+        local extra=()
+        [[ $def == n ]] && extra=(--defaultno)
+        whiptail --backtitle "$WT_TITLE" --title "Frage" --yes-button "Ja" --no-button "Nein" "${extra[@]}" \
+            --yesno "$q" 10 78 </dev/tty >/dev/tty 2>&1
+        return
+    fi
     if [[ $TTY_OK -eq 0 ]]; then a="$def"; else read -r -p "    $q $hint " a </dev/tty; fi
     a="${a:-$def}"
     [[ ${a,,} == j* || ${a,,} == y* ]]
+}
+
+# menu TITEL TEXT STANDARD TAG BESCHREIBUNG [TAG BESCHREIBUNG ...] -> setzt MENU
+# (kein $(...): ein Abbruch soll das Skript beenden, nicht nur die Subshell)
+MENU=""
+menu() {
+    local title="$1" text="$2" def="$3" a i n dnum=1
+    shift 3
+    local -a tags=() descs=() items=()
+    while [[ $# -gt 1 ]]; do tags+=("$1"); descs+=("$2"); shift 2; done
+    n=${#tags[@]}
+    MENU="$def"
+    [[ $TTY_OK -eq 0 ]] && return 0
+    if [[ $USE_WT -eq 1 ]]; then
+        for ((i = 0; i < n; i++)); do items+=("${tags[i]}" "${descs[i]}"); done
+        local lines rows
+        lines=$(printf '%s\n' "$text" | wc -l)
+        rows=$(( n < 12 ? n : 12 ))
+        MENU="$(wt --title "$title" --notags --ok-button "Weiter" --cancel-button "Abbrechen" \
+            --default-item "$def" --menu "$text" $((rows + lines + 8)) 78 "$rows" "${items[@]}")" \
+            || die "Abgebrochen."
+        return 0
+    fi
+    for ((i = 0; i < n; i++)); do [[ "${tags[i]}" == "$def" ]] && dnum=$((i + 1)); done
+    echo
+    echo "    ${B}$title${N}"
+    [[ -n "$text" ]] && printf '%s\n' "$text" | sed 's/^/    /'
+    for ((i = 0; i < n; i++)); do echo "      $((i + 1))) ${descs[i]}"; done
+    while true; do
+        read -r -p "    Auswahl [$dnum]: " a </dev/tty
+        a="${a:-$dnum}"
+        if [[ "$a" =~ ^[0-9]+$ ]] && (( a >= 1 && a <= n )); then MENU="${tags[a - 1]}"; return 0; fi
+        for ((i = 0; i < n; i++)); do [[ "${tags[i]}" == "$a" ]] && { MENU="$a"; return 0; }; done
+        echo "    Bitte 1 bis $n wählen."
+    done
+}
+
+# confirm TITEL TEXT JA-KNOPF NEIN-KNOPF -> Rückgabewert 0 = ja (ohne Terminal: ja)
+confirm() {
+    local title="$1" text="$2" yes="$3" no="$4"
+    [[ $TTY_OK -eq 0 ]] && return 0
+    if [[ $USE_WT -eq 1 ]]; then
+        whiptail --backtitle "$WT_TITLE" --title "$title" --yes-button "$yes" --no-button "$no" \
+            --yesno "$text" $(( $(printf '%s\n' "$text" | wc -l) + 8 )) 78 </dev/tty >/dev/tty 2>&1
+        return
+    fi
+    echo
+    echo "    ${B}$title${N}"
+    printf '%s\n' "$text" | sed 's/^/    /'
+    ask_yn "$yes?" j
 }
 
 # ── 1. Rolle ─────────────────────────────────────────────────────────────────
@@ -139,21 +219,7 @@ if [[ -d "$OLD_PREFIX" ]] || ls /etc/systemd/system/privatelm-*.service >/dev/nu
     fi
 fi
 
-if [[ -z "$ROLE" ]]; then
-    echo
-    echo "    Welche Rolle hat dieser PC?"
-    echo "      1) Master  – OpenAI-API, Dashboard und Router; mit eigenem Modell oder nur als Router (auch in einer VM)"
-    echo "      2) Worker  – leiht GPU und RAM an den Master (für ein Modell, das auf mehrere PCs verteilt wird)"
-    echo "      3) Host    – lädt ein ganzes Modell auf die eigene GPU; der Router des Masters schickt Anfragen hin"
-    case "$(ask "Auswahl 1, 2 oder 3" 2)" in
-        1|m|M|master) ROLE=master ;;
-        2|w|W|worker) ROLE=worker ;;
-        3|h|H|host) ROLE=host ;;
-        *) die "Bitte 1 (Master), 2 (Worker) oder 3 (Host) wählen." ;;
-    esac
-fi
-[[ "$ROLE" == master || "$ROLE" == worker || "$ROLE" == host ]] || die "--role muss master, worker oder host sein."
-ok "Rolle: $ROLE"
+[[ -z "$ROLE" || "$ROLE" == master || "$ROLE" == worker || "$ROLE" == host ]] || die "--role muss master, worker oder host sein."
 
 # ── 2. System erkennen ───────────────────────────────────────────────────────
 
@@ -186,6 +252,79 @@ VENDORS="$(gpu_vendors || true)"
 if [[ -n "$VENDORS" ]]; then ok "GPUs: $VENDORS"; else warn "Keine GPU gefunden, es wird nur die CPU genutzt."; fi
 has_vendor() { [[ " $VENDORS " == *" $1 "* ]]; }
 
+# ── Wie installieren? (alles vorab, mit Zusammenfassung) ─────────────────────
+
+CLI_ROLE="$ROLE" CLI_MODEL="$MODEL" CLI_DOCKER="$DOCKER"
+nvcc_found=0
+for d in /usr/local/cuda/bin $(ls -d /usr/local/cuda-*/bin 2>/dev/null) /opt/cuda/bin /usr/lib/cuda/bin; do
+    [[ -x "$d/nvcc" ]] && nvcc_found=1
+done
+have nvcc && nvcc_found=1
+while true; do
+    ROLE="$CLI_ROLE" MODEL="$CLI_MODEL" DOCKER="$CLI_DOCKER" RUN_DOCKER=0 BUILD_MODE=native asked=0
+    if [[ -z "$ROLE" ]]; then
+        menu "Rolle" "Welche Rolle hat dieser PC?" worker \
+            master "Master: API, Dashboard und Router (mit eigenem Modell oder nur Router)" \
+            worker "Worker: leiht GPU und RAM für ein auf mehrere PCs verteiltes Modell" \
+            host "Host: lädt ein ganzes Modell auf die eigene GPU"
+        ROLE="$MENU" asked=1
+    fi
+    if [[ "$ROLE" == master && -z "$MODEL" && ! ( "$OLD_ROLE" == master && -n "$OLD_ARGS" ) ]]; then
+        menu "Master" "Soll der Master selbst ein Modell laden?" "$( [[ -n "$VENDORS" ]] && echo model || echo router )" \
+            model "Ja: eigenes Modell auf diesem PC (Auswahl nach dem Bauen)" \
+            router "Nein: nur Router (z. B. VM ohne GPU), die Modelle laufen auf Hosts"
+        [[ "$MENU" == router ]] && MODEL=none
+        asked=1
+    fi
+    if [[ "$ROLE" == master && "$MODEL" == none ]]; then
+        if [[ -z "$DOCKER" ]]; then
+            menu "Installationsart" "Wie soll der Master laufen?" native \
+                native "Nativ als systemd-Dienst (für einen eigenen PC oder eine VM)" \
+                docker "Im Docker-Container (praktisch für NAS, Proxmox, Portainer)"
+            DOCKER="$MENU" asked=1
+        fi
+        [[ "$DOCKER" == docker ]] && RUN_DOCKER=1
+    elif [[ "$VENDORS" == nvidia && $nvcc_found -eq 0 ]]; then
+        if [[ -z "$DOCKER" ]]; then
+            menu "llama.cpp bauen" "Diese NVIDIA-GPU braucht llama.cpp mit CUDA. Wo soll es gebaut werden?" docker \
+                docker "Im Docker-Container (empfohlen, kein CUDA-Toolkit nötig, ca. 5 GB)" \
+                native "Direkt auf dem System: installiert das CUDA-Toolkit (ca. 4 GB)"
+            DOCKER="$MENU" asked=1
+        fi
+        [[ "$DOCKER" == docker ]] && BUILD_MODE=docker
+    elif [[ "$DOCKER" == docker ]]; then
+        info "Bauen im Container gibt es nur für PCs mit NVIDIA-GPU ohne CUDA-Toolkit; es wird direkt gebaut."
+    fi
+
+    case "$ROLE:$MODEL" in
+        master:none) r="Master, nur Router" ;;
+        master:*) r="Master mit eigenem Modell" ;;
+        worker:*) r="Worker" ;;
+        host:*) r="Host" ;;
+    esac
+    if [[ $RUN_DOCKER -eq 1 ]]; then how="Docker-Container (ghcr.io/miki84/myrmidlm, sonst hier gebaut)"
+    else how="systemd-Dienst (myrmid-$( [[ "$ROLE" == master ]] && echo server || echo "$ROLE"))"; fi
+    if [[ $RUN_DOCKER -eq 1 ]]; then build="im Image enthalten (CPU)"
+    elif [[ "$BUILD_MODE" == docker ]]; then build="im CUDA-Container gebaut (kein CUDA-Toolkit auf dem System)"
+    else build="direkt auf dem System gebaut (CUDA-Toolkit/Vulkan nach Bedarf, mit Rückfrage)"; fi
+    case "$ROLE:$MODEL" in
+        master:none) next="API-Port, Schlafzeit der Hosts" ;;
+        master:*) next="Modell (Liste nach dem Bauen), Worker, Port, Zweitmodell" ;;
+        *) next="Master-IP (Firewall), RAM verleihen" ;;
+    esac
+    summary="Rolle:      $r
+Läuft als:  $how
+llama.cpp:  $build
+GPUs:       ${VENDORS:-keine}
+Version:    ${WANT_VERSION:-neueste}$( [[ "$CHANNEL" == main ]] && echo " (main)")
+Updates:    $( [[ $AUTO_UPDATE == on ]] && echo "automatisch" || echo "auf Klick im Dashboard")
+Ziel:       $PREFIX
+Danach:     $next"
+    if confirm "Zusammenfassung" "$summary" "Installieren" "Ändern"; then break; fi
+    [[ $asked -eq 1 ]] || die "Abgebrochen (alles war per Option festgelegt; nichts verändert)."
+done
+ok "Rolle: $ROLE$( [[ $RUN_DOCKER -eq 1 ]] && echo ", im Docker-Container")$( [[ "$BUILD_MODE" == docker ]] && echo ", Bauen im CUDA-Container")"
+
 # apt_has PACKAGE: installable here? (apt-cache show also succeeds for a name
 # that other packages only refer to, e.g. nvidia-vulkan-icd on Ubuntu)
 apt_has() {
@@ -204,6 +343,13 @@ pkg_install() {
 # ── 3. Grundpakete ───────────────────────────────────────────────────────────
 
 step "Grundpakete installieren"
+if [[ $RUN_DOCKER -eq 1 ]]; then  # alles Weitere steckt im Image
+    case "$PM" in
+        apt) srun apt-get update; pkg_install git python3 qrencode curl ca-certificates iproute2 ;;
+        dnf) pkg_install git python3 qrencode curl iproute ;;
+        pacman) pkg_install git python qrencode curl iproute2 ;;
+    esac
+else
 case "$PM" in
     apt)
         srun apt-get update
@@ -221,6 +367,23 @@ case "$PM" in
     pacman)
         pkg_install base-devel cmake git python python-zeroconf qrencode pciutils curl ethtool ;;
 esac
+fi
+
+# Docker: aus den Paketen der Distribution.
+install_docker() {
+    if have docker && $SUDO docker info >/dev/null 2>&1; then return 0; fi
+    if ! have docker; then
+        ask_yn "Docker ist nicht installiert. Jetzt installieren?" j || die "Ohne Docker: Skript mit --native erneut starten."
+        case "$PM" in
+            apt) pkg_install docker.io ;;
+            dnf) pkg_install moby-engine || pkg_install docker ;;
+            pacman) pkg_install docker ;;
+        esac
+    fi
+    srun systemctl enable --now docker
+    [[ $DRY -eq 1 ]] || $SUDO docker info >/dev/null 2>&1 || die "Docker läuft nicht (systemctl status docker)."
+    ok "Docker: $($SUDO docker --version 2>/dev/null || echo bereit)"
+}
 
 # ── NVIDIA: Generation, Treiber, CUDA ────────────────────────────────────────
 
@@ -442,7 +605,7 @@ USE_CUDA=0 USE_VULKAN=0
 CUDA_BIN=""
 find_cuda_bin
 
-if has_vendor nvidia; then
+if has_vendor nvidia && [[ $RUN_DOCKER -eq 0 ]]; then
     step "NVIDIA"
     NV_GEN="$(nvidia_generation)"
     NV_NAMES="$(lspci -d 10de: 2>/dev/null | grep -E 'VGA|3D|Display' | sed -E 's/.*: NVIDIA Corporation //' | paste -sd';' - || true)"
@@ -480,7 +643,14 @@ if has_vendor nvidia; then
     elif [[ "$NV_GEN" != fermi ]]; then
         if have nvidia-smi; then ok "Treiber: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | paste -sd';' -)"
         else ok "Treiber: $(head -1 /proc/driver/nvidia/version | grep -o 'Kernel Module.*' | cut -c1-60)"; fi
-        if [[ -n "$CUDA_BIN" ]]; then
+        if [[ "$BUILD_MODE" == docker && "$NV_GEN" == kepler ]]; then
+            info "Kepler-Karten laufen nur über Vulkan: es wird direkt gebaut, nicht im CUDA-Container."
+            BUILD_MODE=native
+        fi
+        if [[ "$BUILD_MODE" == docker ]]; then
+            ok "CUDA: wird im Container mitgebaut (kein CUDA-Toolkit auf diesem PC)"
+            USE_CUDA=1
+        elif [[ -n "$CUDA_BIN" ]]; then
             ok "CUDA-Toolkit: $("$CUDA_BIN/nvcc" --version | grep -o 'release [0-9.]*')"
             USE_CUDA=1
         elif [[ "$NV_GEN" == kepler ]]; then
@@ -503,7 +673,9 @@ if has_vendor nvidia; then
         fi
     fi
 fi
-if has_vendor amd || has_vendor intel; then USE_VULKAN=1; fi
+if [[ $RUN_DOCKER -eq 0 ]] && { has_vendor amd || has_vendor intel; }; then USE_VULKAN=1; fi
+# Treiber fehlt (NVIDIA-Karte ungenutzt): nichts mehr im Container zu bauen
+[[ "$BUILD_MODE" == docker && $USE_CUDA -eq 0 ]] && BUILD_MODE=native
 
 if [[ $USE_VULKAN -eq 1 ]]; then
     step "Vulkan (AMD, Intel$( [[ $USE_CUDA -eq 0 ]] && has_vendor nvidia && echo ", NVIDIA ohne CUDA"))"
@@ -578,6 +750,75 @@ run $SUDO git -C "$SRC_DIR" checkout -q --force --detach "$REF"
 [[ -z "$LOCAL_SRC" ]] && run $SUDO git -C "$SRC_DIR" remote set-url origin "$REPO_URL"
 ok "Version $VER ($CHANNEL)"
 
+# ── Master als Docker-Container ──────────────────────────────────────────────
+# Nur Router: alles steckt im Image (ghcr.io/OWNER/myrmidlm, gebaut von der
+# GitHub-CI für jedes Release). Ist es nicht abrufbar (Paket privat, Stand von
+# main), wird es hier aus dem Quellcode gebaut. Ein erneuter Start des
+# Skripts holt die neueste Version und erstellt den Container neu; Schlüssel
+# und Einstellungen bleiben im Volume myrmid-data.
+if [[ $RUN_DOCKER -eq 1 ]]; then
+    step "Master im Docker-Container"
+    install_docker
+    owner="$(echo "$REPO_URL" | sed -E 's#^(https?://|git@)github\.com[:/]+([^/]+)/.*#\2#' | tr 'A-Z' 'a-z')"
+    [[ "$owner" == */* || "$owner" == "$REPO_URL" ]] && owner=miki84
+    IMG="ghcr.io/$owner/myrmidlm:$VER"
+    if [[ $DRY -eq 0 ]] && ! $SUDO docker pull -q "$IMG" >/dev/null 2>&1; then
+        warn "Image $IMG ist nicht abrufbar: baue es hier aus dem Quellcode (etwa 10 Minuten)."
+        IMG="myrmidlm:$VER"
+        srun docker build -t "$IMG" "$SRC_DIR"
+    fi
+    ok "Image: $IMG"
+    # Ein nativer Master auf diesem PC: abschalten, Schlüssel und Einstellungen übernehmen
+    # (die Hosts kennen seinen Schlüssel).
+    if systemctl is-enabled --quiet myrmid-server 2>/dev/null; then
+        if ask_yn "Auf diesem PC läuft der Master schon als Dienst. Abschalten und Schlüssel/Einstellungen in den Container übernehmen?" j; then
+            srun systemctl disable --now myrmid-server
+            if [[ $DRY -eq 0 ]] && ! $SUDO docker volume inspect myrmid-data >/dev/null 2>&1; then
+                $SUDO docker volume create myrmid-data >/dev/null
+                mp="$($SUDO docker volume inspect -f '{{.Mountpoint}}' myrmid-data)"
+                if $SUDO test -d /var/lib/private/myrmid; then
+                    $SUDO tar -C /var/lib/private/myrmid --exclude=./models -cf - . | $SUDO tar -C "$mp" -xf -
+                    ok "Schlüssel und Einstellungen übernommen."
+                fi
+            fi
+        fi
+    fi
+    PORT="$(ask "API-Port" "$PORT")"
+    if [[ -z "$HOST_SLEEP" ]]; then
+        HOST_SLEEP=0
+        [[ $YES -eq 0 ]] && HOST_SLEEP="$(ask "Hosts nach wie vielen Minuten ohne Anfrage schlafen legen (0 = nie, später pro Host im Dashboard)" 0)"
+    fi
+    LAN_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)"
+    cargs=(serve -m none --workers off --port "$PORT")
+    [[ "${HOST_SLEEP:-0}" != 0 ]] && cargs+=(--host-sleep "$HOST_SLEEP")
+    $SUDO docker rm -f myrmid >/dev/null 2>&1 || true
+    srun docker run -d --name myrmid --restart unless-stopped --network host \
+        -v myrmid-data:/var/lib/myrmid -v myrmid-cache:/var/cache/myrmid "$IMG" "${cargs[@]}"
+    KEY=""
+    if [[ $DRY -eq 0 ]]; then
+        info "Warte auf den API-Key ..."
+        for _ in $(seq 1 30); do
+            KEY="$($SUDO docker exec myrmid myrmid key 2>/dev/null || true)"
+            [[ -n "$KEY" ]] && break
+            sleep 2
+        done
+        $SUDO docker ps --filter name=^myrmid$ --format '{{.Status}}' | grep -q '^Up' \
+            || { warn "Der Container läuft nicht. Letzte Meldungen:"; $SUDO docker logs --tail 8 myrmid 2>&1 | sed 's/^/      /'; }
+    fi
+    if have ufw && $SUDO ufw status 2>/dev/null | grep -q "Status: active"; then
+        srun ufw allow "$PORT/tcp"; srun ufw allow 8090/tcp; srun ufw allow 5353/udp
+    fi
+    URL="http://${LAN_IP:-<IP>}:$PORT/v1"
+    echo
+    echo "${G}${B}Fertig.${N} Der Master ($VER) läuft im Docker-Container myrmid (nur Router):"
+    echo "    Base URL:  $URL"
+    echo "    Dashboard: http://${LAN_IP:-<IP>}:8090/  (Anmeldung mit dem API-Key)"
+    [[ -n "$KEY" ]] && echo "    API-Key:   $KEY  (auch der Schlüssel für Hosts)"
+    echo "Hosts erscheinen im Dashboard, sobald sie im Netz sind: dort Modelle zuweisen."
+    echo "Log: sudo docker logs -f myrmid · Update: dieses Skript erneut starten (Hosts folgen von selbst)."
+    exit 0
+fi
+
 # ── 6. Bauen ─────────────────────────────────────────────────────────────────
 
 REL="$PREFIX/releases/$VER"
@@ -601,7 +842,14 @@ if [[ -x "$REL/bin/myrmid" ]]; then
     ok "Version $VER ist schon gebaut."
 else
     srun rm -rf "$REL.part"
-    srun env PATH="$PATH" bash "$SRC_DIR/node/build.sh" --backends "$BACKENDS" --install "$REL.part"
+    if [[ "$BUILD_MODE" == docker ]]; then
+        install_docker
+        info "Baue im CUDA-Container (lädt beim ersten Mal das Build-Image von NVIDIA, ca. 5 GB) ..."
+        srun env LLAMA_CPP_REPO="$(sed -n 's/^LLAMA_CPP_REPO=//p' "$CONF" 2>/dev/null || true)" \
+            bash "$SRC_DIR/node/docker-build.sh" --backends "$BACKENDS" --install "$REL.part"
+    else
+        srun env PATH="$PATH" bash "$SRC_DIR/node/build.sh" --backends "$BACKENDS" --install "$REL.part"
+    fi
     if [[ $DRY -eq 0 ]]; then
         echo "$VER" | $SUDO tee "$REL.part/bin/VERSION" >/dev/null
         $SUDO mv "$REL.part" "$REL"
@@ -618,6 +866,7 @@ if [[ $DRY -eq 0 ]]; then
     srun mkdir -p /etc/myrmid
     printf '%s\n' "# MyrmidLM (install.sh). Updates: myrmid update; ändern und speichern genügt." \
         "REPO=$REPO_URL" "CHANNEL=$CONF_CHANNEL" "AUTO=$AUTO_UPDATE" "BACKENDS=$BACKENDS" "CUDA_BIN=${CUDA_BIN:-}" \
+        "BUILD=$BUILD_MODE" "$(sed -n 's/^BUILD_IMAGE=/BUILD_IMAGE=/p' "$CONF" 2>/dev/null || true)" \
         "$(sed -n 's/^LLAMA_CPP_REPO=/LLAMA_CPP_REPO=/p' "$CONF" 2>/dev/null || true)" \
         | sed '/^$/d' | $SUDO tee "$CONF" >/dev/null
 fi
@@ -866,6 +1115,12 @@ if [[ "$ROLE" == worker || "$ROLE" == host ]]; then
     # Die Ports braucht nur der Master (RPC hat keine Anmeldung).
     ask_master_ip
     check_master_ip
+    confirm "$( [[ "$ROLE" == worker ]] && echo Worker || echo Host ) einrichten" \
+        "Läuft:      myrmid-$ROLE ($( [[ "$ROLE" == worker ]] && echo "verleiht $WHAT${RAM_NOTE:+ und RAM}" || echo "lädt Modelle, die der Master zuweist"))
+Firewall:   Ports 50052-50053, 50060, 50070, 8081 offen für ${MASTER_IP:-das ganze LAN ($LAN_NET)}
+Aufwecken:  Wake-on-LAN, wenn die Netzwerkkarte es kann
+Steuerung:  Rolle, Modelle und Updates im Dashboard des Masters" "Einrichten" "Abbrechen" \
+        || die "Abgebrochen. Das Programm ist gebaut: ein neuer Start des Skripts überspringt das Bauen."
     open_ports "${MASTER_IP:-$LAN_NET}" "50052:50053/tcp" "50060/tcp" "50070/tcp" "8081/tcp"
     enable_wol
     # Ohne Key: nur dieser Master darf den PC aufnehmen (sonst jeder, in der ersten Stunde nach dem Start).
@@ -927,7 +1182,7 @@ fi
 # Modellauswahl: vorhandene GGUF-Dateien und Katalog, bewertet nach Speicher.
 # choose_model big|small  ->  setzt CHOSEN (Pfad; bei small leer = ohne Router)
 choose_model() {
-    local kind="$1" json tmp sel pick
+    local kind="$1" json tmp sel pick t d
     CHOSEN=""
     if [[ $DRY -eq 1 || ! -x "$NODE" ]]; then
         CHOSEN="$(ask "Pfad zum GGUF-Modell" "")"
@@ -944,30 +1199,39 @@ choose_model() {
     fi
     tmp="$(mktemp)"
     printf '%s' "$json" > "$tmp"
-    python3 - "$tmp" menu "$kind" <<'PY'
+    # Einträge als TAG<Tab>BESCHREIBUNG, dazu die erste Zeile: Platz, Empfehlung
+    local entries head def
+    entries="$(python3 - "$tmp" "$kind" <<'PY'
 import json, sys
-d = json.load(open(sys.argv[1])); kind = sys.argv[3]
+d = json.load(open(sys.argv[1])); kind = sys.argv[2]
 fit = {"here": "passt hier", "workers": "nur mit Workern", "too_big": "zu groß", "unknown": "?"}
-print(f"    Platz: {d['local_mb']/1024:.1f} GB auf diesem PC" + (f", {d['workers_mb']/1024:.1f} GB auf Workern" if d["workers_mb"] else ""))
+r = d["recommended"]
+print(f"Platz: {d['local_mb']/1024:.1f} GB auf diesem PC" + (f", {d['workers_mb']/1024:.1f} GB auf Workern" if d["workers_mb"] else "")
+      + "\t" + ("" if r is None else str(r + 1)))
 for i, e in enumerate(d["models"], 1):
     if e.get("error") or e.get("have"):
         continue
-    state = fit[e["fit"]] if e.get("arch_ok") is not False else "Architektur nicht unterstützt"
-    src = "vorhanden" if e["source"] == "local" else ("schon geladen" if e.get("have") else "Download")
-    star = "  <- Empfehlung" if d["recommended"] == i - 1 else ""
-    desc = f" ({e['desc']})" if e.get("desc") else ""
-    print(f"      {i:>2}) {e['name']:<30} {e['size_mb']/1024:5.1f} GB  {state:<16} {src}{desc}{star}")
-print("       p) eigenen Pfad eingeben" + ("\n       0) ohne Router" if kind == "small" else
-      "\n       n) kein eigenes Modell: nur Router (z. B. VM ohne GPU; Modelle laufen auf Hosts)"))
+    state = fit[e["fit"]] if e.get("arch_ok") is not False else "Architektur fehlt"
+    src = "vorhanden" if e["source"] == "local" else "Download"
+    star = " *Empfehlung*" if r == i - 1 else ""
+    print(f"{i}\t{e['name'][:30]:<30} {e['size_mb']/1024:5.1f} GB, {state}, {src}{star}")
+print("p\tEigenen Pfad eingeben")
+print("0\tOhne Zweitmodell (kein Router)" if kind == "small" else
+      "n\tKein eigenes Modell: nur Router (Modelle laufen auf Hosts)")
 PY
-    local def
-    def="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); r=d['recommended']; print('' if r is None else r+1)" "$tmp")"
+)"
+    head="$(head -1 <<< "$entries")"
+    def="${head#*$'\t'}" head="${head%%$'\t'*}"
     [[ "$kind" == small && -z "$def" ]] && def=0
     if [[ "$kind" == small ]] && python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))['local_mb'] < 8192 else 1)" "$tmp"; then
-        info "Wenig Speicher auf diesem PC: Ein Zweitmodell würde dem großen Modell RAM wegnehmen. Empfehlung: ohne Router."
+        head="$head
+Wenig Speicher auf diesem PC: Ein Zweitmodell würde dem großen Modell RAM wegnehmen. Empfehlung: ohne."
         def=0
     fi
-    sel="$(ask "Auswahl" "${def:-p}")"
+    local -a margs=()
+    while IFS=$'\t' read -r t d; do margs+=("$t" "$d"); done < <(tail -n +2 <<< "$entries")
+    menu "$( [[ "$kind" == small ]] && echo "Zweitmodell (Router)" || echo "Modell des Masters")" "$head" "${def:-p}" "${margs[@]}"
+    sel="$MENU"
     if [[ "$sel" == p ]]; then
         CHOSEN="$(ask "Pfad zum GGUF-Modell" "")"
     elif [[ "$kind" == big && "$sel" == n ]]; then
@@ -1054,13 +1318,13 @@ if [[ $ROUTER_ONLY -eq 0 && $SERVICE -eq 1 && $DRY -eq 0 ]] && ! service_can_rea
 fi
 
 if [[ -z "$WORKERS" ]]; then
-    echo
-    echo "    Welche Worker soll der Master nutzen?"
-    echo "      auto  – Worker nur, wo sie nötig sind oder es schneller machen (empfohlen)"
-    echo "      all   – jeder Worker mit freiem Platz (schnellste zuerst)"
-    echo "      off   – keine"
-    echo "      oder feste Liste, z. B. 192.168.1.20:50052,192.168.1.20:50053"
-    WORKERS="$(ask "Worker" auto)"
+    menu "Worker" "Welche Worker soll der Master nutzen?" auto \
+        auto "auto: nur wo sie nötig sind oder es schneller machen (empfohlen)" \
+        all "all: jeder Worker mit freiem Platz (schnellste zuerst)" \
+        off "off: keine" \
+        list "Feste Liste eingeben (IP:Port, mehrere mit Komma)"
+    WORKERS="$MENU"
+    [[ "$WORKERS" == list ]] && WORKERS="$(ask "Worker, z. B. 192.168.1.20:50052,192.168.1.20:50053" "auto")"
 fi
 PORT="$(ask "API-Port" "$PORT")"
 MTP=0
@@ -1137,6 +1401,22 @@ args=(serve -m "$MODEL" --workers "$WORKERS" --port "$PORT")
 [[ "${MTP:-0}" != 0 ]] && args+=(--mtp "$MTP")
 [[ -n "$DRAFT" && "$DRAFT" != off ]] && args+=(--draft-model "$DRAFT")
 [[ "${HOST_SLEEP:-0}" != 0 ]] && args+=(--host-sleep "$HOST_SLEEP")
+fi
+if [[ $REUSE -eq 0 ]]; then
+    plan="Modell:       $( [[ $ROUTER_ONLY -eq 1 ]] && echo "keins (nur Router)" || basename "$MODEL")
+Worker:       $WORKERS
+API-Port:     $PORT (Dashboard 8090)
+Zweitmodell:  $( [[ -n "$FAST_MODEL" ]] && basename "$FAST_MODEL" || echo "keins")
+Entwurf/MTP:  $( [[ "${MTP:-0}" != 0 ]] && echo "MTP-Tiefe $MTP" || { [[ "${DRAFT:-off}" != off ]] && echo "Entwurfsmodell automatisch" || echo "aus"; })
+Hosts schlafen: $( [[ "${HOST_SLEEP:-0}" != 0 ]] && echo "nach $HOST_SLEEP Minuten" || echo "nie")"
+    confirm "Master einrichten" "$plan" "Einrichten" "Abbrechen" \
+        || die "Abgebrochen. Das Programm ist gebaut: ein neuer Start des Skripts überspringt das Bauen."
+fi
+# Der Master lief bisher im Docker-Container: der wird jetzt ersetzt.
+if [[ $DRY -eq 0 ]] && have docker && $SUDO docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx myrmid; then
+    if ask_yn "Der Master läuft auch als Docker-Container myrmid. Den Container entfernen (das Volume bleibt)?" j; then
+        srun docker rm -f myrmid
+    fi
 fi
 if [[ $SERVICE -eq 1 ]]; then
     write_unit myrmid-server "MyrmidLM Server (Modell als OpenAI-API)" "$NODE ${args[*]}"

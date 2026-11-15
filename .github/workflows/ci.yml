@@ -18,7 +18,7 @@ jobs:
           python3 -m py_compile node/myrmid.py
           python3 node/myrmid.py --version
       - name: Shell scripts
-        run: shellcheck -S warning install.sh node/build.sh scripts/release.sh node/systemd/myrmid-role.sh
+        run: shellcheck -S warning install.sh node/build.sh node/docker-build.sh scripts/release.sh node/systemd/myrmid-role.sh
 
   node-cpu:
     runs-on: ubuntu-latest

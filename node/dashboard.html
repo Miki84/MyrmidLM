@@ -1549,9 +1549,11 @@ function renderUpdate(s) {
   renderVersion(u);
   if (!u.installed) {
     $("up-version").textContent = u.release ? `${u.release}` : "";
-    $("up-explain").textContent = "Updates sind auf diesem Master nicht eingerichtet: mit install.sh installieren.";
+    $("up-explain").textContent = u.container ? (u.status || "Der Master läuft im Docker-Container.")
+      : "Updates sind auf diesem Master nicht eingerichtet: mit install.sh installieren.";
     ["up-switch", "up-check"].forEach((id) => { $(id).disabled = true; });
-    $("up-state").textContent = ""; $("up-nodes").innerHTML = "";
+    $("up-state").textContent = "";
+    $("up-nodes").innerHTML = u.container ? (u.nodes || []).map((n) => `<tr><td>${esc(n.name + (n.kind === "host" ? " (Host)" : ""))}</td><td class="num">${esc(n.release || "?")}</td><td class="num">${esc(n.prepared || "–")}</td><td>${esc(n.phase === "failed" ? "Fehler: " + n.error : (phaseText[n.phase] ?? n.phase) || "")}</td></tr>`).join("") : "";
     return;
   }
   $("up-version").textContent = `${u.release} · ${u.rpc}`;

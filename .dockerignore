@@ -1,0 +1,8 @@
+# The image needs only the node and the version.
+*
+!VERSION
+!node
+node/build
+node/build-docker
+node/.llama.cpp
+node/**/__pycache__

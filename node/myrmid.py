@@ -4231,6 +4231,12 @@ UPDATE_CONF = Path(env("CONF", "/etc/myrmid/myrmid.conf"))
 UPDATE_REQUEST = f"{RUN_DIR}/update"
 UNIT_DIR = Path(env("UNIT_DIR", "/etc/systemd/system"))
 UPDATE_HELPER = UNIT_DIR / "myrmid-update-request.path"
+# The master as a Docker container (Dockerfile): no updater of its own, a new
+# image is the update; the other PCs follow it to its release.
+IN_CONTAINER = env("CONTAINER") == "1"
+CONTAINER_HINT = ("Der Master läuft im Docker-Container. Neue Version: Installer erneut starten oder "
+                  "docker pull ghcr.io/miki84/myrmidlm:latest und den Container neu erstellen. "
+                  "Hosts und Worker stellt er danach von selbst auf seine Version um.")
 CLUSTER_KEY_FILE = Path(env("CLUSTER_KEY_FILE", "/etc/myrmid/cluster_key"))
 DEFAULT_REPO = "https://github.com/Miki84/MyrmidLM.git"
 SERVICES = ("myrmid-server", "myrmid-worker", "myrmid-host")
@@ -4273,7 +4279,7 @@ def is_newer(a: Optional[str], b: Optional[str]) -> bool:
 
 def read_conf() -> dict:
     conf = {"REPO": DEFAULT_REPO, "CHANNEL": "stable", "AUTO": "on", "BACKENDS": "auto",
-            "CUDA_BIN": "", "ROCM_TARGETS": "", "LLAMA_CPP_REPO": ""}
+            "CUDA_BIN": "", "ROCM_TARGETS": "", "LLAMA_CPP_REPO": "", "BUILD": "native", "BUILD_IMAGE": ""}
     try:
         for line in UPDATE_CONF.read_text().splitlines():
             k, sep, v = line.strip().partition("=")
@@ -4460,9 +4466,15 @@ def update_prepare(version: Optional[str] = None) -> dict:
         if conf["LLAMA_CPP_REPO"]:
             envp["LLAMA_CPP_REPO"] = conf["LLAMA_CPP_REPO"]
         cmd = ["nice", "-n", "19"] + (["ionice", "-c3"] if shutil.which("ionice") else [])
-        cmd += ["bash", str(PREFIX / "src" / "node" / "build.sh"), "--backends", conf["BACKENDS"],
-                "--install", str(part)]
-        if conf["ROCM_TARGETS"]:
+        if conf["BUILD"] == "docker":  # in NVIDIA's CUDA container (install.sh: no toolkit on this PC)
+            cmd += ["bash", str(PREFIX / "src" / "node" / "docker-build.sh"), "--backends", conf["BACKENDS"],
+                    "--install", str(part)]
+            if conf["BUILD_IMAGE"]:
+                cmd += ["--image", conf["BUILD_IMAGE"]]
+        else:
+            cmd += ["bash", str(PREFIX / "src" / "node" / "build.sh"), "--backends", conf["BACKENDS"],
+                    "--install", str(part)]
+        if conf["ROCM_TARGETS"] and conf["BUILD"] != "docker":
             cmd += ["--rocm-targets", conf["ROCM_TARGETS"]]
         with open(UPDATE_LOG, "w") as lf:
             rc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, env=envp, cwd=str(PREFIX / "src")).returncode
@@ -4852,7 +4864,7 @@ class UpdateCoordinator:
         target, st = self.target()
         mine = own_version()
         nodes = self.poll()
-        if not st:
+        if not st and not IN_CONTAINER:
             self.status = "Updates sind auf diesem PC nicht eingerichtet (mit install.sh installieren)."
             return
         if not target:
@@ -4864,7 +4876,7 @@ class UpdateCoordinator:
                     self._ask(n, "activate", mine, every_s=600)
                 elif n["prepared"] != mine and n["phase"] != "building" and VERSION_RE.match(mine):
                     self._ask(n, "prepare", mine)
-            self.status = ""
+            self.status = CONTAINER_HINT if IN_CONTAINER and not st else ""
             return
         for n in nodes:  # let every PC build the release now, not at its own timer
             if n["release"] != target and n["prepared"] != target and n["phase"] != "building" \
@@ -4935,6 +4947,7 @@ class UpdateCoordinator:
         with self.lock:
             nodes = list(self.nodes)
         return {"release": own_version(), "rpc": RPC_VERSION, "installed": bool(st), "target": target,
+                "container": IN_CONTAINER,
                 "latest": st.get("latest"), "latest_rpc": st.get("latest_rpc"), "prepared": st.get("prepared"),
                 "phase": st.get("phase") or "", "error": st.get("error") or "", "auto": bool(st.get("auto")),
                 "checked": st.get("checked"), "channel": st.get("channel") or "stable",

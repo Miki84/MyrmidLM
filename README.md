@@ -25,7 +25,7 @@ Auf jedem PC (Debian, Ubuntu, Linux Mint, Pop!_OS, Fedora, Arch), als normaler B
 curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash
 ```
 
-Das Skript fragt nach der Rolle:
+Das Skript fragt alles in Auswahlmenüs ab (Pfeiltasten, Enter; ohne `whiptail` oder mit `--plain` als Text) und zeigt vor dem Start eine Zusammenfassung. Mit „Ändern“ geht es zurück an den Anfang, erst „Installieren“ verändert etwas. Zuerst kommt die Rolle:
 
 | Rolle | Was der PC tut |
 |---|---|
@@ -34,6 +34,11 @@ Das Skript fragt nach der Rolle:
 | **Host** | lädt ein ganzes Modell, der Router des Masters schickt Anfragen hin |
 
 Zuerst den Master installieren, danach Worker und Hosts. Einen Schlüssel musst du dabei nicht eintippen: Das Skript sucht den Master im Netz, und sobald der Master den neuen PC sieht, nimmt er ihn auf und gibt ihm seinen API-Key. Ab dann kann er ihn im Dashboard umschalten und aktualisieren. Aufnehmen darf ihn nur der Master, den das Skript gefunden hat; findet es keinen, nimmt ihn der erste Master, der ihn in der ersten Stunde nach dem Start sieht.
+
+**Docker** (Frage im Menü, oder `--docker` bzw. `--native`):
+
+- **Master nur als Router:** auf Wunsch als Container `myrmid` statt als systemd-Dienst, praktisch auf einem NAS, unter Proxmox oder mit Portainer. Das Image `ghcr.io/miki84/myrmidlm` baut die GitHub-CI für jedes Release; ist es nicht abrufbar, baut das Skript es aus dem Quellcode. Update: Skript erneut starten (holt die neueste Version, Schlüssel und Einstellungen bleiben im Volume `myrmid-data`); Hosts und Worker stellt der Master danach von selbst auf seine Version um. Ohne Skript: `docker run -d --name myrmid --restart unless-stopped --network host -v myrmid-data:/var/lib/myrmid -v myrmid-cache:/var/cache/myrmid ghcr.io/miki84/myrmidlm:latest`. Läuft der Master vorher als Dienst auf demselben PC, übernimmt das Skript seinen Schlüssel, damit die Hosts ihn weiter kennen.
+- **PCs mit NVIDIA-GPU** (Master mit Modell, Worker, Host): llama.cpp wird auf Wunsch in NVIDIAs CUDA-Container gebaut. Auf dem System braucht es dann nur den Treiber, kein CUDA-Toolkit (das war die häufigste Fehlerquelle, z. B. unter Ubuntu 26.04). Die Programme laufen wie gewohnt direkt auf dem PC; die nötigen CUDA-Bibliotheken liegen neben ihnen. Auch die nächtlichen Updates bauen dann im Container (`BUILD=docker` in `/etc/myrmid/myrmid.conf`, eigenes Image mit `BUILD_IMAGE=`). CUDA 13 für Turing und neuer, 12.9 für ältere Karten. Für AMD, Intel und gemischte PCs wird wie bisher direkt gebaut.
 
 Ohne Rückfragen, zum Beispiel für einen weiteren Worker:
 
