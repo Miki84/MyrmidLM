@@ -5067,11 +5067,22 @@ class HostAgent:
         if not d:
             return None
         done = 0
-        for f in d["files"]:
+        files = list(d["files"]) + ([d["mmproj"]] if d.get("mmproj") else [])
+        for f in files:
             dest = Path(d["dir"]) / Path(f["file"]).name
             part = dest.with_suffix(dest.suffix + ".part")
-            done += dest.stat().st_size if dest.exists() else part.stat().st_size if part.exists() else 0
-        return {"name": d["name"], "total_mb": d["size_mb"], "done_mb": done // 2**20}
+            try:  # a file can be renamed from .part between the two looks
+                done += dest.stat().st_size if dest.exists() else part.stat().st_size if part.exists() else 0
+            except OSError:
+                pass
+        now = time.time()
+        prev = d.get("_last")
+        if prev and now - prev[0] >= 2:
+            d["_rate"] = max(0.0, (done - prev[1]) / (now - prev[0]) / 2**20)
+        if not prev or now - prev[0] >= 2:
+            d["_last"] = (now, done)
+        return {"name": d["name"], "total_mb": d["size_mb"], "done_mb": done // 2**20,
+                "mb_s": round(d.get("_rate", 0.0), 1), "files": len(files)}
 
     def status(self) -> dict:
         node = self.node

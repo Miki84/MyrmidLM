@@ -1313,8 +1313,12 @@ function renderHosts(s) {
     const a = x.assignment || {}, e = hostEdits[x.id] || {};
     const val = (k, d) => esc(e[k] ?? a[k] ?? d ?? "");
     const pr = x.progress;
-    const prog = x.state === "downloading" && pr ? `<div class="progress"><i style="width:${pr.total_mb ? 100 * pr.done_mb / pr.total_mb : 0}%"></i></div>
-      <div class="note">${esc(pr.name)}: ${gb(pr.done_mb)} von ${gb(pr.total_mb)}</div>` : "";
+    const eta = pr && pr.mb_s > 0.1 ? Math.max(0, (pr.total_mb - pr.done_mb) / pr.mb_s) : 0;
+    const etaText = eta ? `, ${pr.mb_s >= 1 ? nf(pr.mb_s, 0) : nf(pr.mb_s, 1)} MB/s, noch ${eta >= 3600 ? `${Math.floor(eta / 3600)} Std. ${Math.round(eta % 3600 / 60)} Min.` : `${Math.max(1, Math.round(eta / 60))} Min.`}` : "";
+    const prog = x.state !== "downloading" ? ""
+      : pr ? `<div class="progress"><i style="width:${pr.total_mb ? 100 * pr.done_mb / pr.total_mb : 0}%"></i></div>
+      <div class="note">${esc(pr.name)}${pr.files > 1 ? ` (${pr.files} Dateien)` : ""}: ${gb(pr.done_mb)} von ${gb(pr.total_mb)}${etaText}</div>`
+      : `<div class="note">Sucht die Dateien auf Hugging Face …</div>`;
     const now = x.model ? `<div><b>${esc(x.model)}</b>${x.ctx ? `, Kontext ${x.ctx.toLocaleString("de-DE")}` : ""}${x.estimate_tps ? `, geschätzt ${nf(x.estimate_tps, 1)} Token/s` : ""}${x.busy ? `, ${x.busy} Anfrage(n) in Arbeit` : ""}</div>` : "";
     const role = e.role ?? a.role ?? "big";
     const nGpus = (x.gpus || []).length;
