@@ -1857,6 +1857,49 @@ def tune_bench(base: str, key: str, timeout: float = 900) -> dict:
     return {"pp": round(pp, 1), "tg": round(tg, 2), "secs": round(secs, 2)}
 
 
+def _bench_watched(base: str, key: str, limit: float, proc, tail, stop) -> dict:
+    """tune_bench, watching the server meanwhile: when it crashes the answer
+    never comes (and a crash reporter like Ubuntu's apport can keep the dying
+    process around for many minutes while it dumps 80 GB), so it's killed and
+    the variant counts as crashed."""
+    import threading
+    import urllib.request
+
+    out: dict = {}
+
+    def run() -> None:
+        try:
+            out["r"] = tune_bench(base, key, timeout=limit)
+        except (OSError, SystemExit, ValueError) as e:
+            out["e"] = e
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    fails = 0
+    while t.is_alive():
+        t.join(5)
+        if not t.is_alive():
+            break
+        if stop():
+            proc.kill()
+            raise OSError("abgebrochen")
+        alive = proc.poll() is None
+        if alive:
+            try:
+                with urllib.request.urlopen(base + "/health", timeout=5):
+                    pass
+                fails = 0
+            except OSError as e:
+                fails += 0 if "503" in str(e) else 1  # 503: busy, still alive
+        if not alive or fails >= 3:
+            proc.kill()
+            t.join(10)
+            why = server_error(tail)
+            raise OSError("abgestürzt" + (f": {why}" if why else ""))
+    if "e" in out:
+        raise out["e"]
+    return out.get("r", {})
+
+
 def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=None,
              load_timeout: float = 3600) -> dict:
     """Measures the variants one setting at a time, keeping the best of each.
@@ -1905,7 +1948,7 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
                 # a variant much slower than the plan is not worth waiting for:
                 # three times the plan's time (at least 3 minutes), else 15 minutes
                 limit = max(180.0, 3 * base_secs[0]) if base_secs else 900.0
-                r.update(tune_bench(f"http://127.0.0.1:{port}", key, timeout=limit))
+                r.update(_bench_watched(f"http://127.0.0.1:{port}", key, limit, proc, tail, stop))
         except (OSError, SystemExit, ValueError) as e:
             r["error"] = ("viel langsamer als der Plan, abgebrochen" if "timed out" in str(e).lower()
                           else str(e)[:200] or "Messung fehlgeschlagen")
@@ -2094,8 +2137,17 @@ def spawn_logged(cmd: list[str]):
     import threading
 
     tail: collections.deque = collections.deque(maxlen=300)
+
+    def no_core() -> None:
+        # No core dump on a crash: crash reporters (Ubuntu's apport) spent many
+        # minutes writing tens of GB for a crashed llama-server while it hung.
+        import resource
+        try:
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        except (ValueError, OSError):
+            pass
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
-                            bufsize=1)
+                            bufsize=1, preexec_fn=no_core)
 
     def pump() -> None:
         for line in proc.stdout:
