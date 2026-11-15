@@ -1886,11 +1886,12 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
         label = tune_label(flags)
         say(f"{n}/{total}: {label} – lädt …", n, total)
         cmd = apply_tune(list(base_cmd), flags)
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc, tail = spawn_logged(cmd)
         r: dict = {"flags": dict(flags), "label": label}
         try:
             if not _wait_healthy(f"http://127.0.0.1:{port}", proc, timeout=load_timeout):
-                r["error"] = f"startet nicht (Code {proc.poll()})"
+                why = server_error(tail)
+                r["error"] = f"startet nicht (Code {proc.poll()})" + (f": {why}" if why else "")
             elif not stop():
                 say(f"{n}/{total}: {label} – misst …", n, total)
                 r.update(tune_bench(f"http://127.0.0.1:{port}", key))
@@ -2069,6 +2070,43 @@ def cmd_tune_mtp(args) -> None:
         print(f"  depth {depth}: {r['tps']:6.1f} tokens/s   accepted {acc}" + ("   <- best" if (depth, r) == best else ""))
     print(f"\nUse: myrmid serve -m {args.model} --mtp {best[0]}" if best[0] else
           "\nMTP doesn't pay off at this temperature: serve without --mtp.")
+
+
+def spawn_logged(cmd: list[str]):
+    """Starts llama-server with its output passed on to our log (journal) and
+    the last lines kept, so a failed start can say why."""
+    import collections
+    import threading
+
+    tail: collections.deque = collections.deque(maxlen=300)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+                            bufsize=1)
+
+    def pump() -> None:
+        for line in proc.stdout:
+            tail.append(line.rstrip())
+            sys.stderr.write(line)
+    threading.Thread(target=pump, daemon=True).start()
+    return proc, tail
+
+
+def server_error(tail) -> str:
+    """The lines of llama-server's output that tell why it stopped."""
+    generic = ("fit_params", "failed to create context", "failed to create_context", "exiting due to",
+               "failed to load model", "error loading model'", "main: exiting")
+    seen, out = set(), []
+    for x in list(tail):
+        if not re.search(r"(^|\s)E\s|error|failed|out of memory|cannot|unable|not enough", x, re.I):
+            continue
+        if any(g in x for g in generic):
+            continue
+        t = re.sub(r"^[\d.]+\s+[EWI]\s+", "", x).strip()
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    if not out:  # only the generic lines: better than nothing
+        out = [re.sub(r"^[\d.]+\s+[EWI]\s+", "", x).strip() for x in list(tail) if re.search(r"(^|\s)E\s", x)][-2:]
+    return " | ".join(out[:3])[:500]
 
 
 def _wait_healthy(base: str, proc: subprocess.Popen, timeout: float) -> bool:
@@ -2739,7 +2777,7 @@ class Supervisor:
         finally:
             a.host, a.port = public
         log(" ".join(sp.cmd).replace(sp.key, "***") if sp.key else " ".join(sp.cmd))
-        proc = subprocess.Popen(sp.cmd)
+        proc, self.tail = spawn_logged(sp.cmd)
         with self.lock:
             self.sp, self.proc, self.state, self.reason = sp, proc, "running", ""
             self.pending, self.now_requested = None, False
@@ -3195,8 +3233,9 @@ class Supervisor:
                         self.exit_code = p.returncode or 1
                         break
                     time.sleep(3)  # let a lost worker drop out of the listings
+                    why = server_error(getattr(self, "tail", []))
                     self.replan(f"llama-server ended (code {p.returncode}); planning again",
-                                f"Server beendet (Code {p.returncode}). Plane neu.")
+                                f"Server beendet (Code {p.returncode}{': ' + why if why else ''}). Plane neu.")
                     continue
                 if self.state == "waiting":
                     if now - self.last_scan > REBALANCE_SCAN_S:
@@ -5224,14 +5263,16 @@ class HostAgent:
             if not current():
                 return
             log(" ".join(sp.cmd).replace(self.key, "***"))
-            proc = subprocess.Popen(sp.cmd)
+            proc, tail = spawn_logged(sp.cmd)
             with self.lock:
                 self.proc, self.model_path, self.ctx, self.estimate_tps = proc, path, ns.ctx, round(sp.estimate_tps, 1)
                 self.download = None
             if _wait_healthy(f"http://127.0.0.1:{self.api_port}", proc, timeout=3600) and current():
                 self._set("ready")
             elif current():
-                self._set("error", f"llama-server did not start (code {proc.poll()}); see the log")
+                why = server_error(tail)
+                self._set("error", f"llama-server startet nicht (Code {proc.poll()})" + (f": {why}" if why else
+                                                                                       "; siehe Protokoll"))
         except (ModelError, PlanTooBig) as e:
             if current():
                 self._set("error", str(e))
