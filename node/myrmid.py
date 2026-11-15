@@ -1734,6 +1734,8 @@ def tune_label(flags: dict) -> str:
             parts.append({"dio": "Direct I/O", "mlock": "Experten fest im RAM (mlock)"}.get(str(v), f"-lm {v}"))
         elif k == "--moe-cache-cpu-share":
             parts.append(f"CPU-Anteil {v}")
+        elif k == "--moe-cache-mib":
+            parts.append(f"Cache {int(v):,} MB".replace(",", "."))
         elif k == "--tensor-split":
             if flags.get("-sm") != "tensor":
                 parts.append("über alle GPUs")
@@ -1930,12 +1932,40 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
     seen: dict[str, dict] = {}
 
     def trial(flags: dict) -> Optional[dict]:
+        r = trial_once(flags)
+        # A larger batch (-ub) or pinned experts need more GPU memory than the
+        # plan left beside the expert cache: "cudaMalloc failed: out of memory"
+        # at the start, or "CUDA error: out of memory" in the first long
+        # prompt. Not a slow variant, a too-large cache: try it again with
+        # less cache (up to twice) before giving up on it.
+        cache = None
+        if "--moe-cache-mib" in flags:
+            cache = int(flags["--moe-cache-mib"])
+        elif "--moe-cache-mib" in base_cmd:
+            try:
+                cache = int(base_cmd[base_cmd.index("--moe-cache-mib") + 1])
+            except (ValueError, IndexError):
+                cache = None
+        for frac in (0.75, 0.5):
+            if not (r and cache and "out of memory" in (r.get("error") or "").lower()) or stop():
+                break
+            mib = int(cache * frac)
+            if mib < MOE_CACHE_MIN_MB:
+                break
+            r2 = trial_once({**flags, "--moe-cache-mib": mib})
+            if r2 and "secs" in r2:
+                return r2
+            r = r2 or r
+        return r
+
+    def trial_once(flags: dict) -> Optional[dict]:
         sig = json.dumps(flags, sort_keys=True)
         if sig in seen:
             return seen[sig]
         n = len(results) + 1
         label = tune_label(flags)
-        say(f"{n}/{total}: {label} – lädt …", n, total)
+        top = max(total, n)
+        say(f"{n}/{top}: {label} – lädt …", n, top)
         cmd = apply_tune(list(base_cmd), flags)
         proc, tail = spawn_logged(cmd)
         r: dict = {"flags": dict(flags), "label": label}
@@ -1944,7 +1974,7 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
                 why = server_error(tail)
                 r["error"] = f"startet nicht (Code {proc.poll()})" + (f": {why}" if why else "")
             elif not stop():
-                say(f"{n}/{total}: {label} – misst …", n, total)
+                say(f"{n}/{top}: {label} – misst …", n, top)
                 # a variant much slower than the plan is not worth waiting for:
                 # three times the plan's time (at least 3 minutes), else 15 minutes
                 limit = max(180.0, 3 * base_secs[0]) if base_secs else 900.0
@@ -1981,7 +2011,7 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
     if best is None:
         raise RuntimeError("keine Variante ist gestartet: " + (results[0].get("error") or ""))
     label = tune_label(best_flags)
-    if moe and "mib" in moe:
+    if moe and "mib" in moe and "--moe-cache-mib" not in best_flags:
         label = f"Cache {moe['mib']:,} MB".replace(",", ".") + (f", CPU-Anteil {moe['share']:g}"
                                                                  if "--moe-cache-cpu-share" not in best_flags else "") \
             + ("" if label == "Plan" else ", " + label)
@@ -4475,6 +4505,24 @@ def _install_units(release: Path) -> None:
         if not dst.exists() or dst.read_bytes() != f.read_bytes():
             shutil.copyfile(f, dst)
             changed = True
+    # The services stay as the installer wrote them, but older installers
+    # left out LimitMEMLOCK: without it "-lm mlock" pins nothing ("failed to
+    # mlock … Cannot allocate memory"). A drop-in adds it without touching them.
+    for u in SERVICES:
+        if not (UNIT_DIR / f"{u}.service").exists():
+            continue
+        try:
+            if "LimitMEMLOCK" in (UNIT_DIR / f"{u}.service").read_text():
+                continue
+            d = UNIT_DIR / f"{u}.service.d"
+            conf = d / "memlock.conf"
+            want = "[Service]\nLimitMEMLOCK=infinity\n"
+            if not conf.exists() or conf.read_text() != want:
+                d.mkdir(exist_ok=True)
+                conf.write_text(want)
+                changed = True
+        except OSError as e:
+            log(f"Update: memlock drop-in for {u} failed: {e}")
     role = src / "myrmid-role.sh"
     dst = Path("/usr/local/sbin/myrmid-role")
     if role.is_file() and dst.exists() and dst.read_bytes() != role.read_bytes():
