@@ -1902,9 +1902,13 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
                 r["error"] = f"startet nicht (Code {proc.poll()})" + (f": {why}" if why else "")
             elif not stop():
                 say(f"{n}/{total}: {label} – misst …", n, total)
-                r.update(tune_bench(f"http://127.0.0.1:{port}", key))
+                # a variant much slower than the plan is not worth waiting for:
+                # three times the plan's time (at least 3 minutes), else 15 minutes
+                limit = max(180.0, 3 * base_secs[0]) if base_secs else 900.0
+                r.update(tune_bench(f"http://127.0.0.1:{port}", key, timeout=limit))
         except (OSError, SystemExit, ValueError) as e:
-            r["error"] = str(e)[:200] or "Messung fehlgeschlagen"
+            r["error"] = ("viel langsamer als der Plan, abgebrochen" if "timed out" in str(e).lower()
+                          else str(e)[:200] or "Messung fehlgeschlagen")
         finally:
             proc.terminate()
             try:
@@ -1917,7 +1921,10 @@ def autotune(base_cmd: list[str], key: str, port: int, progress=None, cancelled=
         log(f"Autotune {label}: " + (r.get("error") or f"{r['pp']} t/s prompt, {r['tg']} t/s answer, {r['secs']} s"))
         return r
 
+    base_secs: list[float] = []
     base = trial({})
+    if base and "secs" in base:
+        base_secs.append(base["secs"])
     if stop():
         raise RuntimeError("abgebrochen")
     best = base if base and "secs" in base else None
