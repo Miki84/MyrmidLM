@@ -1288,8 +1288,10 @@ function hostStats(x) {
   if (!st.host || x.asleep) return "";
   let gpus = st.gpus || [];
   if (x.slot != null && gpus[x.slot]) gpus = [gpus[x.slot]];
+  const ramPct = st.ram_total_mb ? 100 * st.ram_used_mb / st.ram_total_mb : null;
   return `<div class="host-stats">${gpus.map(gpuBlock).join("")}
-    ${meter("CPU", st.cpu_pct, nf(st.cpu_pct, 0) + " %" + tempText(st.cpu_temp_c))}</div>`;
+    ${meter("CPU", st.cpu_pct, nf(st.cpu_pct, 0) + " %" + tempText(st.cpu_temp_c))}
+    ${st.ram_total_mb ? meter("RAM", ramPct, `${gb(st.ram_used_mb)} / ${gb(st.ram_total_mb)}`, 90, 97) : ""}</div>`;
 }
 
 function renderHosts(s) {
