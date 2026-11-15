@@ -4576,7 +4576,12 @@ def update_activate(version: Optional[str] = None, *, rollback: bool = False) ->
         write_update_state(phase="activating", activating=version, error="")
         log(f"Update: {prev} -> {version}; restarting {', '.join(running) or 'nothing'}")
         _switch_link(version)
-        _install_units(dest)
+        # The units as the NEW release wants them: this code is still the old
+        # release's, so let the new one install them (falls back to ours).
+        r = subprocess.run([sys.executable, str(dest / "bin" / "myrmid"), "update", "install-units"],
+                           capture_output=True, text=True)
+        if r.returncode:
+            _install_units(dest)
         before = {u: _restarts(u) for u in running}
         if running:
             _systemctl("restart", *running)
@@ -4727,6 +4732,8 @@ def cmd_update(args) -> None:
                 print(f"Running {st.get('current')}; newest {st.get('latest') or '?'}; built {st.get('prepared') or '-'}")
         elif what == "apply-request":
             update_apply_request()
+        elif what == "install-units":
+            _install_units(Path(__file__).resolve().parent.parent)
     except UpdateError as e:
         die(str(e))
 
@@ -7877,7 +7884,8 @@ def main() -> None:
                                     "rollback: back to the previous release. auto [on|off]: the daily timer's "
                                     "run, or switch automatic updates on or off.")
     up.add_argument("what", nargs="?", default="status",
-                    choices=("status", "check", "prepare", "activate", "rollback", "auto", "apply-request"))
+                    choices=("status", "check", "prepare", "activate", "rollback", "auto", "apply-request",
+                             "install-units"))
     up.add_argument("version", nargs="?", help="release (e.g. 1.2.0); for auto: on or off")
     up.add_argument("--json", action="store_true")
     up.set_defaults(fn=cmd_update)
