@@ -5384,17 +5384,42 @@ class HostAgent:
             sp = self._plan(ns)
             if not current():
                 return
-            log(" ".join(sp.cmd).replace(self.key, "***"))
-            proc, tail = spawn_logged(sp.cmd)
-            with self.lock:
-                self.proc, self.model_path, self.ctx, self.estimate_tps = proc, path, ns.ctx, round(sp.estimate_tps, 1)
-                self.download = None
-            if _wait_healthy(f"http://127.0.0.1:{self.api_port}", proc, timeout=3600) and current():
-                self._set("ready")
-            elif current():
+            cmd = list(sp.cmd)
+            cache = None
+            if "--moe-cache-mib" in cmd:
+                try:
+                    cache = int(cmd[cmd.index("--moe-cache-mib") + 1])
+                except (ValueError, IndexError):
+                    cache = None
+            # The expert cache was measured with other settings (another KV
+            # cache type needs other buffers, e.g. q8_0 with flash attention
+            # converts K/V for long prompts): out of GPU memory at the start,
+            # so try it again with less cache before reporting an error.
+            for frac in (1.0, 0.75, 0.5):
+                if frac < 1.0:
+                    mib = int(cache * frac)
+                    if mib < MOE_CACHE_MIN_MB:
+                        break
+                    cmd[cmd.index("--moe-cache-mib") + 1] = str(mib)
+                    log(f"{self.label}: out of GPU memory, trying again with {mib} MiB expert cache")
+                log(" ".join(cmd).replace(self.key, "***"))
+                proc, tail = spawn_logged(cmd)
+                with self.lock:
+                    self.proc, self.model_path, self.ctx = proc, path, ns.ctx
+                    self.estimate_tps = round(sp.estimate_tps, 1)
+                    self.download = None
+                if _wait_healthy(f"http://127.0.0.1:{self.api_port}", proc, timeout=3600) and current():
+                    self._set("ready")
+                    break
+                if not current():
+                    break
                 why = server_error(tail)
+                if cache and "out of memory" in why.lower() and frac > 0.5:
+                    proc.wait()
+                    continue
                 self._set("error", f"llama-server startet nicht (Code {proc.poll()})" + (f": {why}" if why else
                                                                                        "; siehe Protokoll"))
+                break
         except (ModelError, PlanTooBig) as e:
             if current():
                 self._set("error", str(e))
