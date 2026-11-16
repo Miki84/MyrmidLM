@@ -702,6 +702,14 @@ def _gguf_model(kv: dict, sizes: dict[str, int], file_size: int, ctx: int, kv_ty
 #     shipping the scores is cheaper, so they don't cross the wire.
 
 GPU_RESERVE_MB = 400  # compute buffers per GPU, beyond weights and KV
+
+
+def compute_extra_mb(ub: int, ctx: int) -> float:
+    """Compute buffer on the main GPU beyond GPU_RESERVE_MB: it grows with the
+    batch (-ub) and, for attention over long prompts, with the context.
+    Measured (Qwen3.8-Flash-Next, 2x RTX A2000): -ub 2048 at 8k needs 1.2 GB,
+    -ub 1024 at 128k 1.4 GB; -ub 512 up to 32k fits in the base reserve."""
+    return max(0, ub - 512) * 0.55 + ub * 7.5e-6 * max(0, ctx - 32768)
 MTP_RESERVE_MB = 1300  # MTP: second context and draft buffers, on the output device
 HOST_RESERVE_MB = 768
 NET_MBPS_PC = 110.0  # 1 Gbit/s Ethernet
@@ -1315,6 +1323,10 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
             break
     budgets = [d.free_mb * GPU_SHARE - GPU_RESERVE_MB - (out_extra if d is out_gpu else 0)
                for d in local_gpus]
+    if budgets:  # llama.cpp's main GPU (the first) holds the compute buffers
+        tuned = {} if getattr(args, "no_tune", False) else tune_lookup(model, getattr(args, "tune_slot", ""))
+        ub = (tuned.get("flags") or {}).get("-ub") or getattr(args, "ub", None) or 512
+        budgets[0] -= compute_extra_mb(int(ub), int(args.ctx or 0))
     # A vision model's image part goes to llama.cpp's main GPU (the first),
     # with room to encode an image; without a GPU it costs RAM.
     proj = None if str(getattr(args, "mmproj", "auto")).lower() == "off" else find_mmproj(model)
@@ -5225,6 +5237,7 @@ class HostAgent:
         self.model_path: Optional[Path] = None
         self.ctx: Optional[int] = None
         self.estimate_tps: Optional[float] = None
+        self.note = ""  # e.g. the context was shortened to fit
         self.download: Optional[dict] = None  # files being fetched, for the progress
         self.job = 0  # a newer assignment makes older jobs stop
         self.restarts = 0
@@ -5322,6 +5335,7 @@ class HostAgent:
                   "gpu": f"{self.gpu.name} {self.gpu.description}" if self.gpu else None,
                   "assignment": self.assignment, "model": self.model_path.stem if self.model_path else None,
                   "ctx": self.ctx, "estimate_tps": self.estimate_tps, "api_port": self.args.api_port,
+                  "note": self.note if self.state == "ready" else "",
                   "progress": self._progress() if self.state == "downloading" else None,
                   "mac": self.mac, "bcast": self.bcast,
                   "can_sleep": os.geteuid() == 0 or Path("/etc/systemd/system/myrmid-suspend.path").exists(),
@@ -5448,52 +5462,98 @@ class HostAgent:
             if not current():
                 return
             self._set("loading")
-            ns = self._ns(path, a)
-            sp = self._plan(ns)
-            if not current():
-                return
-            cmd = list(sp.cmd)
-            cache = None
-            if "--moe-cache-mib" in cmd:
-                try:
-                    cache = int(cmd[cmd.index("--moe-cache-mib") + 1])
-                except (ValueError, IndexError):
-                    cache = None
-            # The expert cache was measured with other settings (another KV
-            # cache type needs other buffers, e.g. q8_0 with flash attention
-            # converts K/V for long prompts): out of GPU memory at the start,
-            # so try it again with less cache before reporting an error.
-            for frac in (1.0, 0.75, 0.5):
-                if frac < 1.0:
-                    mib = int(cache * frac)
-                    if mib < MOE_CACHE_MIN_MB:
-                        break
-                    cmd[cmd.index("--moe-cache-mib") + 1] = str(mib)
-                    log(f"{self.label}: out of GPU memory, trying again with {mib} MiB expert cache")
-                log(" ".join(cmd).replace(self.key, "***"))
-                proc, tail = spawn_logged(cmd)
-                with self.lock:
-                    self.proc, self.model_path, self.ctx = proc, path, ns.ctx
-                    self.estimate_tps = round(sp.estimate_tps, 1)
-                    self.download = None
-                if _wait_healthy(f"http://127.0.0.1:{self.api_port}", proc, timeout=3600) and current():
-                    self._set("ready")
-                    break
-                if not current():
-                    break
-                why = server_error(tail)
-                if cache and "out of memory" in why.lower() and frac > 0.5:
-                    proc.wait()
-                    continue
-                self._set("error", f"llama-server startet nicht (Code {proc.poll()})" + (f": {why}" if why else
-                                                                                       "; siehe Protokoll"))
-                break
+            self._start_fitting(path, a, current)
         except (ModelError, PlanTooBig) as e:
             if current():
                 self._set("error", str(e))
         except Exception as e:  # noqa: BLE001 - report it to the master instead of dying
             if current():
                 self._set("error", f"{type(e).__name__}: {e}")
+
+    def _start_fitting(self, path: Path, a: dict, current) -> None:
+        """Plans and starts llama-server. Out of GPU memory at the start (the
+        compute buffers outgrew the plan, or the expert cache was measured with
+        other settings): less expert cache, a smaller batch, then a shorter
+        context, a set one too; better the model with less context than none
+        (the card says so)."""
+        asked = parse_ctx(a.get("ctx"))
+        ctxs: list[Optional[int]] = [asked]
+        c = asked
+        while c and c > 8192:
+            c = max(8192, (c * 3 // 4) // 1024 * 1024)
+            ctxs.append(c)
+        small_ub = False
+        last_err = ""
+        for n, want in enumerate(ctxs):
+            ns = self._ns(path, {**a, "ctx": want})
+            try:
+                sp = self._plan(ns)
+            except PlanTooBig as e:
+                last_err = str(e)
+                if want is None or want == ctxs[-1]:
+                    raise
+                continue
+            if not current():
+                return
+            base = list(sp.cmd)
+            if small_ub and "-ub" in base:
+                base[base.index("-ub") + 1] = "512"
+            tries = [base]
+            cache = None
+            if "--moe-cache-mib" in base:
+                try:
+                    cache = int(base[base.index("--moe-cache-mib") + 1])
+                except (ValueError, IndexError):
+                    cache = None
+            fracs = (0.75, 0.5) if n == 0 else (0.5,)
+            for frac in fracs if cache else ():
+                if int(cache * frac) >= MOE_CACHE_MIN_MB:
+                    t = list(base)
+                    t[t.index("--moe-cache-mib") + 1] = str(int(cache * frac))
+                    tries.append(t)
+            ub = int(base[base.index("-ub") + 1]) if "-ub" in base and base[base.index("-ub") + 1].isdigit() else 512
+            if ub > 512:
+                t = list(tries[-1])
+                t[t.index("-ub") + 1] = "512"
+                tries.append(t)
+            for i, cmd in enumerate(tries):
+                if i or n:
+                    log(f"{self.label}: out of GPU memory, trying again"
+                        + (f" with -c {ns.ctx}" if n else "")
+                        + (f", {cmd[cmd.index('--moe-cache-mib') + 1]} MiB expert cache" if "--moe-cache-mib" in cmd else "")
+                        + (", -ub 512" if "-ub" in cmd and cmd[cmd.index("-ub") + 1] == "512" else ""))
+                log(" ".join(cmd).replace(self.key, "***"))
+                proc, tail = spawn_logged(cmd)
+                with self.lock:
+                    self.proc, self.model_path, self.ctx = proc, path, ns.ctx
+                    self.estimate_tps = round(sp.estimate_tps, 1)
+                    self.download = None
+                    self.note = ""
+                if _wait_healthy(f"http://127.0.0.1:{self.api_port}", proc, timeout=3600) and current():
+                    if asked and ns.ctx and ns.ctx < asked:
+                        with self.lock:
+                            de = lambda v: f"{v:,}".replace(",", ".")  # noqa: E731
+                            self.note = f"Kontext {de(asked)} passte nicht in den GPU-Speicher, geladen mit {de(ns.ctx)}."
+                        log(f"{self.label}: -c {asked} didn't fit, running with -c {ns.ctx}")
+                    self._set("ready")
+                    return
+                if not current():
+                    return
+                why = server_error(tail)
+                proc.wait()
+                if "out of memory" not in why.lower():
+                    self._set("error", f"llama-server startet nicht (Code {proc.poll()})"
+                              + (f": {why}" if why else "; siehe Protokoll"))
+                    return
+                last_err = f"llama-server startet nicht (Code {proc.poll()}): {why}"
+                if "-ub" in cmd and cmd[cmd.index("-ub") + 1] == "512":
+                    small_ub = True
+            if want is None and ns.ctx and ns.ctx > 8192 and len(ctxs) == 1:
+                c = ns.ctx  # automatic context: shorter than the planner's choice
+                while c > 8192:
+                    c = max(8192, (c * 3 // 4) // 1024 * 1024)
+                    ctxs.append(c)
+        self._set("error", last_err or "llama-server startet nicht")
 
     def _ns(self, path: Path, a: dict, no_tune: bool = False) -> argparse.Namespace:
         return argparse.Namespace(model=str(path), ctx=a.get("ctx"), kv=a.get("kv") or "f16", mtp=0, workers="off",
@@ -6984,12 +7044,15 @@ class HostManager:
                     continue
                 with self.lock:
                     h.update(status=st, seen=time.time(), error="", asleep=st.get("state") == "asleep",
-                             pc=st.get("pc") or hid)
+                             pc=st.get("pc") or hid, fails=0)
                 self.known.note(hid, "host", h["name"], h["addr"], {**st, "port": h["port"], "path": h.get("path", "")})
                 self._prune(st)
             except Exception as e:  # noqa: BLE001
                 with self.lock:
-                    if hid in self.known.machines:
+                    h["fails"] = h.get("fails", 0) + 1
+                    if hid in self.known.machines and h["fails"] < 3 and not h.get("asleep"):
+                        pass  # one slow answer (busy loading, nvidia-smi hanging) isn't sleep yet
+                    elif hid in self.known.machines:
                         h["asleep"] = True  # off or asleep: it can be woken
                         h["error"] = ""
                     else:
@@ -7264,7 +7327,8 @@ class HostManager:
                               "pc": h.get("pc"), "path": h.get("path") or "",
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
-                                                       "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned")},
+                                                       "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned",
+                                                       "note")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]

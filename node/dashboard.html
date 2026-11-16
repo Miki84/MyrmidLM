@@ -1346,7 +1346,7 @@ function renderHosts(s) {
     return `<article class="host" data-id="${esc(x.id)}">
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${x.gpu ? " · " + esc(x.gpu) : gpus ? " · " + gpus : ""}</div></div>
         <div class="pill"><span class="dot ${cls}"></span><span>${txt}</span></div></div>
-      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${hostStats(x)}${layoutRow}${sleepRow}${maintRow}${roleRow}
+      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${x.note ? `<div class="note">${esc(x.note)}</div>` : ""}${hostStats(x)}${layoutRow}${sleepRow}${maintRow}${roleRow}
       ${x.state === "ready" || x.state === "tuning" || x.tuned || x.tune_job ? `<div class="kv"><span class="note">${esc(tuneText(x.tune_job, x.tuned) || "Autotune: misst die schnellsten Einstellungen für dieses Modell auf diesem PC.")}</span>${
         x.tune_job && x.tune_job.state === "running" ? `<button class="btn quiet small" type="button" data-htune="cancel">Abbrechen</button>`
         : x.state === "ready" ? `<button class="btn quiet small" type="button" data-htune="start">${x.tuned ? "Autotune erneut" : "Autotune"}</button>${x.tuned ? `<button class="btn quiet small" type="button" data-htune="reset">Verwerfen</button>` : ""}` : ""}</div>` : ""}
