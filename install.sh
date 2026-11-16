@@ -1146,6 +1146,17 @@ Steuerung:  Rolle, Modelle und Updates im Dashboard des Masters" "Einrichten" "A
         install_static_units myrmid-suspend.path myrmid-suspend.service myrmid-role.path myrmid-role.service
         srun install -m 755 "$PREFIX/current/systemd/myrmid-role.sh" /usr/local/sbin/myrmid-role
         srun systemctl enable --now myrmid-suspend.path myrmid-role.path
+        # Volle CPU-Taktung: die CPU rechnet bei MoE-Modellen die Experten im RAM,
+        # Energiesparen kostet dort Tempo. Auf Laptops (Akku) standardmäßig aus.
+        if ls /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor >/dev/null 2>&1; then
+            install_static_units myrmid-cpu-performance.service
+            def=j; ls /sys/class/power_supply/BAT* >/dev/null 2>&1 && def=n
+            if systemctl is-enabled --quiet myrmid-cpu-performance 2>/dev/null \
+                || ask_yn "CPU immer mit vollem Takt laufen lassen (schneller bei Modellen im RAM, etwas mehr Strom im Leerlauf)?" "$def"; then
+                srun systemctl enable --now myrmid-cpu-performance
+                ok "CPU-Takt: performance (aus: sudo systemctl disable --now myrmid-cpu-performance)"
+            fi
+        fi
     fi
 
     if [[ $SERVICE -eq 1 ]]; then

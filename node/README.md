@@ -162,6 +162,10 @@ myrmid serve -m gross.gguf --assign "pc2=qwen3-32b,name=qwen32" --assign "pc3=qw
 
 **Reasoning-Stufen:** Schickt ein Client eine Stufe, die das Chat-Template des Modells nicht kennt (z. B. Hermes `reasoning_effort: minimal`, Qwen3.8 kennt nur low, medium und xhigh), wiederholt der Router die Anfrage mit der nächstliegenden erlaubten Stufe und merkt sich das für diesen Host.
 
+**Host entfernen:** „Entfernen“ in der Host-Karte (gilt für den ganzen PC) entlädt sein Modell, wenn er erreichbar ist, und der Master vergisst ihn samt Zuweisung und Einstellungen. Taucht der PC wieder im Netz auf, nimmt der Master ihn nicht von selbst auf; unter der Host-Liste steht er bei „Entfernte Hosts“ mit „Wieder aufnehmen“. Ganz weg ist er erst, wenn MyrmidLM auf dem PC deinstalliert ist.
+
+**CPU-Takt:** Auf Workern und Hosts fragt der Installer, ob die CPU immer mit vollem Takt laufen soll (`myrmid-cpu-performance.service`, Governor „performance“). Bei MoE-Modellen rechnet die CPU die Experten im RAM, Energiesparen kostet dort Tempo. Nachträglich: `sudo systemctl enable --now myrmid-cpu-performance` (ab 2.4.0 liegt der Dienst nach einem Update bereit), aus mit `disable --now`.
+
 **Wartungsmodus:** Ein Knopf in jeder Host-Karte nimmt den PC aus dem Routing (bei mehreren GPUs alle seine Hosts). Der Router schickt ihm nichts, weckt ihn nicht und legt ihn nicht schlafen; „Aufwecken“ von Hand geht weiter. Gedacht für PCs, die länger aus sind oder an denen gearbeitet wird. Die Einstellung bleibt über Neustarts des Masters erhalten.
 
 Hosts legen sich nach `--host-sleep MIN` Minuten ohne Anfrage schlafen (pro Host im Dashboard einstellbar, 0 = nie): Der Master sagt es dem Host, der beendet llama-server und geht in Standby, über `myrmid-suspend.path`/`.service` (kleine Root-Units, das Installationsskript richtet sie ein). Nach dem Aufwachen lädt der Host sein Modell von selbst wieder. Worker im Plan bleiben wach. Das Installationsskript schaltet Wake-on-LAN auf der Netzwerkkarte ein (ethtool, dauerhaft über NetworkManager oder `myrmid-wol.service`); im BIOS muss es ebenfalls an sein.

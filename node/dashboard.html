@@ -461,6 +461,7 @@
     <div class="panel-head"><h2 id="hosts-title">Hosts</h2><span class="muted" id="hosts-sub"></span></div>
     <p class="note" id="hosts-note"></p>
     <div class="hosts" id="hosts"></div>
+    <div class="kv" id="hosts-removed" style="margin-top: 10px"></div>
     <datalist id="model-list"></datalist>
   </section>
 
@@ -1307,6 +1308,10 @@ function renderHosts(s) {
     ? "Hosts brauchen einen API-Key auf dem Master (er ist ihr Cluster-Schlüssel)."
     : list.length ? "Jeder Host lädt ein ganzes Modell auf seine eigenen GPUs; ein PC mit mehreren GPUs kann auch jeder GPU ein eigenes Modell geben. Hosts mit demselben Namen für Clients teilen sich die Anfragen, verschiedene Namen sind getrennte Modelle. Rolle „groß“ und „schnell“ nutzt der Router auch ohne Namen."
     : "Noch keine Hosts gefunden. Auf einem PC mit GPU das Installationsskript mit der Rolle „Host“ starten; dieser Master nimmt ihn dann automatisch auf.";
+  const rem = h.removed || [];
+  const remHtml = rem.length ? `<span class="note">Entfernte Hosts (werden nicht aufgenommen):</span>` + rem.map((r) =>
+    `<span>${esc(r.name)}${r.addr ? ` <span class="note">${esc(r.addr)}</span>` : ""} <button class="btn quiet small" type="button" data-hrestore="${esc(r.pc)}">Wieder aufnehmen</button></span>`).join("") : "";
+  if ($("hosts-removed").dataset.sig !== remHtml) { $("hosts-removed").innerHTML = remHtml; $("hosts-removed").dataset.sig = remHtml; }
   const focused = document.activeElement && document.activeElement.closest(".host");
   if (focused) return;  // don't rebuild the form someone is typing in
   $("hosts").innerHTML = list.map((x) => {
@@ -1336,7 +1341,7 @@ function renderHosts(s) {
       : "";
     const maintRow = `<div class="kv">${x.maintenance
         ? `<span class="note">Wartung: nicht im Routing, wird weder geweckt noch schlafen gelegt.</span><button class="btn quiet small" type="button" data-hmaint="off">Wartung beenden</button>`
-        : `<button class="btn quiet small" type="button" data-hmaint="on" title="Aus dem Routing nehmen, z. B. wenn der PC aus ist">Wartungsmodus</button>`}</div>`;
+        : `<button class="btn quiet small" type="button" data-hmaint="on" title="Aus dem Routing nehmen, z. B. wenn der PC aus ist">Wartungsmodus</button>`}<button class="btn quiet small" type="button" data-hremove="${esc(x.name)}" title="Den PC aus MyrmidLM entfernen, z. B. wenn es ihn nicht mehr gibt">Entfernen</button></div>`;
     const sleepRow = x.maintenance ? "" : x.asleep
       ? `<div class="kv"><span>${x.waking ? "Wird geweckt, lädt danach sein Modell …" : "Schläft. Eine Anfrage an sein Modell weckt ihn."}</span>${x.wakeable && !x.waking ? `<button class="btn quiet small" type="button" data-hwake>Aufwecken</button>` : ""}</div>`
       : `<div class="kv"><label class="inline">Schlafen nach <input name="sleep_min" class="mini" inputmode="numeric" value="${esc(String(e.sleep_min ?? x.sleep_min ?? 0))}"> Min. ohne Anfrage (0 = nie)</label>${x.can_sleep && x.state === "ready" ? `<button class="btn quiet small" type="button" data-hsleep>${x.slot != null ? "PC jetzt schlafen legen" : "Jetzt schlafen"}</button>` : ""}</div>
@@ -1390,6 +1395,12 @@ $("hosts").addEventListener("click", (ev) => {
     if (act === "start" && !confirm("Autotune auf diesem Host starten? Sein Modell steht währenddessen nicht zur Verfügung (5 bis 30 Minuten).")) return;
     ev.target.disabled = true; hostAction({ host: card.dataset.id, tune: act });
   }
+  if (ev.target.matches("[data-hremove]")) {
+    const name = ev.target.dataset.hremove || "diesen Host";
+    if (confirm(`${name} entfernen?\n\nSein Modell wird entladen (wenn er erreichbar ist), und der Master vergisst ihn mit Zuweisung und Einstellungen. Taucht der PC wieder im Netz auf, wird er nicht automatisch aufgenommen; unten unter „Entfernte Hosts“ lässt er sich wieder aufnehmen.\n\nGilt für den ganzen PC (alle GPUs).`)) {
+      ev.target.disabled = true; hostAction({ host: card.dataset.id, remove: true });
+    }
+  }
   if (ev.target.matches("[data-hmaint]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, maintenance: ev.target.dataset.hmaint === "on" }); }
   if (ev.target.matches("[data-hwake]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, wake: true }); }
   if (ev.target.matches("[data-hsleep]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, sleep: true }); }
@@ -1401,6 +1412,10 @@ $("hosts").addEventListener("click", (ev) => {
       : "Ein Modell über alle GPUs dieses PCs. Die Modelle der einzelnen GPUs stoppen; das Modell von GPU 0 wird über alle GPUs neu geladen.";
     if (confirm(msg)) { lay.disabled = true; hostAction({ host: card.dataset.id, layout: lay.dataset.layout }); }
   }
+});
+$("hosts-removed").addEventListener("click", (ev) => {
+  const pc = ev.target.dataset && ev.target.dataset.hrestore; if (!pc) return;
+  ev.target.disabled = true; hostAction({ restore: pc });
 });
 $("hosts").addEventListener("change", (ev) => {
   if (ev.target.name !== "sleep_min") return;

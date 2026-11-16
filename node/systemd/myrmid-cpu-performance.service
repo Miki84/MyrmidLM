@@ -1,0 +1,13 @@
+[Unit]
+Description=MyrmidLM: CPU at full clock for inference (governor "performance")
+# The installer asks for it on workers and hosts. Off again:
+#   sudo systemctl disable --now myrmid-cpu-performance
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo performance > "$g"; done; true'
+ExecStop=/bin/sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do for x in schedutil ondemand powersave; do echo $x > "$g" 2>/dev/null && break; done; done; true'
+
+[Install]
+WantedBy=multi-user.target

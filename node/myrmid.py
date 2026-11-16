@@ -4593,7 +4593,10 @@ def _install_units(release: Path) -> None:
             continue
         dst = UNIT_DIR / f.name
         is_update = f.name.startswith("myrmid-update")
-        if not (is_update or dst.exists()):
+        # full CPU clock: available on workers and hosts (enabled by the installer, or by hand)
+        offer = f.stem == "myrmid-cpu-performance" and any((UNIT_DIR / f"myrmid-{r}.service").exists()
+                                                          for r in ("host", "worker"))
+        if not (is_update or offer or dst.exists()):
             continue  # not set up on this PC (e.g. sleep on a master)
         if not dst.exists() or dst.read_bytes() != f.read_bytes():
             shutil.copyfile(f, dst)
@@ -6923,6 +6926,7 @@ class HostManager:
         self.hosts: dict[str, dict] = {}  # id -> addr, port, name, status, seen, error
         self.assign: dict[str, Optional[dict]] = {}  # id -> wanted assignment (None: unload)
         self.maint: set[str] = set()  # PCs in maintenance (dashboard): out of the routing
+        self.removed: dict[str, dict] = {}  # PCs removed in the dashboard: not taken in again
         self.pending_cli = [self._parse_assign(x) for x in (args.assign or [])]
         self.extra = []
         for ep in (args.hosts or "").split(","):
@@ -6934,11 +6938,13 @@ class HostManager:
             saved = json.loads(HOSTS_STATE.read_text())
             self.assign, self.sleep_min = saved.get("assign", {}), saved.get("sleep", {})
             self.maint = set(saved.get("maint") or [])
+            self.removed = dict(saved.get("removed") or {})
         except (OSError, ValueError):
             pass
         # hosts seen before that are off or asleep now: listed, and woken on demand
         for mid, rec in self.known.machines.items():
-            if rec.get("kind") == "host" and rec.get("ip") and rec.get("port"):
+            if rec.get("kind") == "host" and rec.get("ip") and rec.get("port") and \
+                    (rec.get("pc") or mid) not in self.removed:
                 self.hosts[mid] = {"addr": rec["ip"], "port": int(rec["port"]), "path": rec.get("path") or "",
                                    "name": rec.get("name", rec["ip"]), "status": {}, "seen": 0, "error": "",
                                    "asleep": True, "pc": rec.get("pc") or mid}
@@ -6970,7 +6976,8 @@ class HostManager:
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             HOSTS_STATE.write_text(json.dumps({"assign": self.assign, "sleep": self.sleep_min,
-                                               "maint": sorted(getattr(self, "maint", set()))}))
+                                               "maint": sorted(getattr(self, "maint", set())),
+                                               "removed": getattr(self, "removed", {})}))
         except OSError as e:
             log(f"Hosts: could not save the assignments ({e})")
 
@@ -7007,6 +7014,8 @@ class HostManager:
                 continue
             if root.get("state") == "pairing":
                 continue  # waits for its key (the pairer gives it this master's)
+            if (root.get("pc") or root.get("id")) in self.removed:
+                continue  # removed in the dashboard: only "Wieder aufnehmen" brings it back
             for slot in root.get("slots") or [{"id": root["id"], "path": ""}]:
                 if slot["id"] in self.hosts and not self.hosts[slot["id"]].get("asleep"):
                     continue
@@ -7115,6 +7124,45 @@ class HostManager:
             log(f"Host {h['name']}: {path.strip('/')}" + (f" {body['model']}" if body.get("model") else ""))
         except Exception as e:  # noqa: BLE001
             h["error"] = f"{path}: {e}"[:160]
+
+    def remove(self, hid: str) -> dict:
+        """The dashboard: a PC that is gone or no longer wanted. Its hosts
+        unload their models (if they answer), and the master forgets them,
+        their assignments and settings, and doesn't take the PC in again when
+        it shows up, until "Wieder aufnehmen"."""
+        h = self.hosts.get(hid) or {}
+        pc = h.get("pc") or hid
+        with self.lock:
+            mine = [x for x, y in self.hosts.items() if (y.get("pc") or x) == pc]
+        for x in mine:
+            if not self.hosts[x].get("asleep"):
+                try:
+                    self._call(self.hosts[x], "/unload", {}, timeout=5)
+                except Exception:  # noqa: BLE001 - off, or gone: forget it anyway
+                    pass
+        with self.lock:
+            name = (h.get("status") or {}).get("host") or h.get("name") or pc
+            self.removed[pc] = {"name": str(name).split(" · ")[0], "addr": h.get("addr", ""), "at": int(time.time())}
+            for x in mine:
+                self.hosts.pop(x, None)
+                self.assign.pop(x, None)
+                self.sleep_min.pop(x, None)
+                self.pushed.pop(x, None)
+                self.known.forget(x)
+            self.maint.discard(pc)
+        log(f"Host {name}: removed from the dashboard")
+        self.save()
+        self.update_router()
+        return self.info()
+
+    def restore(self, pc: str) -> dict:
+        with self.lock:
+            rec = self.removed.pop(pc, None)
+        if rec:
+            log(f"Host {rec.get('name')}: taken in again")
+            self.save()
+            self.rescan, self.last_scan = True, 0
+        return self.info()
 
     def in_maint(self, hid: str) -> bool:
         """Maintenance (dashboard): the PC is out of the routing, not woken
@@ -7244,9 +7292,13 @@ class HostManager:
     def api(self, body: dict) -> dict:
         import threading
 
+        if body.get("restore"):
+            return self.restore(str(body["restore"]))
         hid = str(body.get("host") or "")
         if hid not in self.hosts:
             return {"error": "unknown host"}
+        if body.get("remove"):
+            return self.remove(hid)
         if "maintenance" in body:
             key = self.hosts[hid].get("pc") or hid
             if not hasattr(self, "maint"):
@@ -7349,6 +7401,7 @@ class HostManager:
                 elif h.get("asleep"):
                     hosts[-1]["state"] = "asleep"
         return {"hosts": sorted(hosts, key=lambda x: x["name"]),
+                "removed": [{"pc": pc, **r} for pc, r in sorted(self.removed.items(), key=lambda x: x[1].get("name", ""))],
                 "catalog": [{"key": k, "desc": d} for k, _r, _q, d in CATALOG]}
 
 
