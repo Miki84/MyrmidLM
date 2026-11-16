@@ -6783,6 +6783,7 @@ class HostManager:
         self.lock = threading.RLock()
         self.hosts: dict[str, dict] = {}  # id -> addr, port, name, status, seen, error
         self.assign: dict[str, Optional[dict]] = {}  # id -> wanted assignment (None: unload)
+        self.maint: set[str] = set()  # PCs in maintenance (dashboard): out of the routing
         self.pending_cli = [self._parse_assign(x) for x in (args.assign or [])]
         self.extra = []
         for ep in (args.hosts or "").split(","):
@@ -6793,6 +6794,7 @@ class HostManager:
         try:
             saved = json.loads(HOSTS_STATE.read_text())
             self.assign, self.sleep_min = saved.get("assign", {}), saved.get("sleep", {})
+            self.maint = set(saved.get("maint") or [])
         except (OSError, ValueError):
             pass
         # hosts seen before that are off or asleep now: listed, and woken on demand
@@ -6828,7 +6830,8 @@ class HostManager:
     def save(self) -> None:
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            HOSTS_STATE.write_text(json.dumps({"assign": self.assign, "sleep": self.sleep_min}))
+            HOSTS_STATE.write_text(json.dumps({"assign": self.assign, "sleep": self.sleep_min,
+                                               "maint": sorted(getattr(self, "maint", set()))}))
         except OSError as e:
             log(f"Hosts: could not save the assignments ({e})")
 
@@ -6971,10 +6974,18 @@ class HostManager:
         except Exception as e:  # noqa: BLE001
             h["error"] = f"{path}: {e}"[:160]
 
+    def in_maint(self, hid: str) -> bool:
+        """Maintenance (dashboard): the PC is out of the routing, not woken
+        and not put to sleep, e.g. while it is off or being worked on."""
+        h = self.hosts.get(hid) or {}
+        return (h.get("pc") or hid) in getattr(self, "maint", set())
+
     def update_router(self) -> None:
         backends = []
         with self.lock:
             for hid, h in self.hosts.items():
+                if self.in_maint(hid):
+                    continue
                 st = h.get("status") or {}
                 rec = self.known.machines.get(hid, {})
                 if h.get("asleep") and h["addr"] in self.worker_ips:
@@ -7007,6 +7018,8 @@ class HostManager:
         """Hosts with a sleep time that had no request for that long go to sleep."""
         now = time.time()
         for hid, h in list(self.hosts.items()):
+            if self.in_maint(hid):
+                continue
             st = h.get("status") or {}
             mins = int(self.sleep_min.get(hid, self.args.host_sleep or 0) or 0)
             served = sum(b.served for b in self.router.backends if b.source == hid)
@@ -7092,6 +7105,19 @@ class HostManager:
         hid = str(body.get("host") or "")
         if hid not in self.hosts:
             return {"error": "unknown host"}
+        if "maintenance" in body:
+            key = self.hosts[hid].get("pc") or hid
+            if not hasattr(self, "maint"):
+                self.maint = set()
+            if body["maintenance"]:
+                self.maint.add(key)
+            else:
+                self.maint.discard(key)
+                self.last_active[hid] = time.time()  # the sleep timer starts afresh
+            log(f"Host {self.hosts[hid]['name']}: maintenance {'on' if body['maintenance'] else 'off'}")
+            self.save()
+            self.update_router()
+            return self.info()
         if body.get("wake"):
             self.wake(hid, force=True)
             return self.info()
@@ -7167,6 +7193,7 @@ class HostManager:
                               "asleep": bool(h.get("asleep")), "wakeable": hid in self.known.machines,
                               "waking": self.known.recently_woken(hid),
                               "sleep_min": int(self.sleep_min.get(hid, self.args.host_sleep or 0) or 0),
+                              "maintenance": self.in_maint(hid),
                               "can_sleep": bool((h.get("status") or {}).get("can_sleep")),
                               "switchable": bool((h.get("status") or {}).get("switchable")),
                               "pc": h.get("pc"), "path": h.get("path") or "",

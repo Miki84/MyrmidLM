@@ -1310,7 +1310,7 @@ function renderHosts(s) {
   const focused = document.activeElement && document.activeElement.closest(".host");
   if (focused) return;  // don't rebuild the form someone is typing in
   $("hosts").innerHTML = list.map((x) => {
-    const [cls, txt] = HOST_STATE[x.state] || ["", x.state || "–"];
+    const [cls, txt] = x.maintenance ? ["warn", "Wartung"] : HOST_STATE[x.state] || ["", x.state || "–"];
     const st = x.stats || {}, gpus = (st.gpus || []).map((g) => `${esc(g.name)} (${gb(g.mem_total_mb)})`).join(", ");
     const a = x.assignment || {}, e = hostEdits[x.id] || {};
     const val = (k, d) => esc(e[k] ?? a[k] ?? d ?? "");
@@ -1334,7 +1334,10 @@ function renderHosts(s) {
     const roleRow = x.switchable && !x.asleep
       ? `<div class="role-row"><span class="muted">Rolle: Host</span><button class="btn quiet small" type="button" data-role-ctl="${esc(x.addr)}" data-role="worker">Zum Worker machen</button></div>`
       : "";
-    const sleepRow = x.asleep
+    const maintRow = `<div class="kv">${x.maintenance
+        ? `<span class="note">Wartung: nicht im Routing, wird weder geweckt noch schlafen gelegt.</span><button class="btn quiet small" type="button" data-hmaint="off">Wartung beenden</button>`
+        : `<button class="btn quiet small" type="button" data-hmaint="on" title="Aus dem Routing nehmen, z. B. wenn der PC aus ist">Wartungsmodus</button>`}</div>`;
+    const sleepRow = x.maintenance ? "" : x.asleep
       ? `<div class="kv"><span>${x.waking ? "Wird geweckt, lädt danach sein Modell …" : "Schläft. Eine Anfrage an sein Modell weckt ihn."}</span>${x.wakeable && !x.waking ? `<button class="btn quiet small" type="button" data-hwake>Aufwecken</button>` : ""}</div>`
       : `<div class="kv"><label class="inline">Schlafen nach <input name="sleep_min" class="mini" inputmode="numeric" value="${esc(String(e.sleep_min ?? x.sleep_min ?? 0))}"> Min. ohne Anfrage (0 = nie)</label>${x.can_sleep && x.state === "ready" ? `<button class="btn quiet small" type="button" data-hsleep>${x.slot != null ? "PC jetzt schlafen legen" : "Jetzt schlafen"}</button>` : ""}</div>
          ${x.slot != null && x.sleep_min ? `<div class="note">Der PC schläft erst, wenn alle seine GPUs so lange keine Anfrage hatten.</div>` : ""}
@@ -1343,7 +1346,7 @@ function renderHosts(s) {
     return `<article class="host" data-id="${esc(x.id)}">
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${x.gpu ? " · " + esc(x.gpu) : gpus ? " · " + gpus : ""}</div></div>
         <div class="pill"><span class="dot ${cls}"></span><span>${txt}</span></div></div>
-      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${hostStats(x)}${layoutRow}${sleepRow}${roleRow}
+      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${hostStats(x)}${layoutRow}${sleepRow}${maintRow}${roleRow}
       ${x.state === "ready" || x.state === "tuning" || x.tuned || x.tune_job ? `<div class="kv"><span class="note">${esc(tuneText(x.tune_job, x.tuned) || "Autotune: misst die schnellsten Einstellungen für dieses Modell auf diesem PC.")}</span>${
         x.tune_job && x.tune_job.state === "running" ? `<button class="btn quiet small" type="button" data-htune="cancel">Abbrechen</button>`
         : x.state === "ready" ? `<button class="btn quiet small" type="button" data-htune="start">${x.tuned ? "Autotune erneut" : "Autotune"}</button>${x.tuned ? `<button class="btn quiet small" type="button" data-htune="reset">Verwerfen</button>` : ""}` : ""}</div>` : ""}
@@ -1387,6 +1390,7 @@ $("hosts").addEventListener("click", (ev) => {
     if (act === "start" && !confirm("Autotune auf diesem Host starten? Sein Modell steht währenddessen nicht zur Verfügung (5 bis 30 Minuten).")) return;
     ev.target.disabled = true; hostAction({ host: card.dataset.id, tune: act });
   }
+  if (ev.target.matches("[data-hmaint]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, maintenance: ev.target.dataset.hmaint === "on" }); }
   if (ev.target.matches("[data-hwake]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, wake: true }); }
   if (ev.target.matches("[data-hsleep]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, sleep: true }); }
   const lay = ev.target.closest("[data-layout]");
