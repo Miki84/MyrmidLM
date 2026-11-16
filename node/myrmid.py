@@ -1166,6 +1166,50 @@ CTX_STATE = CONFIG_DIR / "ctx.json"  # the context chosen in the dashboard
 CTX_CHOICES = (8192, 16384, 32768, 65536, 131072)
 
 
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def effort_of(raw: Optional[bytes]) -> str:
+    try:
+        return str(json.loads(raw).get("reasoning_effort") or "")
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
+def effort_instead(sent: str, error: str) -> str:
+    """The level nearest to the one sent that the error names as supported
+    ("Supported types are xhigh (default), medium, and low"), lower on a tie;
+    "" (leave it out) when the error doesn't say."""
+    if "reasoning" not in error.lower() or "effort" not in error.lower():
+        return sent
+    m = re.search(r"[Ss]upported[^:.\n]*?(?:are|:)\s*([^.\n\"]+)", error)
+    ok = [w for w in re.findall(r"[a-z]+", m.group(1).lower()) if w in EFFORTS] if m else []
+    if not ok:
+        return ""
+    if sent not in EFFORTS:
+        return ok[0]
+    i = EFFORTS.index(sent)
+    return min(ok, key=lambda w: (abs(EFFORTS.index(w) - i), EFFORTS.index(w)))
+
+
+def fix_effort(raw: Optional[bytes], efforts: dict) -> Optional[bytes]:
+    """The request with reasoning_effort replaced as learned for this backend."""
+    if not raw or not efforts or b"reasoning_effort" not in raw:
+        return raw
+    try:
+        body = json.loads(raw)
+        sent = str(body.get("reasoning_effort") or "")
+        if sent not in efforts:
+            return raw
+        if efforts[sent]:
+            body["reasoning_effort"] = efforts[sent]
+        else:
+            body.pop("reasoning_effort", None)
+        return json.dumps(body).encode()
+    except (ValueError, TypeError, AttributeError):
+        return raw
+
+
 def parse_ctx(v) -> Optional[int]:
     """A context typed in the dashboard: "65536", "65.536", "65 536", "64k".
     None (automatic) for anything else."""
@@ -5929,6 +5973,7 @@ class Backend:
     tps: float = 0.0  # measured on requests it ran alone (moving average)
     upstream_model: str = ""  # external server: the model name it wants in requests
     vision: Optional[bool] = None  # reads images (from the server's /props; None: not known yet)
+    efforts: dict = field(default_factory=dict)  # reasoning_effort a client sends -> one its template takes
 
     @property
     def speed(self) -> float:
@@ -6683,6 +6728,7 @@ class Router:
                 self._forward(backend, "POST", raw, reason)
 
             def _forward(self, backend: Backend, method: str, raw: Optional[bytes], reason: str) -> None:
+                raw = fix_effort(raw, backend.efforts)
                 u = urlsplit(backend.base)
                 conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
                 conn = conn_cls(u.hostname, u.port or (443 if u.scheme == "https" else 80), timeout=900)
@@ -6706,6 +6752,23 @@ class Router:
                     try:
                         conn.request(method, path, body=raw, headers=headers)
                         resp = conn.getresponse()
+                        pre = b""
+                        if resp.status >= 400 and raw and b"reasoning_effort" in raw:
+                            # The model's chat template knows other levels (e.g. "minimal"
+                            # from Hermes, the template only low/medium/xhigh): the nearest
+                            # one it takes, remembered for this backend, and once more.
+                            pre = resp.read(65536)
+                            sent = effort_of(raw)
+                            alt = effort_instead(sent, pre.decode("utf-8", "replace"))
+                            if sent and alt != sent:
+                                backend.efforts[sent] = alt
+                                log(f"Router: {backend.where} doesn't take reasoning_effort {sent!r}, "
+                                    f"sending {alt or 'none'} instead")
+                                conn.close()
+                                conn = conn_cls(u.hostname, u.port or (443 if u.scheme == "https" else 80),
+                                                timeout=900)
+                                conn.request(method, path, body=fix_effort(raw, backend.efforts), headers=headers)
+                                resp, pre = conn.getresponse(), b""
                     except OSError as e:
                         return self._json(502, {"error": {"message": f"{backend.where} ({backend.label}) "
                                                                      f"unreachable: {e}"}})
@@ -6721,6 +6784,8 @@ class Router:
                         self.send_header("X-Myrmid-Reason-Utf8", urllib.parse.quote(reason))
                         self.send_header("Transfer-Encoding", "chunked")
                         self.end_headers()
+                        if pre:
+                            self.wfile.write(f"{len(pre):x}\r\n".encode() + pre + b"\r\n")
                         while True:
                             chunk = resp.read1(65536)
                             if not chunk:
