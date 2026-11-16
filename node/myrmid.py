@@ -1166,6 +1166,16 @@ CTX_STATE = CONFIG_DIR / "ctx.json"  # the context chosen in the dashboard
 CTX_CHOICES = (8192, 16384, 32768, 65536, 131072)
 
 
+def parse_ctx(v) -> Optional[int]:
+    """A context typed in the dashboard: "65536", "65.536", "65 536", "64k".
+    None (automatic) for anything else."""
+    t = str(v or "").strip().lower().replace(".", "").replace(" ", "").replace("\u202f", "").replace("_", "")
+    mult = 1
+    if t.endswith("k"):
+        t, mult = t[:-1], 1024
+    return int(t) * mult if t.isdigit() and int(t) > 0 else None
+
+
 def ctx_steps(args) -> tuple[int, ...]:
     """The contexts to try, largest first: from the dashboard's maximum (or
     8192) halving down to 2048, never above what the model was trained for."""
@@ -5294,7 +5304,7 @@ class HostAgent:
             return {"error": "model missing"}
         a = {"model": model, "name": str(body.get("name") or "").strip(),
              "role": body.get("role") if body.get("role") in ("big", "fast", "extra") else "big",
-             "ctx": int(body["ctx"]) if str(body.get("ctx") or "").isdigit() else None,
+             "ctx": parse_ctx(body.get("ctx")),
              "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16"}
         with self.lock:
             self.job += 1
@@ -7136,7 +7146,7 @@ class HostManager:
             ctx = body.get("ctx")
             self.assign[hid] = {"model": model, "role": body.get("role") if body.get("role") in ("big", "fast", "extra")
                                 else "big", "name": str(body.get("name") or "").strip(),
-                                "ctx": int(ctx) if str(ctx or "").isdigit() else None,
+                                "ctx": parse_ctx(ctx),
                                 "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16"}
         self.save()
         self.pushed.pop(hid, None)
