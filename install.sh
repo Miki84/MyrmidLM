@@ -1393,6 +1393,7 @@ if [[ -n "$FAST_MODEL" ]]; then
 fi
 
 # Entwurfsmodell: ein kleines Modell derselben Familie schreibt vor, das große prüft nur.
+[[ $ROUTER_ONLY -eq 1 && -z "$DRAFT" ]] && DRAFT=off  # nur Router: kein eigenes Modell, nichts zu beschleunigen
 if [[ "${MTP:-0}" == 0 && -z "$DRAFT" ]]; then
     echo
     info "Optional: Entwurfsmodell (ein kleines Modell derselben Familie, z. B. 0,6B zu 32B)."
