@@ -1374,7 +1374,9 @@ def _build_server(args, quiet: bool = False) -> ServerPlan:
     # with room to encode an image; without a GPU it costs RAM.
     proj = None if str(getattr(args, "mmproj", "auto")).lower() == "off" else find_mmproj(model)
     args._mmproj = str(proj) if proj else ""
-    proj_mb = proj.stat().st_size / 2**20 + 400 if proj else 0.0
+    # Beyond its weights, encoding an image (the dashboard sends up to 2048 px)
+    # needs about a gigabyte more while it runs.
+    proj_mb = proj.stat().st_size / 2**20 + 1024 if proj else 0.0
     proj_cpu = bool(proj) and (not budgets or getattr(args, "_mmproj_cpu", False))
     args._mmproj_where = "" if not proj else ("cpu" if proj_cpu else "gpu")
     if proj and not proj_cpu:
@@ -5604,8 +5606,9 @@ class HostAgent:
                 t = list(tries[-1])
                 t[t.index("-ub") + 1] = "512"
                 tries.append(t)
-            if n == 0 and self.mem_cut:
-                tries = tries[min(self.mem_cut, len(tries) - 1):]
+            skip = min(self.mem_cut, len(tries) - 1) if n == 0 else 0
+            if skip:
+                tries = tries[skip:]
                 log(f"{self.label}: ran out of GPU memory while serving: starting {self.mem_cut} step(s) smaller")
             for i, cmd in enumerate(tries):
                 if i or n or self.mem_cut:
@@ -5621,6 +5624,7 @@ class HostAgent:
                     self.download = None
                     self.note = ""
                 if _wait_healthy(f"http://127.0.0.1:{self.api_port}", proc, timeout=3600) and current():
+                    self.run_step = skip + i if n == 0 else 3  # how far down it had to go
                     if asked and ns.ctx and ns.ctx < asked:
                         with self.lock:
                             de = lambda v: f"{v:,}".replace(",", ".")  # noqa: E731
@@ -5745,7 +5749,7 @@ class HostAgent:
                 if "out of memory" in why.lower():
                     # The plan was too tight for long prompts (buffers grow while serving):
                     # the restart starts with less expert cache / a smaller batch.
-                    self.mem_cut = min(self.mem_cut + 1, 3)
+                    self.mem_cut = min(max(self.mem_cut, getattr(self, "run_step", 0)) + 1, 3)
                     log(f"{self.label}: llama-server ran out of GPU memory while serving: {why}")
                 self.restarts += 1
                 if self.restarts > 3:
