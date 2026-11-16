@@ -1904,6 +1904,11 @@ def _tune_variants(cmd: list[str]) -> list[tuple[str, list]]:
     dims.append(("-ub", [None, 1024, 2048]))
     cpu_work = "--cpu-moe" in cmd or "--n-cpu-moe" in cmd or \
         ("-ngl" in cmd and cmd[cmd.index("-ngl") + 1] == "0")
+    if not cpu_work and "-ngl" in cmd and "-m" in cmd:
+        try:  # some layers in RAM (long context leaves fewer on the GPUs): the CPU computes them
+            cpu_work = int(cmd[cmd.index("-ngl") + 1]) <= gguf_info(cmd[cmd.index("-m") + 1], 2048).n_layer
+        except Exception:  # noqa: BLE001 - only decides which variants to try
+            pass
     if cpu_work:
         cores = os.cpu_count() or 4
         phys = max(1, cores // 2)
