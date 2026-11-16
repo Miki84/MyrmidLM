@@ -673,6 +673,19 @@ def _gguf_model(kv: dict, sizes: dict[str, int], file_size: int, ctx: int, kv_ty
     vocab = kv.get("tokenizer.ggml.tokens")
     n_vocab = vocab[1] if isinstance(vocab, tuple) else a("vocab_size", 0) or 0
     kv_layer = ctx * n_head_kv * (k_dim + v_dim) * KV_BYTES.get(kv_type or "f16", 2.0)  # K and V
+    # Hybrid models (Qwen3-Next, Qwen3.x-Flash-Next …): only every n-th layer
+    # is attention with a KV cache, the others keep a small fixed state. Spread
+    # over all layers, the KV cache is that much smaller per layer.
+    # Counted from the tensors (layers with attention K/V weights), else from
+    # full_attention_interval.
+    attn = {int(mm.group(1)) for k in sizes for mm in [re.match(r"^blk\.(\d+)\.attn_(k|qkv|k_b|kv_a_mqa)\.weight$", k)]
+            if mm}
+    every = a("full_attention_interval") or next((v for k, v in kv.items()
+                                                 if k.endswith(".full_attention_interval")), 0)
+    if 0 < len(attn) < n_layer:
+        kv_layer *= len(attn) / n_layer
+    elif isinstance(every, int) and every > 1:
+        kv_layer /= every
     exps = sum(v for k, v in sizes.items() if re.match(r"^blk\.\d+\.ffn_(up|down|gate|gate_up)_(ch|)exps", k))
     n_expert = a("expert_count", 0)
     n_used = a("expert_used_count", 0)
