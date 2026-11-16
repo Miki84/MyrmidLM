@@ -4049,6 +4049,7 @@ class Dashboard:
 # waking up they load their model again.
 
 KNOWN_STATE = CONFIG_DIR / "known.json"
+WAKE_RETRY_S = 600  # a host that didn't wake: not tried again for this long
 WAKE_WAIT_S = 240  # how long a request waits for a host to wake up and load
 WAKE_REPEAT_S = 300  # don't wake the same machine more often (unless asked)
 SUSPEND_FILE = f"{RUN_DIR}/suspend"
@@ -6366,8 +6367,24 @@ class Router:
         return [b for b in self.backends if b.name == role]
 
     def sleeper(self, cands: list[Backend]) -> Optional[Backend]:
-        """A sleeping member to wake when none is ready."""
-        return next((b for b in cands if b.asleep), None)
+        """A sleeping member to wake when none is ready (not one that just
+        failed to wake: each try keeps the client waiting for minutes)."""
+        failed = getattr(self, "wake_failed", {})
+        return next((b for b in cands if b.asleep and time.time() - failed.get(b.source or b.base, 0) > WAKE_RETRY_S),
+                    None)
+
+    def note_wake_failed(self, b: Backend) -> None:
+        if not hasattr(self, "wake_failed"):
+            self.wake_failed = {}
+        self.wake_failed[b.source or b.base] = time.time()
+
+    def instead_of(self, b: Backend, body: Optional[dict]) -> Optional[Backend]:
+        """A ready backend in place of one that didn't wake: the same role or
+        group first, then any, each with room for the optimistic estimate."""
+        loose = self.need(body)[1] if isinstance(body, dict) else 0
+        same = [x for x in self.backends if x is not b and (x.name == b.name or (b.group and x.group == b.group))]
+        return self.choose(self.fits(same, loose)) or self.choose(self.fits([x for x in self.backends if x is not b],
+                                                                          loose))
 
     @staticmethod
     def fits(cands: list[Backend], need: int) -> list[Backend]:
@@ -6382,11 +6399,17 @@ class Router:
 
     def _pick_role(self, role: str, reason: str, need: int = 0, loose: int = 0) -> tuple[Backend, str]:
         cands = self.fits(self.role(role), need)
-        if self.role(role) and not cands:
-            reason += f", {'schnelles' if role == 'fast' else 'großes'} Modell hat zu wenig Kontext"
         b = self.choose(cands)
         if b:
             return b, reason
+        # The careful estimate is pessimistic (about 3 characters a token):
+        # a ready model where the request fits by the optimistic one tries
+        # first, rather than waking a host whose context isn't known.
+        b = self.choose(self.fits(self.role(role), loose)) if loose else None
+        if b:
+            return b, reason + ", Kontext knapp"
+        if self.role(role) and not cands:
+            reason += f", {'schnelles' if role == 'fast' else 'großes'} Modell hat zu wenig Kontext"
         b = self.sleeper(cands)
         if b and self.waker:
             return b, f"{reason}, Host wird geweckt"
@@ -6408,6 +6431,9 @@ class Router:
         b = self.choose(fitting)
         if b:
             return b, reason
+        b = self.choose(self.fits(group, loose)) if loose else None
+        if b:
+            return b, reason + ", Kontext knapp"
         b = self.sleeper(fitting)
         if b and self.waker:
             return b, f"{reason}, Host wird geweckt"
@@ -6633,8 +6659,16 @@ class Router:
                 if backend.asleep and router.waker:
                     woke = router.waker(backend)
                     if woke is None:
-                        return self._json(503, {"error": {"message": f"{backend.where} sleeps and did not wake up "
-                                                                     f"within {WAKE_WAIT_S} s"}})
+                        # Off for good, maybe: don't try it again for a while, and
+                        # answer with another model that is ready, if there is one.
+                        router.note_wake_failed(backend)
+                        alt = router.instead_of(backend, body if isinstance(body, dict) else None)
+                        if alt is None:
+                            return self._json(503, {"error": {"message": f"{backend.where} sleeps and did not wake "
+                                                                         f"up within {WAKE_WAIT_S} s"}})
+                        log(f"Router: {backend.where} did not wake up, {alt.where} answers instead")
+                        reason += f", {backend.where} nicht aufgewacht"
+                        woke = alt
                     backend = woke
                 self._forward(backend, "POST", raw, reason)
 

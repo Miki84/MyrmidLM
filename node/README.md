@@ -157,7 +157,7 @@ myrmid serve -m gross.gguf --assign "pc2=qwen3-32b,name=qwen32" --assign "pc3=qw
 
 **Wake-on-LAN und Schlafen:** Worker und Hosts melden ihre MAC-Adresse (nur Kabel); der Master merkt sich jeden Rechner (`known.json`) und weckt ihn per Magic Packet,
 - einen Worker, wenn das Modell ohne ihn nicht passt (der Dienst wartet dann auf Worker),
-- einen Host, wenn eine Anfrage sein Modell braucht: Die Anfrage wartet, bis er wach ist und sein Modell geladen hat (bis 240 s),
+- einen Host, wenn eine Anfrage sein Modell braucht: Die Anfrage wartet, bis er wach ist und sein Modell geladen hat (bis 240 s), Wacht er nicht auf (z. B. ausgeschaltet), antwortet ein anderes bereites Modell, und der Router versucht ihn 10 Minuten lang nicht mehr. Ein wacher Host, in den die Anfrage nach der optimistischen Schätzung passt, geht vor dem Wecken eines schlafenden,
 - und von Hand im Dashboard („Aufwecken“, auch für ausgeschaltete Worker in „Weitere Geräte im Netzwerk“).
 
 Hosts legen sich nach `--host-sleep MIN` Minuten ohne Anfrage schlafen (pro Host im Dashboard einstellbar, 0 = nie): Der Master sagt es dem Host, der beendet llama-server und geht in Standby, über `myrmid-suspend.path`/`.service` (kleine Root-Units, das Installationsskript richtet sie ein). Nach dem Aufwachen lädt der Host sein Modell von selbst wieder. Worker im Plan bleiben wach. Das Installationsskript schaltet Wake-on-LAN auf der Netzwerkkarte ein (ethtool, dauerhaft über NetworkManager oder `myrmid-wol.service`); im BIOS muss es ebenfalls an sein.
