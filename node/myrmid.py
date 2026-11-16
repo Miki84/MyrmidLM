@@ -718,7 +718,7 @@ GPU_RESERVE_MB = 400  # compute buffers per GPU, beyond weights and KV
 
 
 def compute_extra_mb(ub: int, ctx: int) -> float:
-    """Compute buffer on the main GPU beyond GPU_RESERVE_MB: it grows with the
+    """Compute buffer per GPU beyond GPU_RESERVE_MB: it grows with the
     batch (-ub) and, for attention over long prompts, with the context.
     Measured (Qwen3.8-Flash-Next, 2x RTX A2000): -ub 2048 at 8k needs 1.2 GB,
     -ub 1024 at 128k 1.4 GB; -ub 512 up to 32k fits in the base reserve."""
@@ -1336,10 +1336,11 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
             break
     budgets = [d.free_mb * GPU_SHARE - GPU_RESERVE_MB - (out_extra if d is out_gpu else 0)
                for d in local_gpus]
-    if budgets:  # llama.cpp's main GPU (the first) holds the compute buffers
+    if budgets:  # every GPU with layers holds compute buffers for them (seen: 1.3 GB on the second)
         tuned = {} if getattr(args, "no_tune", False) else tune_lookup(model, getattr(args, "tune_slot", ""))
         ub = (tuned.get("flags") or {}).get("-ub") or getattr(args, "ub", None) or 512
-        budgets[0] -= compute_extra_mb(int(ub), int(args.ctx or 0))
+        extra = compute_extra_mb(int(ub), int(args.ctx or 0))
+        budgets = [b - extra for b in budgets]
     # A vision model's image part goes to llama.cpp's main GPU (the first),
     # with room to encode an image; without a GPU it costs RAM.
     proj = None if str(getattr(args, "mmproj", "auto")).lower() == "off" else find_mmproj(model)
@@ -5273,6 +5274,8 @@ class HostAgent:
         self.ctx: Optional[int] = None
         self.estimate_tps: Optional[float] = None
         self.note = ""  # e.g. the context was shortened to fit
+        self.tail: list = []  # last lines of the running llama-server
+        self.mem_cut = 0  # it ran out of GPU memory while serving: start that many steps smaller
         self.download: Optional[dict] = None  # files being fetched, for the progress
         self.job = 0  # a newer assignment makes older jobs stop
         self.restarts = 0
@@ -5401,6 +5404,8 @@ class HostAgent:
              "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16"}
         with self.lock:
             self.job += 1
+            if a != self.assignment:
+                self.mem_cut = 0  # other settings: the plan starts afresh
             self.assignment, self.restarts = a, 0
             job = self.job
         self._save()
@@ -5551,8 +5556,11 @@ class HostAgent:
                 t = list(tries[-1])
                 t[t.index("-ub") + 1] = "512"
                 tries.append(t)
+            if n == 0 and self.mem_cut:
+                tries = tries[min(self.mem_cut, len(tries) - 1):]
+                log(f"{self.label}: ran out of GPU memory while serving: starting {self.mem_cut} step(s) smaller")
             for i, cmd in enumerate(tries):
-                if i or n:
+                if i or n or self.mem_cut:
                     log(f"{self.label}: out of GPU memory, trying again"
                         + (f" with -c {ns.ctx}" if n else "")
                         + (f", {cmd[cmd.index('--moe-cache-mib') + 1]} MiB expert cache" if "--moe-cache-mib" in cmd else "")
@@ -5560,7 +5568,7 @@ class HostAgent:
                 log(" ".join(cmd).replace(self.key, "***"))
                 proc, tail = spawn_logged(cmd)
                 with self.lock:
-                    self.proc, self.model_path, self.ctx = proc, path, ns.ctx
+                    self.proc, self.model_path, self.ctx, self.tail = proc, path, ns.ctx, tail
                     self.estimate_tps = round(sp.estimate_tps, 1)
                     self.download = None
                     self.note = ""
@@ -5662,6 +5670,12 @@ class HostAgent:
                 a = self.assignment
             if dead and a:
                 code = self.proc.poll()
+                why = server_error(self.tail)
+                if "out of memory" in why.lower():
+                    # The plan was too tight for long prompts (buffers grow while serving):
+                    # the restart starts with less expert cache / a smaller batch.
+                    self.mem_cut = min(self.mem_cut + 1, 3)
+                    log(f"{self.label}: llama-server ran out of GPU memory while serving: {why}")
                 self.restarts += 1
                 if self.restarts > 3:
                     self._set("error", f"llama-server keeps ending (code {code}); not restarting again")
