@@ -5629,7 +5629,7 @@ class HostAgent:
                     return
                 why = server_error(tail)
                 proc.wait()
-                low = " ".join(tail[-40:]).lower() if tail else why.lower()
+                low = " ".join(list(tail)[-40:]).lower() if tail else why.lower()
                 if "--mmproj" in cmd and "out of memory" not in why.lower() and \
                         any(k in low for k in ("clip", "mmproj", "projector", "mtmd")):
                     # This llama.cpp doesn't take the model's image part: the text model alone.
