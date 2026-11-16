@@ -1891,6 +1891,13 @@ def apply_tune(cmd: list[str], flags: dict) -> list[str]:
             continue  # the GPUs changed since the autotune
         if flag == "-sm" and not (_gpu_split(cmd) and _tensor_ok(cmd)):
             continue  # the plan no longer fits tensor split (CPU part, KV cache, workers)
+        if flag == "--moe-cache-mib" and flag in cmd:
+            # Never more than the plan has room for now: the autotune measured
+            # without what came since (the image part, a longer context …).
+            try:
+                value = min(int(value), int(cmd[cmd.index(flag) + 1]))
+            except (ValueError, IndexError):
+                pass
         if flag in cmd:
             i = cmd.index(flag)
             if i + 1 < len(cmd):
