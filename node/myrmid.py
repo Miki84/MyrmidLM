@@ -1299,6 +1299,35 @@ def build_server_fitting(args, quiet: bool = False, exit_on_fail: bool = True) -
 
 
 def build_server(args, quiet: bool = False) -> ServerPlan:
+    """Plans the split and returns the llama-server command. A vision model's
+    image part (mmproj) goes to the GPU when there is room for it: when it
+    would cost the text noticeable speed (it takes VRAM from the layers or the
+    expert cache), or doesn't fit at all, it stays in RAM and the CPU encodes
+    images (a few seconds each)."""
+    args._mmproj_cpu = False
+    model = str(Path(args.model).expanduser().resolve())
+    gpus = [d for d in usable_gpus(probe(bench=False)) if d.type == "gpu"] if Path(model).is_file() else []
+    if not gpus or str(getattr(args, "mmproj", "auto")).lower() == "off" or not find_mmproj(model):
+        return _build_server(args, quiet)
+    try:
+        on_gpu: Optional[ServerPlan] = _build_server(args, True)
+    except PlanTooBig:
+        on_gpu = None
+    args._mmproj_cpu = True
+    try:
+        on_cpu = _build_server(args, True)
+    except PlanTooBig:
+        if on_gpu is None:
+            raise
+        on_cpu = None
+    args._mmproj_cpu = bool(on_cpu) and (on_gpu is None or on_gpu.estimate_tps < 0.9 * on_cpu.estimate_tps)
+    if not quiet or args._mmproj_cpu:
+        log("Vision part (mmproj): " + ("in RAM, the CPU encodes images: VRAM is short"
+                                        if args._mmproj_cpu else "on the GPU"))
+    return _build_server(args, quiet)
+
+
+def _build_server(args, quiet: bool = False) -> ServerPlan:
     """Plans the split and returns the llama-server command."""
     say = (lambda *a, **k: None) if quiet else print
     model = str(Path(args.model).expanduser().resolve())
@@ -1346,11 +1375,13 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     proj = None if str(getattr(args, "mmproj", "auto")).lower() == "off" else find_mmproj(model)
     args._mmproj = str(proj) if proj else ""
     proj_mb = proj.stat().st_size / 2**20 + 400 if proj else 0.0
-    if proj and budgets:
+    proj_cpu = bool(proj) and (not budgets or getattr(args, "_mmproj_cpu", False))
+    args._mmproj_where = "" if not proj else ("cpu" if proj_cpu else "gpu")
+    if proj and not proj_cpu:
         budgets[0] -= proj_mb
     host_budget = host_available_mb() * HOST_SHARE - HOST_RESERVE_MB
     host_budget -= getattr(args, "reserve_mb", {}).get("__host__", 0)  # router's fast model in RAM
-    if proj and not budgets:
+    if proj_cpu:
         host_budget -= proj_mb
     if args.ram_limit is not None:
         host_budget = min(host_budget, args.ram_limit * 1024)
@@ -1586,8 +1617,11 @@ def _finish_command(args, cmd: list[str], model: str, tps: float, info: Optional
                 info["tuned"] = {"flags": tuned.get("flags"), "at": tuned.get("at"), "score": tuned.get("score")}
     if getattr(args, "_mmproj", ""):
         cmd += ["--mmproj", args._mmproj]
+        if getattr(args, "_mmproj_where", "") == "cpu":
+            cmd += ["--no-mmproj-offload"]
         if info is not None:
             info["vision"] = Path(args._mmproj).name
+            info["vision_on"] = getattr(args, "_mmproj_where", "")
     if getattr(args, "ple_mb", 0):
         # The n-gram table is only looked up (a few rows per token): host memory,
         # mmap'd, so with too little RAM the OS reads it from the SSD as needed.
@@ -5499,6 +5533,13 @@ class HostAgent:
                 with self.lock:
                     self.paths[a["model"]] = str(path)
                 self._save()
+            else:
+                def resolved_proj(info: dict) -> None:
+                    self._set("downloading")
+                    with self.lock:
+                        self.download = info
+
+                fetch_mmproj_later(a["model"], Path(path), self.models_dir, resolved_proj)
             if not current():
                 return
             self._set("loading")
@@ -5578,12 +5619,35 @@ class HostAgent:
                             de = lambda v: f"{v:,}".replace(",", ".")  # noqa: E731
                             self.note = f"Kontext {de(asked)} passte nicht in den GPU-Speicher, geladen mit {de(ns.ctx)}."
                         log(f"{self.label}: -c {asked} didn't fit, running with -c {ns.ctx}")
+                    if "--no-mmproj-offload" in cmd:
+                        with self.lock:
+                            self.note = (self.note + " " if self.note else "") + \
+                                "Bilder: Der Bild-Teil läuft im RAM (VRAM zu knapp), Bilder brauchen ein paar Sekunden länger."
                     self._set("ready")
                     return
                 if not current():
                     return
                 why = server_error(tail)
                 proc.wait()
+                low = " ".join(tail[-40:]).lower() if tail else why.lower()
+                if "--mmproj" in cmd and "out of memory" not in why.lower() and \
+                        any(k in low for k in ("clip", "mmproj", "projector", "mtmd")):
+                    # This llama.cpp doesn't take the model's image part: the text model alone.
+                    i = cmd.index("--mmproj")
+                    bare = cmd[:i] + cmd[i + 2:]
+                    bare = [x for x in bare if x != "--no-mmproj-offload"]
+                    log(f"{self.label}: the vision part doesn't load ({why}); starting without it")
+                    proc, tail = spawn_logged(bare)
+                    with self.lock:
+                        self.proc, self.tail = proc, tail
+                    if _wait_healthy(f"http://127.0.0.1:{self.api_port}", proc, timeout=3600) and current():
+                        with self.lock:
+                            self.note = ("Bilder: Der Bild-Teil (mmproj) lädt mit dieser llama.cpp-Version nicht, "
+                                         "das Modell läuft nur mit Text.")
+                        self._set("ready")
+                        return
+                    why = server_error(tail)
+                    proc.wait()
                 if "out of memory" not in why.lower():
                     self._set("error", f"llama-server startet nicht (Code {proc.poll()})"
                               + (f": {why}" if why else "; siehe Protokoll"))
@@ -7803,8 +7867,9 @@ def find_mmproj(model: str) -> Optional[Path]:
     try:
         side = mmproj_sidecar(path)
         if side.is_file():
-            p = path.with_name(side.read_text().strip())
-            return p if p.is_file() else None
+            name = side.read_text().strip()  # empty: looked up, the repo has none
+            p = path.with_name(name) if name else None
+            return p if p and p.is_file() else None
         base = re.sub(r"-\d{5}-of-\d{5}$", "", path.stem).lower()
         base = re.sub(r"[-_.](ud-)?(i?q\d[\w]*|f16|bf16|f32)$", "", base)
         norm = lambda x: re.sub(r"[^a-z0-9]", "", x)  # noqa: E731
@@ -7937,6 +8002,37 @@ def fetch_model(target: str, out_dir: Path, force: bool = False, quiet: bool = F
         paths.append(dest)
         with _download_lock(dest):
             _fetch_file(r, f, dest, quiet)
+    _fetch_mmproj(r, paths[0], out_dir, quiet)
+    return paths[0]
+
+
+def fetch_mmproj_later(target: str, model: Path, out_dir: Path, on_resolved=None) -> None:
+    """For a model downloaded before its repo had a vision part (or before
+    MyrmidLM fetched one): looks it up once and fetches it. Notes "none" when
+    the repo has none, so it asks only once."""
+    side = mmproj_sidecar(model)
+    if side.exists() or Path(target).expanduser().is_file():
+        return
+    try:
+        r = hf_resolve(*resolve_spec(target))
+    except Exception as e:  # noqa: BLE001 - offline: try again next time
+        log(f"Vision part: could not look up {target} ({e})")
+        return
+    if r.get("mmproj"):
+        if on_resolved:
+            on_resolved({**r, "files": [], "dir": str(out_dir)})
+        try:
+            _fetch_mmproj(r, model, out_dir, True)
+        except Exception as e:  # noqa: BLE001 - the text model runs anyway
+            log(f"Vision part: download failed ({e}); the model runs without it")
+    else:
+        try:
+            side.write_text("")
+        except OSError:
+            pass
+
+
+def _fetch_mmproj(r: dict, model: Path, out_dir: Path, quiet: bool) -> None:
     proj = r.get("mmproj")
     if proj:  # a vision model: its image part, noted next to the model
         name = Path(proj["file"]).name
@@ -7946,10 +8042,9 @@ def fetch_model(target: str, out_dir: Path, force: bool = False, quiet: bool = F
         with _download_lock(dest):
             _fetch_file(r, proj, dest, quiet)
         try:
-            mmproj_sidecar(paths[0]).write_text(dest.name)
+            mmproj_sidecar(model).write_text(dest.name)
         except OSError as e:
             log(f"Could not note the vision part ({e})")
-    return paths[0]
 
 
 def _download_lock(dest: Path):
