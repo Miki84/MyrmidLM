@@ -1796,6 +1796,8 @@ def tune_label(flags: dict) -> str:
     for k, v in flags.items():
         if k == "-sm" and v == "tensor":
             parts.append("Tensor Split")
+        elif k == "--numa":
+            parts.append("NUMA verteilt")
         elif k == "-lm":
             parts.append({"dio": "Direct I/O", "mlock": "Experten fest im RAM (mlock)"}.get(str(v), f"-lm {v}"))
         elif k == "--moe-cache-cpu-share":
@@ -1906,7 +1908,19 @@ def _tune_variants(cmd: list[str]) -> list[tuple[str, list]]:
         cores = os.cpu_count() or 4
         phys = max(1, cores // 2)
         dims.append(("-t", [None, phys] + ([cores] if cores != phys else [])))
+        # Several NUMA nodes (EPYC Naples always has four, later ones with
+        # NPS2/NPS4): threads and memory spread over the nodes can read the
+        # experts faster than whatever the kernel does.
+        if numa_nodes() > 1:
+            dims.append(("--numa", [None, "distribute"]))
     return dims
+
+
+def numa_nodes() -> int:
+    try:
+        return len([p for p in Path("/sys/devices/system/node").glob("node[0-9]*")])
+    except OSError:
+        return 1
 
 
 def tune_bench(base: str, key: str, timeout: float = 900) -> dict:
