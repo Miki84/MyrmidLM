@@ -153,6 +153,36 @@
 
   /* Split strip */
   .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-l); padding: 20px 22px; }
+  /* Monitor */
+  .tabs { display: inline-flex; gap: 4px; margin-left: 12px; padding: 3px; border: 1px solid var(--line); border-radius: 999px; }
+  .tabs button { border: 0; background: none; color: var(--muted); padding: 4px 12px; border-radius: 999px; cursor: pointer; font: inherit; font-size: 13px; }
+  .tabs button[aria-selected="true"] { background: var(--surface-2); color: var(--text); }
+  #app.mon > :not(header):not(#monitor):not(#offline) { display: none !important; }
+  #app:not(.mon) > #monitor { display: none; }
+  .mon-pick { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 14px; }
+  .mon-pick button { border: 1px solid var(--line); background: var(--surface); color: var(--muted); border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; font-size: 13px; }
+  .mon-pick button[aria-pressed="true"] { color: var(--text); border-color: var(--c0); }
+  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-l); padding: 14px 16px 8px; min-width: 0; }
+  .tile h4 { margin: 0 0 6px; font-size: 12px; font-weight: 500; color: var(--muted); text-transform: none; }
+  .tile .big { font-size: 26px; font-weight: 650; line-height: 1.1; }
+  .tile .big small { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 3px; }
+  .tile .pair { display: flex; justify-content: space-between; gap: 8px; }
+  .tile .sub { font-size: 12px; color: var(--muted); margin-top: 4px; min-height: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tile svg { width: 100%; height: 34px; display: block; margin-top: 6px; }
+  .mon-row { display: grid; grid-template-columns: 300px 1fr; gap: 14px; margin-top: 14px; }
+  .gauge { display: grid; place-items: center; margin: 6px 0 12px; }
+  .gauge b { font-size: 24px; }
+  .mon-bar { margin: 10px 0; font-size: 13px; }
+  .mon-bar .bar { margin-top: 5px; }
+  table.req { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.req th { text-align: left; font-weight: 500; color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .03em; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  table.req td { padding: 7px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  table.req td.mname { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+  table.req td.num, table.req th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .st { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; background: var(--surface-2); }
+  .st.bad { color: var(--bad, #ef7f98); }
+  @media (max-width: 900px) { .tiles { grid-template-columns: repeat(2, 1fr); } .mon-row { grid-template-columns: 1fr; } }
   .panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
   .strip-wrap { position: relative; }
   .strip { display: flex; align-items: stretch; height: 54px; gap: 0; }
@@ -346,7 +376,7 @@
 <div class="wrap" id="app">
   <header class="top">
     <div>
-      <div class="title-row"><svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="34" height="34" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0f1e28"/><defs><polygon id="hlogo" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/></defs><g stroke="#0f1e28" stroke-width="22"><use href="#hlogo" x="512" y="512" fill="#f0b54a"/><use href="#hlogo" x="512" y="282" fill="#4fc3b4"/><use href="#hlogo" x="512" y="742" fill="#4fc3b4" opacity=".75"/><use href="#hlogo" x="313" y="397" fill="#4fc3b4" opacity=".9"/><use href="#hlogo" x="711" y="397" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="313" y="627" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="711" y="627" fill="#4fc3b4" opacity=".9"/></g><g stroke="#0f1e28" stroke-width="18" stroke-linecap="round"><path d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/></g><g fill="#0f1e28"><circle cx="512" cy="512" r="40"/></g><g fill="#0f1e28"><circle cx="512" cy="282" r="26"/><circle cx="512" cy="742" r="26"/><circle cx="313" cy="397" r="26"/><circle cx="711" cy="397" r="26"/><circle cx="313" cy="627" r="26"/><circle cx="711" cy="627" r="26"/></g></svg><h1>MyrmidLM-Cluster</h1><a class="ver-badge" id="ver-badge" href="#update-panel" hidden></a><button class="btn quiet small chat-btn" id="chat-open" type="button">Chat testen</button></div>
+      <div class="title-row"><svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="34" height="34" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0f1e28"/><defs><polygon id="hlogo" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/></defs><g stroke="#0f1e28" stroke-width="22"><use href="#hlogo" x="512" y="512" fill="#f0b54a"/><use href="#hlogo" x="512" y="282" fill="#4fc3b4"/><use href="#hlogo" x="512" y="742" fill="#4fc3b4" opacity=".75"/><use href="#hlogo" x="313" y="397" fill="#4fc3b4" opacity=".9"/><use href="#hlogo" x="711" y="397" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="313" y="627" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="711" y="627" fill="#4fc3b4" opacity=".9"/></g><g stroke="#0f1e28" stroke-width="18" stroke-linecap="round"><path d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/></g><g fill="#0f1e28"><circle cx="512" cy="512" r="40"/></g><g fill="#0f1e28"><circle cx="512" cy="282" r="26"/><circle cx="512" cy="742" r="26"/><circle cx="313" cy="397" r="26"/><circle cx="711" cy="397" r="26"/><circle cx="313" cy="627" r="26"/><circle cx="711" cy="627" r="26"/></g></svg><h1>MyrmidLM-Cluster</h1><span class="tabs" role="tablist"><button type="button" role="tab" id="tab-main" aria-selected="true">Übersicht</button><button type="button" role="tab" id="tab-mon" aria-selected="false">Monitor</button></span><a class="ver-badge" id="ver-badge" href="#update-panel" hidden></a><button class="btn quiet small chat-btn" id="chat-open" type="button">Chat testen</button></div>
       <div class="model" id="model">Verbinde mit dem Master …</div>
       <details class="model-switch" id="model-switch">
         <summary>Modell und Kontext</summary>
@@ -531,6 +561,34 @@
       <div class="chart-head"><h3>GPU-Auslastung je Rechner</h3><span class="now num" id="c-gpu-now"></span></div>
       <div class="chart-body"><svg id="c-gpu" viewBox="0 0 600 120" preserveAspectRatio="none" aria-hidden="true"></svg><div class="chart-empty" id="c-gpu-empty" hidden>Noch keine GPU-Messwerte</div></div>
       <div class="legend" id="c-gpu-legend"></div>
+    </div>
+  </section>
+
+  <section id="monitor" aria-label="Leistungsmonitor">
+    <div class="mon-pick" id="mon-pick"></div>
+    <div class="tiles">
+      <div class="tile"><h4>Tempo (letzte Anfrage)</h4><div class="pair"><div class="big num" id="mt-tg">–</div><div class="big num" id="mt-pp">–</div></div><div class="pair sub"><span>schreiben</span><span>lesen</span></div><svg id="ms-tg" viewBox="0 0 300 34" preserveAspectRatio="none"></svg></div>
+      <div class="tile"><h4>GPU-Auslastung</h4><div class="big num" id="mt-gpu">–</div><div class="sub" id="mt-gpu-s"></div><svg id="ms-gpu" viewBox="0 0 300 34" preserveAspectRatio="none"></svg></div>
+      <div class="tile"><h4>VRAM</h4><div class="big num" id="mt-vram">–</div><div class="sub" id="mt-vram-s"></div><svg id="ms-vram" viewBox="0 0 300 34" preserveAspectRatio="none"></svg></div>
+      <div class="tile"><h4>GPU-Temperatur</h4><div class="big num" id="mt-temp">–</div><div class="sub" id="mt-temp-s"></div><svg id="ms-temp" viewBox="0 0 300 34" preserveAspectRatio="none"></svg></div>
+      <div class="tile"><h4>Leistungsaufnahme GPUs</h4><div class="big num" id="mt-pow">–</div><div class="sub" id="mt-pow-s"></div><svg id="ms-pow" viewBox="0 0 300 34" preserveAspectRatio="none"></svg></div>
+      <div class="tile"><h4>PCIe</h4><div class="big num" id="mt-pcie">–</div><div class="sub" id="mt-pcie-s"></div></div>
+      <div class="tile"><h4>CPU</h4><div class="big num" id="mt-cpu">–</div><div class="sub" id="mt-cpu-s"></div><svg id="ms-cpu" viewBox="0 0 300 34" preserveAspectRatio="none"></svg></div>
+      <div class="tile"><h4>RAM</h4><div class="big num" id="mt-ram">–</div><div class="sub" id="mt-ram-s"></div><svg id="ms-ram" viewBox="0 0 300 34" preserveAspectRatio="none"></svg></div>
+    </div>
+    <div class="mon-row">
+      <div class="panel">
+        <h3 style="margin:0 0 4px">Kontext-Füllung</h3>
+        <div class="gauge" id="m-gauge"></div>
+        <div class="mon-bar"><div class="pair" style="display:flex;justify-content:space-between"><span>Aus dem Cache wiederverwendet</span><span class="num" id="m-reuse-t">–</span></div><div class="bar"><i id="m-reuse" style="width:0%"></i></div></div>
+        <div class="mon-bar"><div class="pair" style="display:flex;justify-content:space-between"><span>Wiederverwendet seit Start</span><span class="num" id="m-reuse-all-t">–</span></div><div class="bar"><i id="m-reuse-all" style="width:0%"></i></div></div>
+        <p class="note" style="margin-top:12px">Gespräche, die weiterlaufen (Agenten wie Hermes), lesen dank des Caches nur den neuen Teil des Prompts.</p>
+      </div>
+      <div class="panel" style="min-width:0">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h3 style="margin:0">Letzte Anfragen</h3><button class="btn quiet small" type="button" id="m-all">Alle anzeigen</button></div>
+        <div style="overflow-x:auto;margin-top:8px"><table class="req"><thead><tr><th>Zeit</th><th>Modell</th><th>Status</th><th class="num">Prompt</th><th class="num">Wiederverw.</th><th class="num">Ausgabe</th><th class="num">Lesen t/s</th><th class="num">Schreiben t/s</th><th class="num">Dauer</th></tr></thead><tbody id="m-req"></tbody></table></div>
+        <p class="note" id="m-sum" style="margin-top:10px"></p>
+      </div>
     </div>
   </section>
 
@@ -1649,6 +1707,99 @@ function render(s) {
   renderHeader(s); renderLive(s); renderRouter(s); renderSplit(s); renderCharts(s); renderMachines(s); renderLan(s); renderRebalance(s); renderHosts(s); renderBench(s); renderModelSwitch(s); renderUpdate(s);
   if (!$("chat").hidden) chatModels();
   else if (location.hash === "#chat" && !render.chatOpened) { render.chatOpened = true; chatOpen(true); }
+  if (location.hash === "#monitor" && !render.monOpened) { render.monOpened = true; monShow(true); }
+}
+
+/* ── Monitor ────────────────────────────────────────────────────────── */
+
+const mon = { pick: "all", hist: {}, all: false, data: null, busy: false };
+function monShow(on) {
+  $("app").classList.toggle("mon", on);
+  $("tab-main").setAttribute("aria-selected", String(!on));
+  $("tab-mon").setAttribute("aria-selected", String(on));
+  if (on) { if (location.hash !== "#monitor") history.replaceState(null, "", "#monitor"); monFetch(); }
+  else if (location.hash === "#monitor") history.replaceState(null, "", location.pathname);
+}
+$("tab-main").addEventListener("click", () => monShow(false));
+$("tab-mon").addEventListener("click", () => monShow(true));
+$("m-all").addEventListener("click", () => { mon.all = !mon.all; $("m-all").textContent = mon.all ? "Weniger" : "Alle anzeigen"; monRender(last); });
+$("mon-pick").addEventListener("click", (ev) => { const id = ev.target.dataset && ev.target.dataset.pick; if (id) { mon.pick = id; monRender(last); } });
+async function monFetch() {
+  if (mon.busy) return;
+  mon.busy = true;
+  try { mon.data = await api("/api/monitor"); } catch (e) { /* next round */ }
+  mon.busy = false;
+  if (last) monRender(last);
+}
+function spark(id, vals, max, color) {
+  const svg = $(id); if (!svg) return;
+  const v = vals.filter((x) => x != null);
+  if (v.length < 2) { svg.innerHTML = ""; return; }
+  const m = max || Math.max(1, ...v) * 1.15, n = vals.length;
+  const pts = vals.map((x, i) => x == null ? null : `${(i * 300 / Math.max(n - 1, 1)).toFixed(1)},${(32 - (x / m) * 30).toFixed(1)}`).filter(Boolean);
+  svg.innerHTML = `<polygon points="${pts[0].split(",")[0]},34 ${pts.join(" ")} ${pts[pts.length - 1].split(",")[0]},34" fill="${color}" opacity="0.15"/><polyline points="${pts.join(" ")}" fill="none" stroke="${color}" stroke-width="1.6" vector-effect="non-scaling-stroke"/>`;
+}
+function monHosts(s) {
+  // one entry per PC (GPU slot hosts share their PC's stats), plus the master's own machine stats
+  const seen = {}, out = [];
+  for (const h of ((s.hosts || {}).hosts || [])) {
+    const st = h.stats || {}, key = st.host || h.pc || h.id;
+    if (!st.host || seen[key]) continue;
+    seen[key] = 1;
+    out.push({ id: key, name: st.host, st, wheres: ((s.hosts || {}).hosts || []).filter((x) => (x.stats || {}).host === st.host).map((x) => x.name) });
+  }
+  return out;
+}
+function monRender(s) {
+  if (!$("app").classList.contains("mon") || !s) return;
+  const pcs = monHosts(s);
+  if (mon.pick !== "all" && !pcs.some((p) => p.id === mon.pick)) mon.pick = "all";
+  $("mon-pick").innerHTML = [{ id: "all", name: "Alle Hosts" }, ...pcs].map((p) => `<button type="button" data-pick="${esc(p.id)}" aria-pressed="${p.id === mon.pick}">${esc(p.name)}</button>`).join("");
+  const sel = mon.pick === "all" ? pcs : pcs.filter((p) => p.id === mon.pick);
+  const gpus = sel.flatMap((p) => (p.st.gpus || []).map((g, i) => ({ ...g, pc: p.name, i })));
+  const sum = (a) => a.reduce((x, y) => x + (y || 0), 0);
+  const avg = (a) => { const v = a.filter((x) => x != null); return v.length ? sum(v) / v.length : null; };
+  const gname = (g) => (sel.length > 1 ? g.pc + " " : "") + "GPU " + g.i;
+  const util = avg(gpus.map((g) => g.util_pct)), memU = sum(gpus.map((g) => g.mem_used_mb)), memT = sum(gpus.map((g) => g.mem_total_mb));
+  const temps = gpus.map((g) => g.temp_c).filter((x) => x != null), pow = sum(gpus.map((g) => g.power_w));
+  const cpu = avg(sel.map((p) => p.st.cpu_pct)), ramU = sum(sel.map((p) => p.st.ram_used_mb)), ramT = sum(sel.map((p) => p.st.ram_total_mb));
+  const reqs = ((mon.data || {}).requests || []).filter((r) => mon.pick === "all" || sel.some((p) => p.wheres.includes(r.where) || p.name === r.where || (r.where || "").startsWith(p.name)));
+  const lr = reqs.find((r) => r.status === 200 && (r.tg || r.pp));
+  // history per selection (2 s steps, 5 minutes)
+  const H = mon.hist[mon.pick] = mon.hist[mon.pick] || { tg: [], gpu: [], vram: [], temp: [], pow: [], cpu: [], ram: [] };
+  const push = (k, v) => { H[k].push(v); if (H[k].length > 150) H[k].shift(); };
+  push("tg", lr ? lr.tg : null); push("gpu", util); push("vram", memT ? 100 * memU / memT : null);
+  push("temp", temps.length ? Math.max(...temps) : null); push("pow", gpus.length ? pow : null);
+  push("cpu", cpu); push("ram", ramT ? 100 * ramU / ramT : null);
+  $("mt-tg").innerHTML = lr && lr.tg ? `${nf(lr.tg, 1)}<small>t/s</small>` : "–";
+  $("mt-pp").innerHTML = lr && lr.pp ? `${nf(lr.pp, 0)}<small>t/s</small>` : "–";
+  $("mt-gpu").innerHTML = util != null ? `${nf(util, 0)}<small>%</small>` : "–";
+  $("mt-gpu-s").textContent = gpus.map((g) => `${gname(g)} ${g.util_pct ?? "–"} %`).join(" · ");
+  $("mt-vram").innerHTML = memT ? `${nf(memU / 1024, 1)}<small>/ ${nf(memT / 1024, 0)} GB</small>` : "–";
+  $("mt-vram-s").textContent = gpus.map((g) => `${gname(g)} ${nf((g.mem_used_mb || 0) / 1024, 1)} GB`).join(" · ");
+  $("mt-temp").innerHTML = temps.length ? `${Math.max(...temps)}<small>°C</small>` : "–";
+  $("mt-temp-s").textContent = gpus.filter((g) => g.temp_c != null).map((g) => `${gname(g)} ${g.temp_c} °C`).join(" · ");
+  $("mt-pow").innerHTML = gpus.some((g) => g.power_w != null) ? `${nf(pow, 0)}<small>W</small>` : "–";
+  $("mt-pow-s").textContent = gpus.filter((g) => g.power_w != null).map((g) => `${gname(g)} ${nf(g.power_w, 0)} W`).join(" · ");
+  const pc = gpus.filter((g) => g.pcie_gen);
+  $("mt-pcie").innerHTML = pc.length ? `Gen${Math.min(...pc.map((g) => g.pcie_gen))}<small>x${Math.min(...pc.map((g) => g.pcie_width || 0))}</small>` : "–";
+  $("mt-pcie-s").textContent = pc.map((g) => `${gname(g)} Gen${g.pcie_gen} x${g.pcie_width}${g.pcie_width_max && g.pcie_width_max !== g.pcie_width ? ` (max x${g.pcie_width_max})` : ""}`).join(" · ");
+  $("mt-cpu").innerHTML = cpu != null ? `${nf(cpu, 0)}<small>%</small>` : "–";
+  $("mt-cpu-s").textContent = sel.map((p) => `${sel.length > 1 ? p.name + " " : ""}${p.st.cpu_temp_c != null ? p.st.cpu_temp_c + " °C" : ""}${p.st.cpu_name ? " · " + p.st.cpu_name : ""}`).join(" · ");
+  $("mt-ram").innerHTML = ramT ? `${nf(ramU / 1024, 1)}<small>/ ${nf(ramT / 1024, 0)} GB</small>` : "–";
+  $("mt-ram-s").textContent = ramT ? `${nf(100 * ramU / ramT, 0)} % belegt` : "";
+  spark("ms-tg", H.tg, null, "var(--c0)"); spark("ms-gpu", H.gpu, 100, "var(--c0)"); spark("ms-vram", H.vram, 100, "var(--c4)");
+  spark("ms-temp", H.temp, 100, "var(--c1)"); spark("ms-pow", H.pow, null, "var(--c3)"); spark("ms-cpu", H.cpu, 100, "var(--c2)"); spark("ms-ram", H.ram, 100, "var(--c5)");
+  // context fill of the last request
+  const fill = lr && lr.ctx ? Math.min(100, 100 * lr.prompt / lr.ctx) : null, R = 46, C = 2 * Math.PI * R;
+  $("m-gauge").innerHTML = `<svg width="130" height="130" viewBox="0 0 130 130"><circle cx="65" cy="65" r="${R}" fill="none" stroke="var(--line)" stroke-width="12"/>${fill != null ? `<circle cx="65" cy="65" r="${R}" fill="none" stroke="var(--c0)" stroke-width="12" stroke-linecap="round" stroke-dasharray="${(C * fill / 100).toFixed(1)} ${C.toFixed(1)}" transform="rotate(-90 65 65)"/>` : ""}<text x="65" y="63" text-anchor="middle" font-size="22" font-weight="650" fill="var(--text)">${fill != null ? nf(fill, 0) + " %" : "–"}</text><text x="65" y="83" text-anchor="middle" font-size="11" fill="var(--muted)">${lr && lr.ctx ? `${nf(lr.prompt / 1000, 1)}k / ${nf(lr.ctx / 1024, 0)}k` : "keine Anfrage"}</text></svg>`;
+  const rp = lr && lr.prompt ? 100 * lr.reused / lr.prompt : 0;
+  $("m-reuse").style.width = rp + "%"; $("m-reuse-t").textContent = lr ? `${nf(lr.reused, 0)} von ${nf(lr.prompt, 0)}` : "–";
+  const tot = (mon.data || {}).totals || {}, ra = tot.prompt ? 100 * tot.reused / tot.prompt : 0;
+  $("m-reuse-all").style.width = ra + "%"; $("m-reuse-all-t").textContent = tot.prompt ? `${nf(ra, 0)} %` : "–";
+  const when = (t) => new Date(t * 1000).toLocaleTimeString("de-DE");
+  $("m-req").innerHTML = reqs.slice(0, mon.all ? 200 : 12).map((r) => `<tr><td>${when(r.t)}</td><td class="mname" title="${esc(r.model + " @" + r.where + " · " + (r.reason || ""))}">${esc(String(r.model || "").replace(/-\d{5}-of-\d{5}$/, ""))}${r.image ? " 🖼" : ""}<span class="note"> @${esc(r.where)}</span></td><td><span class="st${r.status && r.status !== 200 ? " bad" : ""}">${r.status === 200 ? "fertig" : r.status === 499 ? "abgebrochen" : r.status || "?"}</span></td><td class="num">${nf(r.prompt, 0)}</td><td class="num">${nf(r.reused, 0)}</td><td class="num">${nf(r.output, 0)}</td><td class="num">${r.pp ? nf(r.pp, 0) : "–"}</td><td class="num">${r.tg ? nf(r.tg, 1) : "–"}</td><td class="num">${nf(r.secs, 1)} s</td></tr>`).join("") || `<tr><td colspan="9" class="note">Noch keine Anfragen seit dem Start des Masters.</td></tr>`;
+  $("m-sum").textContent = tot.n ? `Seit ${new Date(tot.since * 1000).toLocaleString("de-DE", { dateStyle: "short", timeStyle: "short" })}: ${nf(tot.n, 0)} Anfragen · ${nf(tot.prompt, 0)} Prompt-Token (${nf(ra, 0)} % aus dem Cache) · gelesen mit ${tot.pp_ms ? nf((tot.prompt - tot.reused) / (tot.pp_ms / 1000), 0) : "–"} t/s · ${nf(tot.output, 0)} Token geschrieben mit ${tot.tg_ms ? nf(tot.output / (tot.tg_ms / 1000), 1) : "–"} t/s (Mittel, ohne externe Server)` : "";
 }
 
 /* ── Polling, login ──────────────────────────────────────────────────── */
@@ -1661,6 +1812,7 @@ async function tick() {
     $("login").hidden = true;
     $("logout").hidden = !key;
     render(s);
+    if ($("app").classList.contains("mon")) monFetch();
   } catch (e) {
     if (e.auth) { $("login").hidden = false; $("key").focus(); return; }
     $("offline").hidden = false;

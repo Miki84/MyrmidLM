@@ -24,6 +24,7 @@ VPN address).
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import json
 import os
@@ -4170,7 +4171,8 @@ class Dashboard:
                           if p.exists()), None)
         page = html_path.read_bytes() if html_path else b"<p>dashboard.html missing</p>"
         handler = _json_handler({"/": lambda: (page, "text/html; charset=utf-8"),
-                                 "/api/status": self.status},
+                                 "/api/status": self.status,
+                                 "/api/monitor": lambda: self.router.monitor() if self.router else {"requests": []}},
                                 {"/api/bench": lambda body: self.run_bench(),
                                  "/api/router": self.set_router,
                                  "/api/rebalance": self.sup.api,
@@ -6420,6 +6422,10 @@ class Router:
         self.counts = {"fast": 0, "big": 0, "extra": 0}
         self.recent: list[dict] = []
         self.on_timings = None  # callback(timings) for requests the master's big model ran alone
+        # The dashboard's monitor: the last requests with their tokens and speeds.
+        self.reqlog: collections.deque = collections.deque(maxlen=500)
+        self.reqtotals = {"since": int(time.time()), "n": 0, "prompt": 0, "reused": 0, "output": 0,
+                          "pp_ms": 0.0, "tg_ms": 0.0}
         self.waker = None  # callback(backend) -> backend once awake, or None: wake a sleeping host
         self.last_request = 0.0  # when the last request came in (updates wait for a quiet moment)
         self.prefer_fast = False  # within a group: the fastest first, slower ones only when it is busy
@@ -7057,6 +7063,7 @@ class Router:
                     backend.served += 1
                     router.last_request = time.time()
                 tail = b""
+                started, status = time.time(), 0
                 try:
                     try:
                         conn.request(method, path, body=raw, headers=headers)
@@ -7079,8 +7086,10 @@ class Router:
                                 conn.request(method, path, body=fix_effort(raw, backend.efforts), headers=headers)
                                 resp, pre = conn.getresponse(), b""
                     except OSError as e:
+                        status = 502
                         return self._json(502, {"error": {"message": f"{backend.where} ({backend.label}) "
                                                                      f"unreachable: {e}"}})
+                    status = resp.status
                     try:
                         self.send_response(resp.status)
                         self.send_header("Content-Type", resp.getheader("Content-Type", "application/json"))
@@ -7095,6 +7104,7 @@ class Router:
                         self.end_headers()
                         if pre:
                             self.wfile.write(f"{len(pre):x}\r\n".encode() + pre + b"\r\n")
+                            tail = pre[-16384:]
                         while True:
                             chunk = resp.read1(65536)
                             if not chunk:
@@ -7104,12 +7114,17 @@ class Router:
                             tail = (tail + chunk)[-16384:]
                         self.wfile.write(b"0\r\n\r\n")
                     except (BrokenPipeError, ConnectionResetError):
-                        pass  # client went away; closing the backend stops its generation
+                        status = 499  # client went away; closing the backend stops its generation
                 finally:
                     conn.close()
                     with router.lock:
                         alone = alone and backend.inflight == 1
                         backend.inflight -= 1
+                    if self.path.split("?", 1)[0].rstrip("/").endswith(("completions", "messages", "responses")):
+                        try:
+                            router.note_request(backend, status, tail, raw, reason, started, alone)
+                        except Exception as e:  # noqa: BLE001 - the monitor must never break serving
+                            log(f"Monitor: {e}")
                     found = re.findall(rb'"timings"\s*:\s*(\{[^{}]*\})', tail) if alone and tail else []
                     if found:
                         try:
@@ -7123,6 +7138,43 @@ class Router:
                             log(f"Calibration: {e}")
 
         return H
+
+    def note_request(self, b: Backend, status: int, tail: bytes, raw: Optional[bytes], reason: str,
+                     started: float, alone: bool) -> None:
+        """One line for the monitor: from llama-server's "timings" (tokens
+        read, reused from the cache, written, and the speeds), else from the
+        OpenAI "usage" an external server sends."""
+        t: dict = {}
+        found = re.findall(rb'"timings"\s*:\s*(\{[^{}]*\})', tail) if tail else []
+        if found:
+            try:
+                t = json.loads(found[-1])
+            except ValueError:
+                t = {}
+        def num(k: bytes) -> int:
+            m = re.findall(rb'"' + k + rb'"\s*:\s*(\d+)', tail or b"")
+            return int(m[-1]) if m else 0
+        reused = int(t.get("cache_n") or 0)
+        prompt = (int(t.get("prompt_n") or 0) + reused) if t else num(b"prompt_tokens")
+        out = int(t.get("predicted_n") or 0) if t else num(b"completion_tokens")
+        e = {"t": int(started), "status": status, "where": b.where, "model": b.group or b.label, "role": b.name,
+             "prompt": prompt, "reused": reused, "output": out,
+             "pp": round(float(t.get("prompt_per_second") or 0), 1), "tg": round(float(t.get("predicted_per_second") or 0), 1),
+             "secs": round(time.time() - started, 1), "reason": reason, "ctx": b.ctx or 0, "alone": alone,
+             "image": bool(raw and (b'"image_url"' in raw or b'"input_image"' in raw))}
+        with self.lock:
+            self.reqlog.append(e)
+            tot = self.reqtotals
+            tot["n"] += 1
+            tot["prompt"] += prompt
+            tot["reused"] += reused
+            tot["output"] += out
+            tot["pp_ms"] += float(t.get("prompt_ms") or 0)
+            tot["tg_ms"] += float(t.get("predicted_ms") or 0)
+
+    def monitor(self) -> dict:
+        with self.lock:
+            return {"requests": list(self.reqlog)[-200:][::-1], "totals": dict(self.reqtotals)}
 
     def start(self, host: str, port: int) -> bool:
         import threading
