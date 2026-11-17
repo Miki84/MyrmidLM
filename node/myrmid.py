@@ -5317,6 +5317,10 @@ class HostAgent:
         self.path = "" if slot is None else f"/gpu{slot}"  # prefix on the control and API ports
         self.api_port = HOST_INTERNAL_PORT + (slot or 0)  # llama-server, on 127.0.0.1
         self.state_file = HOST_STATE if slot is None else CONFIG_DIR / f"host-gpu{slot}.json"
+        # Saved configurations (dashboard, and before every autotune): restorable.
+        self.snap_file = CONFIG_DIR / ("snapshots.json" if slot is None else f"snapshots-gpu{slot}.json")
+        self.rollback: dict = {}  # after an autotune: back to the snapshot if it keeps crashing
+        self.event = ""  # something the host did on its own, shown in the card
         self.closed = False  # replaced by another layout
         self.node: Optional["HostNode"] = None
         self.state, self.error = "idle", ""
@@ -5432,7 +5436,12 @@ class HostAgent:
                   "switchable": can_switch_role(), "keyed": True, "release": own_version(),
                   "tune_job": self.tune_job or None,
                   "tuned": (tune_lookup(str(self.model_path), self.path) or None) if self.model_path else None,
+                  "snapshots": [{k: x.get(k) for k in ("id", "name", "at", "auto", "summary")}
+                                for x in self.snapshots()],
+                  "rollback": bool(self.rollback),
                   "update": update_brief()}
+            if self.event:
+                st["note"] = (st["note"] + " " if st["note"] else "") + self.event
         st["metrics"] = self._metrics()
         st["stats"] = self.stats.sample()
         st["models"] = sorted({p.stem.split("-00001-of-")[0] for p in self.models_dir.glob("*.gguf")}) \
@@ -5447,6 +5456,7 @@ class HostAgent:
     def assign(self, body: dict) -> dict:
         import threading
 
+        self.event = ""  # a message about the last restore is old news now
         model = str(body.get("model") or "").strip()
         if not model:
             return {"error": "model missing"}
@@ -5458,6 +5468,8 @@ class HostAgent:
             self.job += 1
             if a != self.assignment:
                 self.mem_cut = 0  # other settings: the plan starts afresh
+                if self.assignment is not None:
+                    self.rollback = {}  # changed by hand: no automatic way back
             self.assignment, self.restarts = a, 0
             job = self.job
         self._save()
@@ -5628,7 +5640,7 @@ class HostAgent:
                 log(" ".join(cmd).replace(self.key, "***"))
                 proc, tail = spawn_logged(cmd)
                 with self.lock:
-                    self.proc, self.model_path, self.ctx, self.tail = proc, path, ns.ctx, tail
+                    self.proc, self.model_path, self.ctx, self.tail, self.cmd = proc, path, ns.ctx, tail, cmd
                     self.estimate_tps = round(sp.estimate_tps, 1)
                     self.download = None
                     self.note = ""
@@ -5695,12 +5707,102 @@ class HostAgent:
             sp.cmd += ["--device", self.gpu.name]
         return sp
 
+    # Saved configurations --------------------------------------------------------
+
+    def snapshots(self) -> list[dict]:
+        try:
+            d = json.loads(self.snap_file.read_text())
+            return d if isinstance(d, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def snapshot_take(self, name: str = "", auto: bool = False) -> Optional[dict]:
+        """Everything that makes this host's model run as it does now: the
+        assignment (model, role, name, context, KV cache), the autotune's
+        values and the expert-cache measurement, plus the command and speed
+        for reference. Keeps the last 6 (the newest 3 automatic ones)."""
+        with self.lock:
+            a, path, cmd = dict(self.assignment or {}), self.model_path, list(getattr(self, "cmd", []) or [])
+        if not a:
+            return None
+        tuned = tune_lookup(str(path), self.path) if path else {}
+        moe = moe_tuned(str(path)) if path else {}
+        sc = (tuned or {}).get("score") or {}
+        summary = ", ".join(x for x in (
+            f"Kontext {a.get('ctx'):,}".replace(",", ".") if a.get("ctx") else "Kontext automatisch",
+            f"KV {a.get('kv')}" if a.get("kv") else "",
+            (tuned or {}).get("label") or "ohne Autotune",
+            f"{sc['tg']:.1f} Token/s".replace(".", ",") if sc.get("tg") else "") if x)
+        snap = {"id": f"{int(time.time() * 1000):x}", "at": int(time.time()), "auto": auto,
+                "name": name.strip()[:60] or time.strftime("%d.%m. %H:%M"), "summary": summary,
+                "assignment": a, "model_path": str(path) if path else "", "tune": tuned or None, "moe": moe or None,
+                "cmd": " ".join(cmd).replace(self.key, "***") if cmd else ""}
+        snaps = self.snapshots() + [snap]
+        autos = [x for x in snaps if x.get("auto")][-3:]
+        snaps = [x for x in snaps if not x.get("auto") or x in autos][-6:]
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            self.snap_file.write_text(json.dumps(snaps, indent=1))
+        except OSError as e:
+            log(f"{self.label}: could not save the configuration ({e})")
+            return None
+        log(f"{self.label}: configuration saved: {snap['name']} ({summary})")
+        return snap
+
+    def snapshot_restore(self, sid: str, why: str = "") -> bool:
+        snap = next((x for x in self.snapshots() if x.get("id") == sid), None)
+        if not snap:
+            return False
+        if snap.get("model_path"):
+            tune_save(snap["model_path"], self.path, snap.get("tune"))
+            if snap.get("moe"):
+                try:
+                    data = json.loads(MOE_TUNE_STATE.read_text())
+                except (OSError, ValueError):
+                    data = {}
+                data[str(Path(snap["model_path"]).resolve())] = snap["moe"]
+                try:
+                    MOE_TUNE_STATE.write_text(json.dumps(data, indent=1))
+                except OSError:
+                    pass
+        with self.lock:
+            self.mem_cut, self.rollback = 0, {}
+            self.assignment = None  # loads again even when the assignment is the same
+        log(f"{self.label}: configuration restored: {snap.get('name')}" + (f" ({why})" if why else ""))
+        self.assign(snap["assignment"])
+        with self.lock:
+            self.event = why or f"Konfiguration „{snap.get('name')}“ wiederhergestellt."
+        return True
+
+    def snapshot_delete(self, sid: str) -> None:
+        snaps = [x for x in self.snapshots() if x.get("id") != sid]
+        try:
+            self.snap_file.write_text(json.dumps(snaps, indent=1))
+        except OSError:
+            pass
+
     def tune(self, body: Optional[dict] = None) -> dict:
-        """The master's dashboard: autotune this host's model (start, cancel, reset)."""
+        """The master's dashboard: autotune this host's model (start, cancel,
+        reset), and saved configurations (save, restore, delete)."""
         import threading
 
         action = str((body or {}).get("action") or "start")
+        if action == "save":
+            snap = self.snapshot_take(str((body or {}).get("name") or ""))
+            return {**self.status(), **({} if snap else {"error": "kein Modell zugewiesen"})}
+        if action == "restore":
+            with self.lock:
+                if self.tune_job.get("state") == "running":
+                    return {**self.status(), "error": "the autotune is running"}
+            ok_ = self.snapshot_restore(str((body or {}).get("id") or ""))
+            return {**self.status(), **({} if ok_ else {"error": "Sicherung nicht gefunden"})}
+        if action == "delete":
+            self.snapshot_delete(str((body or {}).get("id") or ""))
+            return self.status()
+        if action in ("start", "reset") and self.tune_job.get("state") != "running":
+            self.snapshot_take("vor Autotune" if action == "start" else "vor Verwerfen", auto=True)
         with self.lock:
+            self.event = ""
             running = self.tune_job.get("state") == "running"
             if action == "cancel":
                 if running:
@@ -5737,6 +5839,10 @@ class HostAgent:
                            lambda: bool(job.get("cancel")))
             tune_save(str(path), self.path, res)
             job.update(state="done", text="fertig", result=res)
+            before = next((x for x in reversed(self.snapshots()) if x.get("auto") and x.get("name") == "vor Autotune"),
+                          None)
+            if before:  # crashes twice within the hour: back to how it ran before
+                self.rollback = {"id": before["id"], "until": time.time() + 3600, "crashes": 0}
         except (RuntimeError, PlanTooBig, ModelError) as e:
             job.update(state="error", text=str(e)[:300])
         except Exception as e:  # noqa: BLE001 - the model must come back
@@ -5760,6 +5866,16 @@ class HostAgent:
                     # the restart starts with less expert cache / a smaller batch.
                     self.mem_cut = min(max(self.mem_cut, getattr(self, "run_step", 0)) + 1, 3)
                     log(f"{self.label}: llama-server ran out of GPU memory while serving: {why}")
+                rb = self.rollback
+                if rb and time.time() < rb.get("until", 0):
+                    rb["crashes"] = rb.get("crashes", 0) + 1
+                    if rb["crashes"] >= 2:
+                        log(f"{self.label}: crashed twice since the autotune: restoring the configuration before it")
+                        self.snapshot_restore(rb["id"], "Nach dem Autotune ist das Modell zweimal abgestürzt: "
+                                                        "die Konfiguration von vorher ist wiederhergestellt.")
+                        continue
+                elif rb:
+                    self.rollback = {}
                 self.restarts += 1
                 if self.restarts > 3:
                     self._set("error", f"llama-server keeps ending (code {code}); not restarting again")
@@ -7433,7 +7549,8 @@ class HostManager:
             return self.info()
         if body.get("tune"):
             try:
-                res = self._call(self.hosts[hid], "/tune", {"action": str(body["tune"])}, timeout=10)
+                res = self._call(self.hosts[hid], "/tune", {"action": str(body["tune"]), "name": body.get("name"),
+                                                            "id": body.get("id")}, timeout=10)
             except Exception as e:  # noqa: BLE001
                 return {**self.info(), "error": f"autotune: {e}"}
             if res.get("error"):
@@ -7510,7 +7627,7 @@ class HostManager:
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
                                                        "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned",
-                                                       "note")},
+                                                       "note", "snapshots", "rollback")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]

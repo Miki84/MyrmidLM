@@ -1295,6 +1295,7 @@ function hostStats(x) {
     ${st.ram_total_mb ? meter("RAM", ramPct, `${gb(st.ram_used_mb)} / ${gb(st.ram_total_mb)}`, 90, 97) : ""}</div>`;
 }
 
+const hostOpen = {};  // which host cards have their saved configurations open
 function renderHosts(s) {
   const h = s.hosts || {}, list = h.hosts || [];
   const models = new Set((h.catalog || []).map((c) => c.key));
@@ -1355,6 +1356,9 @@ function renderHosts(s) {
       ${x.state === "ready" || x.state === "tuning" || x.tuned || x.tune_job ? `<div class="kv"><span class="note">${esc(tuneText(x.tune_job, x.tuned) || "Autotune: misst die schnellsten Einstellungen für dieses Modell auf diesem PC.")}</span>${
         x.tune_job && x.tune_job.state === "running" ? `<button class="btn quiet small" type="button" data-htune="cancel">Abbrechen</button>`
         : x.state === "ready" ? `<button class="btn quiet small" type="button" data-htune="start">${x.tuned ? "Autotune erneut" : "Autotune"}</button>${x.tuned ? `<button class="btn quiet small" type="button" data-htune="reset">Verwerfen</button>` : ""}` : ""}</div>` : ""}
+      ${x.assignment || (x.snapshots || []).length ? `<details class="snaps"${hostOpen[x.id] ? " open" : ""}><summary class="note">Gesicherte Konfigurationen (${(x.snapshots || []).length})${x.rollback ? " · Rückkehr nach Autotune aktiv" : ""}</summary>
+        <div class="kv">${x.assignment && x.state === "ready" ? `<button class="btn quiet small" type="button" data-hsnap="save">Aktuelle Konfiguration sichern</button>` : ""}</div>
+        ${(x.snapshots || []).slice().reverse().map((sn) => `<div class="kv"><span><strong>${esc(sn.name)}</strong>${sn.auto ? " <span class=\"note\">(automatisch)</span>" : ""} <span class="note">${new Date(sn.at * 1000).toLocaleString("de-DE", { dateStyle: "short", timeStyle: "short" })} · ${esc(sn.summary || "")}</span></span><button class="btn quiet small" type="button" data-hsnap="restore" data-sid="${esc(sn.id)}">Wiederherstellen</button><button class="btn quiet small" type="button" data-hsnap="delete" data-sid="${esc(sn.id)}" title="Löschen">✕</button></div>`).join("")}</details>` : ""}
       <form>
         <label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
@@ -1387,9 +1391,20 @@ $("hosts").addEventListener("submit", (ev) => {
   document.activeElement.blur();
   hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx"), kv: f.get("kv") });
 });
+$("hosts").addEventListener("toggle", (ev) => {
+  if (ev.target.matches && ev.target.matches("details.snaps")) hostOpen[ev.target.closest(".host").dataset.id] = ev.target.open;
+}, true);
 $("hosts").addEventListener("click", (ev) => {
   const card = ev.target.closest(".host"); if (!card) return;
   if (ev.target.matches("[data-unload]")) { delete hostEdits[card.dataset.id]; hostAction({ host: card.dataset.id, unload: true }); }
+  if (ev.target.matches("[data-hsnap]")) {
+    const act = ev.target.dataset.hsnap, id = ev.target.dataset.sid;
+    let name = "";
+    if (act === "save") { name = prompt("Name für diese Konfiguration (z. B. „stabil, 131k, mit Bildern“):", ""); if (name === null) return; }
+    if (act === "restore" && !confirm("Diese Konfiguration wiederherstellen? Das Modell wird mit ihr neu geladen.")) return;
+    if (act === "delete" && !confirm("Diese Sicherung löschen?")) return;
+    ev.target.disabled = true; hostAction({ host: card.dataset.id, tune: act, name, id });
+  }
   if (ev.target.matches("[data-htune]")) {
     const act = ev.target.dataset.htune;
     if (act === "start" && !confirm("Autotune auf diesem Host starten? Sein Modell steht währenddessen nicht zur Verfügung (5 bis 30 Minuten).")) return;
