@@ -1849,7 +1849,8 @@ def tune_label(flags: dict) -> str:
         elif k == "--numa":
             parts.append("NUMA verteilt")
         elif k == "-lm":
-            parts.append({"dio": "Direct I/O", "mlock": "Experten fest im RAM (mlock)"}.get(str(v), f"-lm {v}"))
+            parts.append({"dio": "Direct I/O", "mlock": "Experten fest im RAM (mlock)",
+                          "none": "Modell im RAM (ohne mmap)"}.get(str(v), f"-lm {v}"))
         elif k == "--moe-cache-cpu-share":
             parts.append(f"CPU-Anteil {v}")
         elif k == "--moe-cache-mib":
@@ -1956,8 +1957,16 @@ def _tune_variants(cmd: list[str]) -> list[tuple[str, list]]:
         # default) they aren't pinned and upload slowly; direct I/O or mlock
         # pins them (measured on Qwen3.8-Flash-Next: up to +63 %). The CPU
         # share decides how many cache misses the CPU computes itself.
-        dims.append(("-lm", [None, "dio", "mlock"]))
-        dims.append(("--moe-cache-cpu-share", [None, 0.5, 0.95]))
+        # "none" reads the model into RAM (pinned): the best mode in a 12 GB
+        # test with llama.cpp 1.0 (writing +63 %, reading +88 %), with CPU
+        # share 0. Every one of these needs the whole model in RAM.
+        try:
+            size_mb = sum(Path(p).stat().st_size for p in gguf_shards(cmd[cmd.index("-m") + 1])) / 2**20
+        except Exception:  # noqa: BLE001 - unknown: assume it fits
+            size_mb = 0
+        if host_available_mb() > size_mb * 1.1 + HOST_RESERVE_MB:
+            dims.append(("-lm", [None, "none", "dio", "mlock"]))
+        dims.append(("--moe-cache-cpu-share", [None, 0, 0.5, 0.95]))
     dims.append(("-ub", [None, 1024, 2048]))
     cpu_work = "--cpu-moe" in cmd or "--n-cpu-moe" in cmd or \
         ("-ngl" in cmd and cmd[cmd.index("-ngl") + 1] == "0")
