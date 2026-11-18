@@ -5448,9 +5448,20 @@ def strata_stop_running(why: str = "") -> None:
 
 # Root's side -------------------------------------------------------------------------------------------------------
 
+def _strata_work(d: Path) -> Path:
+    """Where Strata's server, .venv and strata-*.json are: the clone itself, or
+    its terminal/ folder (layout of Strata 0.2.16; setup.sh moves an older clone there)."""
+    return d / "terminal" if (d / "terminal" / "serve" / "server.py").is_file() else d
+
+
+def _is_strata_dir(d: Path) -> bool:
+    return (_strata_work(d) / "serve" / "server.py").is_file()
+
+
 def _strata_configs(d: Path) -> list[str]:
     try:
-        return sorted(p.name for p in d.glob("strata-*.json") if STRATA_CFG_RE.match(p.name) and p.is_file())
+        return sorted(p.name for p in _strata_work(d).glob("strata-*.json")
+                      if STRATA_CFG_RE.match(p.name) and p.is_file() and not p.name.endswith(".shared-settings.json"))
     except OSError:
         return []
 
@@ -5491,6 +5502,15 @@ def _strata_user_env(conf: dict) -> dict:
     return e
 
 
+def _run_as(user: str, cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    """Runs cmd as user (root only), with the user's groups."""
+    import pwd
+
+    pw = pwd.getpwnam(user)
+    return subprocess.run(cmd, user=pw.pw_uid, group=pw.pw_gid,
+                          extra_groups=os.getgrouplist(user, pw.pw_gid), **kw)
+
+
 def strata_apply_request() -> None:
     """myrmid-strata-request.service (root): carries out the host's request."""
     work = STRATA_REQ.with_suffix(".work")  # taken away first: a newer request can't get lost meanwhile
@@ -5509,7 +5529,7 @@ def strata_apply_request() -> None:
         d = Path(conf["dir"])
         if act == "start":
             cfg, port, key = str(req.get("config") or ""), int(req.get("port") or 0), str(req.get("key") or "")
-            if not STRATA_CFG_RE.match(cfg) or not (d / cfg).is_file():
+            if not STRATA_CFG_RE.match(cfg) or not (_strata_work(d) / cfg).is_file():
                 raise UpdateError(f"Strata-Konfiguration {cfg or '?'} gibt es in {d} nicht")
             if not 1024 <= port <= 65535 or not STRATA_KEY_RE.match(key):
                 raise UpdateError("ungültiger Port oder Schlüssel")
@@ -5539,12 +5559,12 @@ def strata_apply_request() -> None:
             STRATA_UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
             log(f"Strata: updating {d} (as {conf['user']}; log {STRATA_UPDATE_LOG})")
             with open(STRATA_UPDATE_LOG, "a") as out:
-                out.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} update.sh ===\n")
+                out.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} update ===\n")
                 out.flush()
                 try:
-                    r = subprocess.run(["runuser", "-u", conf["user"], "--", "sh", "./update.sh"], cwd=d,
-                                       env=_strata_user_env(conf), stdin=subprocess.DEVNULL, stdout=out,
-                                       stderr=subprocess.STDOUT, timeout=3 * 3600)
+                    cmd = ["sh", "./update.sh"] if (d / "update.sh").is_file() else ["sh", "./setup.sh", "--update"]
+                    r = _run_as(conf["user"], cmd, cwd=d, env=_strata_user_env(conf),
+                                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, timeout=3 * 3600)
                     code = r.returncode
                 except subprocess.TimeoutExpired:
                     code = -1
@@ -5555,7 +5575,7 @@ def strata_apply_request() -> None:
                     last = STRATA_UPDATE_LOG.read_text(errors="replace").strip().splitlines()[-3:]
                 except OSError:
                     last = []
-                raise UpdateError(f"update.sh endete mit Code {code}" + (": " + " / ".join(last) if last else ""))
+                raise UpdateError(f"Update endete mit Code {code}" + (": " + " / ".join(last) if last else ""))
             res["version"] = _strata_version(d)
     except (UpdateError, OSError, ValueError, KeyError) as e:
         res.update(ok=False, error=str(e))
@@ -5600,7 +5620,7 @@ STRATA_LOGROTATE = """/var/log/myrmid/strata.log /var/log/myrmid/strata-update.l
 
 def _strata_find_dir() -> Optional[Path]:
     for p in sorted(Path("/home").glob("*/strata")) + [Path("/opt/strata"), Path("/root/strata")]:
-        if (p / "serve" / "server.py").is_file():
+        if _is_strata_dir(p):
             return p
     return None
 
@@ -5637,7 +5657,8 @@ WorkingDirectory={conf['dir']}
 Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin
 {env_lines + chr(10) if env_lines else ''}# Written per start by the host (config, port, key): it comes last, so it wins
 EnvironmentFile=/run/myrmid/strata.env
-ExecStart={conf['python']} serve/server.py --engine strata --config ${{STRATA_CONFIG}} --port ${{STRATA_PORT}} --host 127.0.0.1
+# The clone itself or its terminal/ folder (Strata 0.2.16 moved everything there): both work, also after an update
+ExecStart=/bin/sh -c '[ -f terminal/serve/server.py ] && cd terminal; exec .venv/bin/python serve/server.py --engine strata --config "$$STRATA_CONFIG" --port "$$STRATA_PORT" --host 127.0.0.1'
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=300
@@ -5652,13 +5673,13 @@ def strata_setup(args) -> None:
     import pwd
 
     d = Path(args.dir).expanduser().resolve() if args.dir else _strata_find_dir()
-    if not d or not (d / "serve" / "server.py").is_file():
+    if not d or not _is_strata_dir(d):
         die("Strata-Ordner nicht gefunden (mit serve/server.py): --dir /home/<user>/strata angeben")
     user = args.user or pwd.getpwuid(d.stat().st_uid).pw_name
     if user == "root":
         die("Strata soll nicht als root laufen: --user <name> angeben")
-    py = d / ".venv" / "bin" / "python"
-    if not py.exists():
+    py = _strata_work(d) / ".venv" / "bin" / "python"
+    if not py.exists() and not (d / ".venv" / "bin" / "python").exists():
         die(f"{py} fehlt: Strata einmal mit ./setup.sh einrichten")
     old = UNIT_DIR / "strata.service"
     extra = _strata_old_unit_env(old)
@@ -5692,6 +5713,56 @@ def strata_setup(args) -> None:
     print("Im Dashboard des Masters: Host-Karte → Engine „Strata“ wählen, Konfiguration wählen, Laden.")
 
 
+STRATA_REPO = "https://github.com/Niko1221/Strata.git"
+
+
+def strata_install(args) -> None:
+    """Clones Strata into the user's home, runs its setup.sh as that user
+    (model, storage, engine: its questions are answered in the terminal)
+    without starting it, then takes it into MyrmidLM (strata_setup)."""
+    import pwd
+    import shutil
+
+    user = args.user or os.environ.get("SUDO_USER") or ""
+    if not user or user == "root":
+        die("Für welchen Benutzer? sudo myrmid strata install --user <name> (Strata läuft nicht als root)")
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        die(f"Benutzer {user} gibt es nicht")
+    d = Path(args.dir).expanduser() if args.dir else Path(pw.pw_dir) / "strata"
+    uenv = _strata_user_env({"user": user})
+
+    def as_user(cmd: list[str], cwd: Path) -> int:
+        return _run_as(user, cmd, cwd=cwd, env=uenv).returncode
+
+    if _is_strata_dir(d):
+        print(f"Strata ist schon in {d}: Klonen übersprungen")
+    else:
+        if d.exists() and any(d.iterdir()):
+            die(f"{d} gibt es schon und ist kein Strata-Ordner: anderen Ordner mit --dir angeben")
+        if not shutil.which("git"):
+            print("git fehlt, wird installiert ...")
+            if not shutil.which("apt-get") or subprocess.run(["apt-get", "install", "-y", "git"]).returncode:
+                die("git konnte nicht installiert werden: bitte von Hand installieren")
+        d.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Hole Strata nach {d} ...")
+        if as_user(["git", "clone", STRATA_REPO, str(d)], d.parent):
+            die("git clone ist fehlgeschlagen")
+    if not args.no_setup:
+        print("\nStrata-Einrichtung (setup.sh, als " + user + "): Modell, Speicherort und Einstellungen wählen. "
+              "Das Modell wird heruntergeladen (40-90 GB); Strata startet danach nicht, das macht MyrmidLM.\n")
+        code = as_user(["sh", "./setup.sh", "--no-start", *(args.setup_args or [])], d)
+        if code:
+            die(f"setup.sh endete mit Code {code}. Danach erneut: sudo myrmid strata install --user {user}")
+    if not _strata_configs(d):
+        die(f"In {d} gibt es noch keine strata-*.json (kein Modell eingerichtet): "
+            f"sudo myrmid strata install --user {user} erneut ausführen")
+    args.dir, args.user = str(d), user
+    print()
+    strata_setup(args)
+
+
 def cmd_strata(args) -> None:
     if args.what == "status":
         conf, info = strata_conf(), strata_info()
@@ -5710,6 +5781,8 @@ def cmd_strata(args) -> None:
         die("Das braucht root: sudo myrmid strata " + args.what)
     if args.what == "setup":
         strata_setup(args)
+    elif args.what == "install":
+        strata_install(args)
     elif args.what == "apply-request":
         strata_apply_request()
 
@@ -9072,12 +9145,17 @@ def main() -> None:
     sc.add_argument("--json", action="store_true")
     sc.set_defaults(fn=cmd_scan)
 
-    st = sub.add_parser("strata", help="Strata as a host's engine: setup (once, sudo), status",
-                        description="setup: take an installed Strata (github.com/Niko1221/Strata) into MyrmidLM: "
+    st = sub.add_parser("strata", help="Strata as a host's engine: install or setup (once, sudo), status",
+                        description="install: clone Strata into the user's home, run its setup.sh as that user "
+                                    "(choose the model there), then do what setup does. "
+                                    "setup: take an installed Strata (github.com/Niko1221/Strata) into MyrmidLM: "
                                     "writes myrmid-strata.service for the user who installed it, the request helper and "
                                     "log rotation, and stops an old strata.service. The master's dashboard then "
                                     "switches the host's engine between llama.cpp and Strata.")
-    st.add_argument("what", nargs="?", default="status", choices=("status", "setup", "apply-request"))
+    st.add_argument("what", nargs="?", default="status", choices=("status", "install", "setup", "apply-request"))
+    st.add_argument("--no-setup", action="store_true", help="install: don't run setup.sh (already done)")
+    st.add_argument("setup_args", nargs="*", help="install: passed on to setup.sh, after --, "
+                                                  "e.g. -- --family qwen --model Q2_0")
     st.add_argument("--dir", help="Strata's folder (default: /home/*/strata)")
     st.add_argument("--user", help="the user Strata runs as (default: the folder's owner)")
     st.add_argument("--keep-old", action="store_true", help="leave an existing strata.service running and enabled")
