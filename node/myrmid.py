@@ -6839,6 +6839,10 @@ class Router:
                 return self._pick_group(group, "Modell angefordert", need, loose)
             for role, words in ROLE_WORDS.items():
                 if forced in words:
+                    members = self.role(role)
+                    if images and members and all(b.vision is False for b in members) and \
+                            any(b.vision for b in self.backends):
+                        break  # "big" can't read the image: the model that can (below)
                     return self._pick_role(role, "angefordert", need, loose)
         if images:
             # only to a model that reads images: the big/fast one if it does, else any
