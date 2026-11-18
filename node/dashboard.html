@@ -1423,6 +1423,7 @@ function renderHosts(s) {
         <label>Rolle<select name="role">${["big", "fast", "extra"].map((r) => `<option value="${r}"${r === role ? " selected" : ""}>${ROLE_TEXT[r]}</option>`).join("")}</select></label>
         <label>Kontext<input name="ctx" inputmode="numeric" value="${val("ctx")}" placeholder="automatisch"></label>
         <label>KV-Cache<select name="kv">${KV_OPTS.map(([v, t]) => `<option value="${v}"${v === (e.kv ?? a.kv ?? "f16") ? " selected" : ""}>${t}</option>`).join("")}</select></label>
+        <label title="Bild-Teil des Modells (mmproj), wenn es einen hat. Aus: mehr VRAM für Text.">Bilder<select name="vision">${[["auto", "an (GPU, wenn Platz)"], ["cpu", "an, im RAM"], ["off", "aus"]].map(([v, t]) => `<option value="${v}"${v === (e.vision ?? a.vision ?? "auto") ? " selected" : ""}>${t}</option>`).join("")}</select></label>
         <div class="acts"><button class="btn" type="submit">Laden</button>${x.assignment ? `<button class="btn quiet" type="button" data-unload>Entladen</button>` : ""}</div>
       </form></article>`;
   }).join("");
@@ -1447,7 +1448,7 @@ $("hosts").addEventListener("submit", (ev) => {
   const card = ev.target.closest(".host"), f = new FormData(ev.target);
   delete hostEdits[card.dataset.id];
   document.activeElement.blur();
-  hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx"), kv: f.get("kv") });
+  hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx"), kv: f.get("kv"), vision: f.get("vision") });
 });
 $("hosts").addEventListener("toggle", (ev) => {
   if (ev.target.matches && ev.target.matches("details.snaps")) hostOpen[ev.target.closest(".host").dataset.id] = ev.target.open;

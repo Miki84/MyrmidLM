@@ -1307,8 +1307,12 @@ def build_server(args, quiet: bool = False) -> ServerPlan:
     images (a few seconds each)."""
     args._mmproj_cpu = False
     model = str(Path(args.model).expanduser().resolve())
+    mode = str(getattr(args, "mmproj", "auto")).lower()  # auto | cpu (always in RAM) | off (text only)
+    if mode == "cpu" and Path(model).is_file() and find_mmproj(model):
+        args._mmproj_cpu = True
+        return _build_server(args, quiet)
     gpus = [d for d in usable_gpus(probe(bench=False)) if d.type == "gpu"] if Path(model).is_file() else []
-    if not gpus or str(getattr(args, "mmproj", "auto")).lower() == "off" or not find_mmproj(model):
+    if not gpus or mode == "off" or not find_mmproj(model):
         return _build_server(args, quiet)
     try:
         on_gpu: Optional[ServerPlan] = _build_server(args, True)
@@ -5465,7 +5469,8 @@ class HostAgent:
         a = {"model": model, "name": str(body.get("name") or "").strip(),
              "role": body.get("role") if body.get("role") in ("big", "fast", "extra") else "big",
              "ctx": parse_ctx(body.get("ctx")),
-             "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16"}
+             "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16",
+             "vision": body.get("vision") if body.get("vision") in ("auto", "cpu", "off") else "auto"}
         with self.lock:
             self.job += 1
             if a != self.assignment:
@@ -5701,7 +5706,7 @@ class HostAgent:
                                   ram_limit=self.ram_limit_gb, api_key=self.key, host="127.0.0.1",
                                   port=self.api_port, extra=list(self.args.extra or []), scan_timeout=1.0,
                                   only_devices=[self.gpu.name] if self.gpu else None,
-                                  tune_slot=self.path, no_tune=no_tune)
+                                  tune_slot=self.path, no_tune=no_tune, mmproj=a.get("vision") or "auto")
 
     def _plan(self, ns: argparse.Namespace) -> "ServerPlan":
         sp = build_server_fitting(ns, quiet=True, exit_on_fail=False)
@@ -5733,6 +5738,7 @@ class HostAgent:
         summary = ", ".join(x for x in (
             f"Kontext {a.get('ctx'):,}".replace(",", ".") if a.get("ctx") else "Kontext automatisch",
             f"KV {a.get('kv')}" if a.get("kv") else "",
+            {"cpu": "Bilder im RAM", "off": "ohne Bilder"}.get(a.get("vision") or "", ""),
             (tuned or {}).get("label") or "ohne Autotune",
             f"{sc['tg']:.1f} Token/s".replace(".", ",") if sc.get("tg") else "") if x)
         snap = {"id": f"{int(time.time() * 1000):x}", "at": int(time.time()), "auto": auto,
@@ -7391,7 +7397,8 @@ class HostManager:
             return
         keys = ("model", "role", "name", "ctx")
         if not force and have and all(have.get(k) == want.get(k) for k in keys) \
-                and (have.get("kv") or "f16") == (want.get("kv") or "f16"):  # hosts before 1.6.2 know only f16
+                and (have.get("kv") or "f16") == (want.get("kv") or "f16") \
+                and (have.get("vision") or "auto") == (want.get("vision") or "auto"):  # older hosts: no such fields
             return
         last = self.pushed.get(hid)
         if last and last[0] == json.dumps(want, sort_keys=True) and time.time() - last[1] < 60:
@@ -7652,7 +7659,8 @@ class HostManager:
             self.assign[hid] = {"model": model, "role": body.get("role") if body.get("role") in ("big", "fast", "extra")
                                 else "big", "name": str(body.get("name") or "").strip(),
                                 "ctx": parse_ctx(ctx),
-                                "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16"}
+                                "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16",
+                                "vision": body.get("vision") if body.get("vision") in ("auto", "cpu", "off") else "auto"}
         self.save()
         self.pushed.pop(hid, None)
         # a click always reaches the host, also when it has this assignment already
