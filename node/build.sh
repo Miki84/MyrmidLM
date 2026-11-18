@@ -148,6 +148,9 @@ for p in "$HERE"/patches/*.patch; do
 done
 
 echo "==> Configuring"
+# Assets of the llama-server web page from earlier builds: no longer built, and
+# stale ones fail the asset check.
+rm -rf "$BUILD/llama.cpp/tools/ui/dist"
 cmake -S "$HERE" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DLLAMA_CPP_DIR="$SRC" ${flags[@]+"${flags[@]}"}
 
 echo "==> Building with $JOBS jobs (CUDA/ROCm builds take a while)"

@@ -31,6 +31,11 @@ set(LLAMA_BUILD_SERVER ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+# llama-server's own web page isn't needed (the master has its dashboard), and
+# its prebuilt assets come from a Hugging Face bucket at build time: when that
+# changes, builds broke (missing "workbox[hash].js"). Built without it.
+set(LLAMA_BUILD_UI OFF CACHE BOOL "" FORCE)
+set(LLAMA_USE_PREBUILT_UI OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(${LLAMA_CPP_DIR} llama.cpp)
 
