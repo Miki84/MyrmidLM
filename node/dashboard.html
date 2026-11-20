@@ -329,6 +329,10 @@
     .dot.busy { animation: none; }
     .bar > i { transition: none; }
   }
+.strata-gpus { border: 1px solid var(--line, #d9dee3); border-radius: 8px; padding: 6px 10px 8px; margin: 0; }
+.strata-gpus legend { font-size: .86rem; padding: 0 4px; }
+.strata-gpus .chk { display: flex; align-items: center; gap: 6px; font-weight: normal; margin: 3px 0; }
+.strata-gpus .chk input { width: auto; margin: 0; }
 </style>
 </head>
 <body>
@@ -1380,6 +1384,13 @@ function renderHosts(s) {
     const a = x.assignment || {}, e = hostEdits[x.id] || {};
     const val = (k, d) => esc(e[k] ?? (k === "model" && a.engine === "strata" ? "" : a[k]) ?? d ?? "");
     const engine = x.strata ? (e.engine ?? a.engine ?? "llama") : "llama";
+    const sCfg = e.model ?? (a.engine === "strata" ? a.model : "") ?? "";
+    const sCfgName = sCfg || ((x.strata || {}).configs || [])[0] || "";
+    const sDefault = ((x.strata || {}).config_gpus || {})[sCfgName] || "";
+    const sChosen = (e.strata_gpus ?? (a.engine === "strata" && a.model === sCfgName ? a.strata_gpus : "")) || sDefault;
+    const sSet = new Set(String(sChosen).split(",").filter((v) => v !== ""));
+    const nvGpus = ((x.stats || {}).gpus || []).filter((g) => g.vendor === "NVIDIA" && g.index != null);
+    const strataGpuRow = x.strata && nvGpus.length > 1 ? `<fieldset class="wide strata-gpus" title="Welche Karten Strata nutzt (mehrere: Strata teilt die Schichten auf). Keine angehakt: wie in der Strata-Konfiguration${sDefault ? " (GPU " + esc(sDefault) + ")" : ""}. Strata empfiehlt für geteilte Modelle mindestens 8 GB je Karte."><legend>GPUs für Strata${sDefault ? ` <span class="note">(Konfiguration: GPU ${esc(sDefault)})</span>` : ""}</legend>${nvGpus.map((g) => `<label class="chk"><input type="checkbox" name="strata_gpu" value="${g.index}"${sSet.has(String(g.index)) ? " checked" : ""}> GPU ${g.index}: ${esc(g.name)} (${((g.mem_total_mb || 0) / 1024).toFixed(0)} GB)${(g.mem_total_mb || 0) < 8000 ? ' <span class="note">unter 8 GB</span>' : ""}</label>`).join("")}</fieldset>` : "";
     const strataRow = x.strata ? `<div class="kv"><span class="note">Strata${x.strata.version ? " " + esc(x.strata.version) : ""} · Dienst ${esc(STRATA_STATE[x.strata.state] || x.strata.state || "?")}</span><button class="btn quiet small" type="button" data-hstrata="update" title="Update im Strata-Ordner (git pull, Engine, Pakete). Läuft Strata, wird es dafür kurz gestoppt.">Strata aktualisieren</button><button class="btn quiet small" type="button" data-hstrata="refresh" title="Konfigurationen neu einlesen">↻</button></div>` : "";
     const pr = x.progress;
     const eta = pr && pr.mb_s > 0.1 ? Math.max(0, (pr.total_mb - pr.done_mb) / pr.mb_s) : 0;
@@ -1424,7 +1435,7 @@ function renderHosts(s) {
       <form>
         ${x.strata ? `<label title="llama.cpp: MyrmidLM plant und startet llama-server. Strata: die auf diesem PC installierte Strata-Engine mit ihrer eigenen Konfiguration.">Engine<select name="engine">${[["llama", "llama.cpp"], ["strata", "Strata"]].map(([v, t]) => `<option value="${v}"${v === engine ? " selected" : ""}>${t}</option>`).join("")}</select></label>` : ""}
         ${engine === "strata"
-          ? `<label class="wide">Strata-Konfiguration<select name="model">${(x.strata.configs || []).map((c) => `<option value="${esc(c)}"${c === (e.model ?? (a.engine === "strata" ? a.model : "")) ? " selected" : ""}>${esc(c.replace(/^strata-|\.json$/g, ""))}</option>`).join("") || `<option value="">keine strata-*.json gefunden</option>`}</select></label>`
+          ? `<label class="wide">Strata-Konfiguration<select name="model">${(x.strata.configs || []).map((c) => `<option value="${esc(c)}"${c === (e.model ?? (a.engine === "strata" ? a.model : "")) ? " selected" : ""}>${esc(c.replace(/^strata-|\.json$/g, ""))}</option>`).join("") || `<option value="">keine strata-*.json gefunden</option>`}</select></label>` + strataGpuRow
           : `<label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>`}
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
         <label>Rolle<select name="role">${["big", "fast", "extra"].map((r) => `<option value="${r}"${r === role ? " selected" : ""}>${ROLE_TEXT[r]}</option>`).join("")}</select></label>
@@ -1448,15 +1459,21 @@ async function hostAction(body) {
 $("hosts").addEventListener("input", (ev) => {
   const card = ev.target.closest(".host"); if (!card) return;
   const id = card.dataset.id;
+  if (ev.target.name === "strata_gpu") {
+    const vals = [...card.querySelectorAll('input[name="strata_gpu"]:checked')].map((c) => c.value);
+    hostEdits[id] = { ...(hostEdits[id] || {}), strata_gpus: vals.join(",") };
+    return;
+  }
   hostEdits[id] = { ...(hostEdits[id] || {}), [ev.target.name]: ev.target.value };
-  if (ev.target.name === "engine") { delete hostEdits[id].model; if (last) renderHosts(last); }
+  if (ev.target.name === "engine") { delete hostEdits[id].model; delete hostEdits[id].strata_gpus; if (last) renderHosts(last); }
+  if (ev.target.name === "model" && ev.target.tagName === "SELECT" && hostEdits[id].strata_gpus === undefined && last) renderHosts(last);
 });
 $("hosts").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const card = ev.target.closest(".host"), f = new FormData(ev.target);
   delete hostEdits[card.dataset.id];
   document.activeElement.blur();
-  hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx"), kv: f.get("kv"), vision: f.get("vision"), engine: f.get("engine") || "llama" });
+  hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx"), kv: f.get("kv"), vision: f.get("vision"), engine: f.get("engine") || "llama", strata_gpus: f.getAll("strata_gpu").join(",") });
 });
 $("hosts").addEventListener("toggle", (ev) => {
   if (ev.target.matches && ev.target.matches("details.snaps")) hostOpen[ev.target.closest(".host").dataset.id] = ev.target.open;

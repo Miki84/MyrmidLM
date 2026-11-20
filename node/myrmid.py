@@ -3606,7 +3606,7 @@ class SystemStats:
                     capture_output=True, text=True, timeout=5).stdout
                 for line in res.strip().splitlines():
                     f = [x.strip() for x in line.split(",")]
-                    out.append({"name": f[0], "vendor": "NVIDIA", "util_pct": _num(f[1]),
+                    out.append({"name": f[0], "vendor": "NVIDIA", "index": len(out), "util_pct": _num(f[1]),
                                 "mem_used_mb": _num(f[2]), "mem_total_mb": _num(f[3]),
                                 "temp_c": _num(f[4]), "power_w": _num(f[5]),
                                 # the slot's link (the generation drops at idle to save power: max is what it can)
@@ -5321,6 +5321,12 @@ STRATA_LOG = Path("/var/log/myrmid/strata.log")
 STRATA_UPDATE_LOG = Path("/var/log/myrmid/strata-update.log")
 STRATA_CFG_RE = re.compile(r"^strata-[A-Za-z0-9_.-]+\.json$")
 STRATA_KEY_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{8,200}$")
+STRATA_GPU_RE = re.compile(r"^\d{1,2}(,\d{1,2}){0,15}$")  # nvidia-smi numbers: "1" or "0,2"
+# Strata's server takes the cards as --gpu (nvidia-smi numbers, several = a layer split); without STRATA_GPU the
+# configuration's own "gpu" counts. The clone itself or its terminal/ folder (Strata 0.2.16): both work.
+STRATA_EXEC = ("ExecStart=/bin/sh -c '[ -f terminal/serve/server.py ] && cd terminal; exec .venv/bin/python "
+               "serve/server.py --engine strata --config \"$$STRATA_CONFIG\" --port \"$$STRATA_PORT\" --host 127.0.0.1"
+               " $${STRATA_GPU:+--gpu \"$$STRATA_GPU\"}'")
 
 
 def strata_conf() -> dict:
@@ -5410,8 +5416,8 @@ class StrataProc:
         self.asked = 0.0 if adopted else time.time()
         self.stopped = False
 
-    def start(self, config: str, key: str) -> None:
-        self.asked = strata_request("start", config=config, port=self.port, key=key)
+    def start(self, config: str, key: str, gpus: str = "") -> None:
+        self.asked = strata_request("start", config=config, port=self.port, key=key, gpus=gpus)
 
     def poll(self) -> Optional[int]:
         if self.stopped:
@@ -5495,6 +5501,7 @@ def _strata_write_info(conf: dict, result: Optional[dict] = None) -> None:
     d = Path(conf["dir"]) if conf else None
     old = strata_info()
     info = {"configs": _strata_configs(d) if d else [], "version": _strata_version(d) if d else "",
+            "config_gpus": _strata_config_gpus(d) if d else {},
             "result": result if result is not None else old.get("result"), "at": time.time()}
     if not conf:
         info["error"] = "Strata ist auf diesem PC nicht eingerichtet: sudo myrmid strata setup"
@@ -5504,8 +5511,37 @@ def _strata_write_info(conf: dict, result: Optional[dict] = None) -> None:
     os.replace(tmp, STRATA_INFO)
 
 
-def _strata_env_text(config: str, port: int, key: str) -> str:
-    return f"STRATA_CONFIG={config}\nSTRATA_PORT={port}\nSTRATA_API_KEY={key}\n"
+def _strata_env_text(config: str, port: int, key: str, gpus: str = "") -> str:
+    return f"STRATA_CONFIG={config}\nSTRATA_PORT={port}\nSTRATA_API_KEY={key}\nSTRATA_GPU={gpus}\n"
+
+
+def _strata_config_gpus(d: Path) -> dict:
+    """{config: its cards as text ("1", "0,2")}: what Strata uses when the dashboard names none."""
+    out = {}
+    for name in _strata_configs(d):
+        try:
+            g = json.loads((_strata_work(d) / name).read_text()).get("gpu")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(g, list):
+            g = ",".join(str(x) for x in g)
+        if g is not None and STRATA_GPU_RE.match(str(g).replace(" ", "")):
+            out[name] = str(g).replace(" ", "")
+    return out
+
+
+def _strata_unit_current() -> None:
+    """A unit from an older MyrmidLM: its ExecStart gets today's (e.g. --gpu), the rest stays."""
+    unit = UNIT_DIR / STRATA_UNIT
+    try:
+        lines = unit.read_text().splitlines()
+    except OSError:
+        return
+    new = [STRATA_EXEC if ln.startswith("ExecStart=") else ln for ln in lines]
+    if new != lines:
+        unit.write_text("\n".join(new) + "\n")
+        _systemctl("daemon-reload")
+        log(f"Strata: {unit} brought up to date")
 
 
 def _strata_user_env(conf: dict) -> dict:
@@ -5549,7 +5585,11 @@ def strata_apply_request() -> None:
                 raise UpdateError(f"Strata-Konfiguration {cfg or '?'} gibt es in {d} nicht")
             if not 1024 <= port <= 65535 or not STRATA_KEY_RE.match(key):
                 raise UpdateError("ungültiger Port oder Schlüssel")
-            want = _strata_env_text(cfg, port, key)
+            gpus = str(req.get("gpus") or "")
+            if gpus and not STRATA_GPU_RE.match(gpus):
+                raise UpdateError(f"ungültige GPU-Auswahl {gpus!r}")
+            _strata_unit_current()
+            want = _strata_env_text(cfg, port, key, gpus)
             try:
                 same = STRATA_ENV.read_text() == want
             except OSError:
@@ -5561,7 +5601,7 @@ def strata_apply_request() -> None:
                 with os.fdopen(fd, "w") as f:
                     f.write(want)
                 STRATA_LOG.parent.mkdir(parents=True, exist_ok=True)
-                log(f"Strata: starting with {cfg} on 127.0.0.1:{port}")
+                log(f"Strata: starting with {cfg} on 127.0.0.1:{port}" + (f", GPUs {gpus}" if gpus else ""))
                 r = _systemctl("restart", STRATA_UNIT)
                 if r.returncode:
                     raise UpdateError(f"systemctl restart {STRATA_UNIT}: {(r.stderr or r.stdout).strip()}")
@@ -5674,7 +5714,7 @@ Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin
 {env_lines + chr(10) if env_lines else ''}# Written per start by the host (config, port, key): it comes last, so it wins
 EnvironmentFile=/run/myrmid/strata.env
 # The clone itself or its terminal/ folder (Strata 0.2.16 moved everything there): both work, also after an update
-ExecStart=/bin/sh -c '[ -f terminal/serve/server.py ] && cd terminal; exec .venv/bin/python serve/server.py --engine strata --config "$$STRATA_CONFIG" --port "$$STRATA_PORT" --host 127.0.0.1'
+{STRATA_EXEC}
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=300
@@ -5963,6 +6003,7 @@ class HostAgent:
                 except OSError:
                     pass
             st["strata"] = {"configs": info.get("configs") or [], "version": info.get("version") or "",
+                            "config_gpus": info.get("config_gpus") or {},
                             "state": strata_state(self.api_port)}
         st["models"] = sorted({p.stem.split("-00001-of-")[0] for p in self.models_dir.glob("*.gguf")}) \
             if self.models_dir.is_dir() else []
@@ -5988,7 +6029,10 @@ class HostAgent:
         if body.get("engine") == "strata":  # model = one of Strata's strata-*.json; it brings its own settings
             if not STRATA_CFG_RE.match(model):
                 return {"error": "Strata: Konfiguration strata-<name>.json wählen"}
-            a.update(engine="strata", ctx=None, kv="f16", vision="auto")
+            gpus = str(body.get("strata_gpus") or "").replace(" ", "")
+            if gpus and not STRATA_GPU_RE.match(gpus):
+                return {"error": f"Strata: ungültige GPU-Auswahl {gpus}"}
+            a.update(engine="strata", ctx=None, kv="f16", vision="auto", strata_gpus=gpus)
         with self.lock:
             self.job += 1
             if a != self.assignment:
@@ -6125,7 +6169,7 @@ class HostAgent:
                 return
             self._set("loading")
             proc = StrataProc(self.api_port)
-            proc.start(a["model"], self.key)
+            proc.start(a["model"], self.key, a.get("strata_gpus") or "")
             with self.lock:
                 self.proc, self.model_path, self.ctx, self.tail, self.cmd = proc, Path(a["model"]), None, [], []
                 self.estimate_tps, self.download, self.note = None, None, ""
@@ -8046,7 +8090,8 @@ class HostManager:
         if not force and have and all(have.get(k) == want.get(k) for k in keys) \
                 and (have.get("kv") or "f16") == (want.get("kv") or "f16") \
                 and (have.get("vision") or "auto") == (want.get("vision") or "auto") \
-                and (have.get("engine") or "llama") == (want.get("engine") or "llama"):  # older hosts: no such fields
+                and (have.get("engine") or "llama") == (want.get("engine") or "llama") \
+                and (have.get("strata_gpus") or "") == (want.get("strata_gpus") or ""):  # older hosts: no such fields
             return
         last = self.pushed.get(hid)
         if last and last[0] == json.dumps(want, sort_keys=True) and time.time() - last[1] < 60:
@@ -8293,8 +8338,9 @@ class HostManager:
                     want = (self.hosts[old_first].get("status") or {}).get("assignment")
                 new_first = pc if body["layout"] == "split" else f"{pc}-gpu0"
                 if want:
-                    self.assign[new_first] = {k: want.get(k) for k in ("model", "role", "name", "ctx", "kv", "engine")
-                                              if want.get(k) is not None or k != "engine"}
+                    self.assign[new_first] = {k: want.get(k) for k in ("model", "role", "name", "ctx", "kv", "engine",
+                                                                              "strata_gpus")
+                                              if want.get(k) is not None or k not in ("engine", "strata_gpus")}
                     self.pushed.pop(new_first, None)
             self.save()
             self.rescan, self.last_scan = True, 0
@@ -8321,7 +8367,9 @@ class HostManager:
                                 "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16",
                                 "vision": body.get("vision") if body.get("vision") in ("auto", "cpu", "off") else "auto"}
             if body.get("engine") == "strata":  # Strata's strata-*.json brings context and the rest
-                self.assign[hid].update(engine="strata", ctx=None, kv="f16", vision="auto")
+                gpus = str(body.get("strata_gpus") or "").replace(" ", "")
+                self.assign[hid].update(engine="strata", ctx=None, kv="f16", vision="auto",
+                                        strata_gpus=gpus if STRATA_GPU_RE.match(gpus) else "")
         self.save()
         self.pushed.pop(hid, None)
         # a click always reaches the host, also when it has this assignment already
