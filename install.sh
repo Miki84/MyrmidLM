@@ -765,6 +765,11 @@ if has_vendor nvidia && [[ $RUN_DOCKER -eq 0 ]]; then
                 def=n
             fi
             if install_cuda "$cuda_pkg" "$def"; then USE_CUDA=1
+            elif [[ "$cuda_pkg" != cuda-toolkit && $NV_OLD_OK -eq 1 ]] && \
+                 ask_yn "CUDA 12.9 gibt es hier nicht als Paket (z. B. Ubuntu 26.04: nur CUDA 13). Stattdessen im CUDA-12.9-Container bauen (Docker, ca. 5 GB)?" j; then
+                # docker-build.sh picks the 12.9 image for the older card; the programs run on the host as usual
+                BUILD_MODE=docker CUDA_BIN="" USE_CUDA=1
+                ok "CUDA: wird im CUDA-12.9-Container gebaut (auch die nächtlichen Updates)"
             elif [[ -n "$CUDA_NEW_BIN" ]]; then
                 # no CUDA 12: the newer cards keep CUDA 13, build.sh leaves the older one out
                 CUDA_BIN="$CUDA_NEW_BIN" USE_CUDA=1
