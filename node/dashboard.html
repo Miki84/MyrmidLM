@@ -1512,8 +1512,9 @@ $("hosts").addEventListener("input", (ev) => {
     return;
   }
   hostEdits[id] = { ...(hostEdits[id] || {}), [ev.target.name]: ev.target.value };
-  if (ev.target.name === "engine") { delete hostEdits[id].model; delete hostEdits[id].strata_gpus; if (last) renderHosts(last); }
-  if (ev.target.name === "model" && ev.target.tagName === "SELECT" && hostEdits[id].strata_gpus === undefined && last) renderHosts(last);
+  // renderHosts leaves a card alone while something in it has the focus: let go of it first
+  if (ev.target.name === "engine") { delete hostEdits[id].model; delete hostEdits[id].strata_gpus; ev.target.blur(); if (last) renderHosts(last); }
+  if (ev.target.name === "model" && ev.target.tagName === "SELECT" && hostEdits[id].strata_gpus === undefined && last) { ev.target.blur(); renderHosts(last); }
 });
 $("hosts").addEventListener("submit", (ev) => {
   ev.preventDefault();
@@ -1557,10 +1558,10 @@ $("hosts").addEventListener("click", (ev) => {
   if (ev.target.matches("[data-hsleep]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, sleep: true }); }
   if (ev.target.closest("[data-layout-groups]") || ev.target.matches("[data-groups-edit]")) {
     const x = (last && ((last.hosts || {}).hosts || []).find((h) => h.id === card.dataset.id)) || null;
-    if (x) { groupEdits[x.id] = { open: true, sel: groupSuggest(x) }; renderHosts(last); }
+    if (x) { groupEdits[x.id] = { open: true, sel: groupSuggest(x) }; ev.target.blur(); renderHosts(last); }
     return;
   }
-  if (ev.target.matches("[data-groups-cancel]")) { delete groupEdits[card.dataset.id]; renderHosts(last); return; }
+  if (ev.target.matches("[data-groups-cancel]")) { delete groupEdits[card.dataset.id]; ev.target.blur(); renderHosts(last); return; }
   if (ev.target.matches("[data-groups-apply]")) {
     const ed = groupEdits[card.dataset.id]; if (!ed) return;
     const byGroup = {};
