@@ -5339,13 +5339,26 @@ def strata_info() -> dict:
         return {}
 
 
-def strata_state() -> str:
-    """active, activating, deactivating, inactive, failed (systemctl is-active needs no root)."""
+_STRATA_SYSTEMCTL_WARNED = [""]
+
+
+def strata_state(port: int = 0) -> str:
+    """active, activating, deactivating, inactive, failed (systemctl is-active needs no root). If systemctl gives no
+    answer, Strata's port tells: it answers -> active."""
     try:
-        return subprocess.run(["systemctl", "is-active", STRATA_UNIT], capture_output=True, text=True,
-                              timeout=10).stdout.strip() or "unknown"
-    except (OSError, subprocess.TimeoutExpired):
-        return "unknown"
+        r = subprocess.run(["systemctl", "is-active", STRATA_UNIT], capture_output=True, text=True, timeout=10)
+        st = r.stdout.strip()
+        why = "" if st else f"{(r.stderr or '').strip()[:200] or r.returncode}"
+    except (OSError, subprocess.TimeoutExpired) as e:
+        st, why = "", str(e)
+    if why and why != _STRATA_SYSTEMCTL_WARNED[0]:
+        _STRATA_SYSTEMCTL_WARNED[0] = why  # once per kind of failure, not every poll
+        log(f"Strata: systemctl is-active {STRATA_UNIT} gave no answer ({why}); using the port instead")
+    if st and st != "unknown":
+        return st
+    if port:
+        return "active" if strata_health(port) is not None else "inactive"
+    return "unknown"
 
 
 def strata_health(port: int) -> Optional[dict]:
@@ -5403,7 +5416,7 @@ class StrataProc:
     def poll(self) -> Optional[int]:
         if self.stopped:
             return 0
-        st = strata_state()
+        st = strata_state(self.port)
         if st in ("active", "activating", "reloading"):
             return None
         if time.time() - self.asked < self.GRACE_S:
@@ -5425,7 +5438,9 @@ class StrataProc:
     def wait(self, timeout: Optional[float] = None) -> int:
         end = time.time() + (timeout if timeout is not None else 120)
         while time.time() < end:
-            if strata_state() in ("inactive", "failed", "unknown"):
+            # stopped means: the service says so AND the port is free (then the GPUs are free too)
+            if strata_state(self.port) in ("inactive", "failed", "unknown") and \
+                    (not self.port or strata_health(self.port) is None):
                 return 0
             time.sleep(1)
         if timeout is not None:
@@ -5433,12 +5448,12 @@ class StrataProc:
         return 0
 
 
-def strata_stop_running(why: str = "") -> None:
+def strata_stop_running(why: str = "", port: int = 0) -> None:
     """Stops Strata if it runs (llama-server takes the GPUs next)."""
-    if not strata_conf() or strata_state() not in ("active", "activating", "reloading"):
+    if not strata_conf() or strata_state(port) not in ("active", "activating", "reloading"):
         return
     log(f"Strata: stopping it{' (' + why + ')' if why else ''}")
-    p = StrataProc(0, adopted=True)
+    p = StrataProc(port, adopted=True)
     p.terminate()
     try:
         p.wait(timeout=90)
@@ -5948,7 +5963,7 @@ class HostAgent:
                 except OSError:
                     pass
             st["strata"] = {"configs": info.get("configs") or [], "version": info.get("version") or "",
-                            "state": strata_state()}
+                            "state": strata_state(self.api_port)}
         st["models"] = sorted({p.stem.split("-00001-of-")[0] for p in self.models_dir.glob("*.gguf")}) \
             if self.models_dir.is_dir() else []
         if node:  # the PC's layout: the master lists every slot and can switch it
@@ -6063,7 +6078,7 @@ class HostAgent:
         try:
             self._set("preparing")
             self.stop_server()
-            strata_stop_running("llama.cpp takes the GPUs")
+            strata_stop_running("llama.cpp takes the GPUs", self.api_port)
             path = self._local(a["model"])
             if path is None:
                 self._set("downloading")
