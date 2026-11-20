@@ -336,6 +336,9 @@
 .grp-edit { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 6px 0; display: grid; gap: 6px; }
 .grp-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-weight: normal; }
 .grp-row select { width: auto; }
+.strata-set { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+.strata-set summary { cursor: pointer; font-size: .9rem; }
+.strata-set .kv { align-items: flex-end; gap: 10px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -1433,6 +1436,14 @@ function renderHosts(s) {
     const strataGpuRow = strataFixed
       ? `<div class="wide note">${x.strata.fixed_gpu === null ? "Die Nummer dieser GPU ist nicht zu ermitteln: Strata geht hier nicht." : `Strata nutzt hier nur diese GPU (GPU ${x.strata.fixed_gpu}). Je PC läuft eine Strata-Instanz.`}${x.strata.elsewhere ? " <b>Strata läuft gerade auf einer anderen GPU dieses PCs.</b>" : ""}</div>`
       : x.strata && nvGpus.length > 1 ? `<fieldset class="wide strata-gpus" title="Welche Karten Strata nutzt (mehrere: Strata teilt die Schichten auf). Keine angehakt: wie in der Strata-Konfiguration${sDefault ? " (GPU " + esc(sDefault) + ")" : ""}. Strata empfiehlt für geteilte Modelle mindestens 8 GB je Karte."><legend>GPUs für Strata${sDefault ? ` <span class="note">(Konfiguration: GPU ${esc(sDefault)})</span>` : ""}</legend>${nvGpus.map((g) => `<label class="chk"><input type="checkbox" name="strata_gpu" value="${g.index}"${sSet.has(String(g.index)) ? " checked" : ""}> GPU ${g.index}: ${esc(g.name)} (${((g.mem_total_mb || 0) / 1024).toFixed(0)} GB)${(g.mem_total_mb || 0) < 8000 ? ' <span class="note">unter 8 GB</span>' : ""}</label>`).join("")}</fieldset>` : "";
+    const sSet0 = ((x.strata || {}).config_settings || {})[sCfgName] || {};
+    const sCtx = e.strata_ctx ?? (sSet0.context || (a.engine === "strata" && x.ctx) || 131072);
+    const sKv = e.strata_kv ?? (sSet0.kv || "int8");
+    const strataSettings = x.strata && engine === "strata" && sCfgName ? `<details class="wide strata-set"${e.strata_ctx !== undefined || e.strata_kv !== undefined ? " open" : ""}><summary>Strata-Einstellungen: Kontext und KV-Cache${sSet0.context ? ` <span class="note">(jetzt ${Number(sSet0.context).toLocaleString("de-DE")}${sSet0.kv ? ", " + esc(sSet0.kv) : ""})</span>` : ""}</summary>
+        <div class="note">Strata legt beides in der Konfiguration ${esc(sCfgName)} fest. „Übernehmen“ richtet sie mit Strata-Setup neu ein (ohne neuen Download) und startet Strata neu; das dauert ein paar Minuten.</div>
+        <div class="kv"><label>Kontext<input name="strata_ctx" inputmode="numeric" value="${esc(String(sCtx))}" placeholder="z. B. 131072"></label>
+        <label>KV-Cache<select name="strata_kv">${[["int8", "int8 (Standard)"], ["q4_0", "q4_0 (½ Speicher)"], ["k8v4", "k8v4 (K 8 Bit, V 4 Bit)"], ["fp16", "fp16 (voll, doppelter Speicher)"]].map(([v, t]) => `<option value="${v}"${v === sKv ? " selected" : ""}>${t}</option>`).join("")}</select></label>
+        <button class="btn small" type="button" data-hstrata-reconf="${esc(sCfgName)}">Übernehmen</button></div></details>` : "";
     const strataRow = x.strata ? `<div class="kv"><span class="note">Strata${x.strata.version ? " " + esc(x.strata.version) : ""} · Dienst ${esc(STRATA_STATE[x.strata.state] || x.strata.state || "?")}</span><button class="btn quiet small" type="button" data-hstrata="update" title="Update im Strata-Ordner (git pull, Engine, Pakete). Läuft Strata, wird es dafür kurz gestoppt.">Strata aktualisieren</button><button class="btn quiet small" type="button" data-hstrata="refresh" title="Konfigurationen neu einlesen">↻</button></div>` : "";
     const pr = x.progress;
     const eta = pr && pr.mb_s > 0.1 ? Math.max(0, (pr.total_mb - pr.done_mb) / pr.mb_s) : 0;
@@ -1478,7 +1489,7 @@ function renderHosts(s) {
       <form>
         ${x.strata ? `<label title="llama.cpp: MyrmidLM plant und startet llama-server. Strata: die auf diesem PC installierte Strata-Engine mit ihrer eigenen Konfiguration.">Engine<select name="engine">${[["llama", "llama.cpp"], ["strata", "Strata"]].map(([v, t]) => `<option value="${v}"${v === engine ? " selected" : ""}>${t}</option>`).join("")}</select></label>` : ""}
         ${engine === "strata"
-          ? `<label class="wide">Strata-Konfiguration<select name="model">${(x.strata.configs || []).map((c) => `<option value="${esc(c)}"${c === (e.model ?? (a.engine === "strata" ? a.model : "")) ? " selected" : ""}>${esc(c.replace(/^strata-|\.json$/g, ""))}</option>`).join("") || `<option value="">keine strata-*.json gefunden</option>`}</select></label>` + strataGpuRow
+          ? `<label class="wide">Strata-Konfiguration<select name="model">${(x.strata.configs || []).map((c) => `<option value="${esc(c)}"${c === (e.model ?? (a.engine === "strata" ? a.model : "")) ? " selected" : ""}>${esc(c.replace(/^strata-|\.json$/g, ""))}</option>`).join("") || `<option value="">keine strata-*.json gefunden</option>`}</select></label>` + strataGpuRow + strataSettings
           : `<label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>`}
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
         <label>Rolle<select name="role">${["big", "fast", "extra"].map((r) => `<option value="${r}"${r === role ? " selected" : ""}>${ROLE_TEXT[r]}</option>`).join("")}</select></label>
@@ -1529,6 +1540,17 @@ $("hosts").addEventListener("toggle", (ev) => {
 $("hosts").addEventListener("click", (ev) => {
   const card = ev.target.closest(".host"); if (!card) return;
   if (ev.target.matches("[data-unload]")) { delete hostEdits[card.dataset.id]; hostAction({ host: card.dataset.id, unload: true }); }
+  if (ev.target.matches("[data-hstrata-reconf]")) {
+    const ctx = (card.querySelector('input[name="strata_ctx"]') || {}).value || "";
+    const kv = (card.querySelector('select[name="strata_kv"]') || {}).value || "int8";
+    if (!/^\s*[\d.\s]+k?\s*$/i.test(ctx)) { alert("Kontext als Zahl angeben, z. B. 131072 oder 128k."); return; }
+    if (!confirm(`Strata neu einrichten: Kontext ${ctx}, KV-Cache ${kv}?\n\nStrata stoppt dafür und startet danach neu; das Modell ist einige Minuten nicht erreichbar.`)) return;
+    const id = card.dataset.id;
+    if (hostEdits[id]) { delete hostEdits[id].strata_ctx; delete hostEdits[id].strata_kv; }
+    ev.target.disabled = true;
+    hostAction({ host: id, strata: "reconfigure", config: ev.target.dataset.hstrataReconf, context: ctx.replace(/[.\s]/g, ""), kv });
+    return;
+  }
   if (ev.target.matches("[data-hstrata]")) {
     const act = ev.target.dataset.hstrata;
     if (act === "update" && !confirm("Strata aktualisieren? Läuft das Modell gerade mit Strata, ist es einige Minuten nicht erreichbar.")) return;

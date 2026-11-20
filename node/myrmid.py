@@ -5545,6 +5545,7 @@ def _strata_write_info(conf: dict, result: Optional[dict] = None) -> None:
     info = {"configs": _strata_configs(d) if d else [], "version": _strata_version(d) if d else "",
             "running": running,
             "config_gpus": _strata_config_gpus(d) if d else {},
+            "config_settings": _strata_config_settings(d) if d else {},
             "result": result if result is not None else old.get("result"), "at": time.time()}
     if not conf:
         info["error"] = "Strata ist auf diesem PC nicht eingerichtet: sudo myrmid strata setup"
@@ -5655,35 +5656,99 @@ def strata_apply_request() -> None:
             _systemctl("stop", STRATA_UNIT)
             res["running"] = None
         elif act == "update":
-            was = strata_state() in ("active", "activating")
-            if was:
-                _systemctl("stop", STRATA_UNIT)
-            STRATA_UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-            log(f"Strata: updating {d} (as {conf['user']}; log {STRATA_UPDATE_LOG})")
-            with open(STRATA_UPDATE_LOG, "a") as out:
-                out.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} update ===\n")
-                out.flush()
-                try:
-                    cmd = ["sh", "./update.sh"] if (d / "update.sh").is_file() else ["sh", "./setup.sh", "--update"]
-                    r = _run_as(conf["user"], cmd, cwd=d, env=_strata_user_env(conf),
-                                stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, timeout=3 * 3600)
-                    code = r.returncode
-                except subprocess.TimeoutExpired:
-                    code = -1
-            if was:
-                _systemctl("start", STRATA_UNIT)
-            if code:
-                try:
-                    last = STRATA_UPDATE_LOG.read_text(errors="replace").strip().splitlines()[-3:]
-                except OSError:
-                    last = []
-                raise UpdateError(f"Update endete mit Code {code}" + (": " + " / ".join(last) if last else ""))
+            cmd = ["sh", "./update.sh"] if (d / "update.sh").is_file() else ["sh", "./setup.sh", "--update"]
+            _strata_run_job(conf, d, cmd, "Update")
             res["version"] = _strata_version(d)
+        elif act == "reconfigure":  # context and KV cache live in the configuration: setup writes it anew
+            cfg = str(req.get("config") or "")
+            if not STRATA_CFG_RE.match(cfg) or not (_strata_work(d) / cfg).is_file():
+                raise UpdateError(f"Strata-Konfiguration {cfg or '?'} gibt es nicht")
+            ctx, kv, gpus = int(req.get("context") or 0), str(req.get("kv") or ""), str(req.get("gpus") or "")
+            if not 4096 <= ctx <= 1048576 or kv not in STRATA_KVS or (gpus and not STRATA_GPU_RE.match(gpus)):
+                raise UpdateError("ungültiger Kontext, KV-Cache oder GPU-Auswahl")
+            family, model = _strata_family_model(conf, d, cfg)
+            cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes", "--model", model, "--context", str(ctx),
+                   "--kv", kv] + (["--family", family] if family else []) + (["--gpus", gpus] if "," in gpus else [])
+            _strata_run_job(conf, d, cmd, "Einrichtung")
+            _strata_write_info(conf)  # the new settings for the card
+
     except (UpdateError, OSError, ValueError, KeyError) as e:
         res.update(ok=False, error=str(e))
         log(f"Strata: {act} failed: {e}")
     res["done_at"] = time.time()
     _strata_write_info(conf, res)
+
+
+STRATA_KVS = ("int8", "q4_0", "k8v4", "fp16")
+
+
+def _strata_run_job(conf: dict, d: Path, cmd: list[str], what: str) -> None:
+    """Runs one of Strata's scripts as its user (root only): Strata stops meanwhile and starts again if it ran."""
+    was = strata_state() in ("active", "activating")
+    if was:
+        _systemctl("stop", STRATA_UNIT)
+    STRATA_UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log(f"Strata: {' '.join(cmd)} in {d} (as {conf['user']}; log {STRATA_UPDATE_LOG})")
+    with open(STRATA_UPDATE_LOG, "a") as out:
+        out.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd)} ===\n")
+        out.flush()
+        try:
+            r = _run_as(conf["user"], cmd, cwd=d, env=_strata_user_env(conf),
+                        stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, timeout=3 * 3600)
+            code = r.returncode
+        except subprocess.TimeoutExpired:
+            code = -1
+    if was:
+        _systemctl("start", STRATA_UNIT)
+    if code:
+        try:
+            last = [x for x in STRATA_UPDATE_LOG.read_text(errors="replace").strip().splitlines() if x.strip()][-3:]
+        except OSError:
+            last = []
+        raise UpdateError(f"{what} endete mit Code {code}" + (": " + " / ".join(x.strip() for x in last) if last else ""))
+
+
+def _strata_family_model(conf: dict, d: Path, cfg: str) -> tuple[str, str]:
+    """setup.sh's --family and --model of a configuration: its model_name is the family's name + "-" + the model
+    (qwen3.8-flash-next-iq3_s); the family names come from Strata's own setup.py."""
+    try:
+        name = str(json.loads((_strata_work(d) / cfg).read_text()).get("model_name") or "")
+    except (OSError, ValueError, AttributeError):
+        name = ""
+    fams = {"qwen3.8-flash-next": "qwen"}
+    try:
+        r = _run_as(conf["user"], [str(_strata_work(d) / ".venv" / "bin" / "python"), "-c",
+                                   "import json, setup; print(json.dumps({k: v.get('name') for k, v in "
+                                   "{**setup.FAMILIES, **getattr(setup, 'PREVIEW_FAMILIES', {})}.items()}))"],
+                    cwd=_strata_work(d), env=_strata_user_env(conf), capture_output=True, text=True, timeout=60)
+        got = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else {}
+        fams = {v: k for k, v in got.items() if v} or fams
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        pass
+    for fname in sorted(fams, key=len, reverse=True):  # the longest name that fits: -coder before the base
+        if name.startswith(fname + "-"):
+            return fams[fname], name[len(fname) + 1:].upper()
+    # no model_name: the file name says the model (strata-iq3_s.json); the family stays setup's default
+    return "", cfg[len("strata-"):-len(".json")].upper()
+
+
+def _strata_config_settings(d: Path) -> dict:
+    """{config: {"context": n, "kv": ...}} as far as the configuration's engine arguments say."""
+    out = {}
+    for name in _strata_configs(d):
+        try:
+            args = [str(x) for x in (json.loads((_strata_work(d) / name).read_text()).get("args") or [])]
+        except (OSError, ValueError, AttributeError):
+            continue
+        st = {}
+        for i, x in enumerate(args[:-1]):
+            if x in ("--ctx", "--context", "-c", "--ctx-size", "--max-context") and args[i + 1].isdigit():
+                st["context"] = int(args[i + 1])
+            elif x in ("--kv", "--kv-type", "--kv-cache") and args[i + 1] in STRATA_KVS:
+                st["kv"] = args[i + 1]
+        if st:
+            out[name] = st
+    return out
 
 
 STRATA_REQUEST_PATH = """[Unit]
@@ -6059,6 +6124,7 @@ class HostAgent:
                     pass
             st["strata"] = {"configs": info.get("configs") or [], "version": info.get("version") or "",
                             "config_gpus": info.get("config_gpus") or {},
+                            "config_settings": info.get("config_settings") or {},
                             "state": strata_state(self.api_port)}
             if self.slot is not None:  # one GPU or a group of several: Strata gets exactly these
                 st["strata"]["fixed_gpu"] = self._strata_fixed()
@@ -6285,14 +6351,28 @@ class HostAgent:
         action = str((body or {}).get("action") or "")
         if not strata_conf():
             return {**self.status(), "error": "Strata ist auf diesem PC nicht eingerichtet: sudo myrmid strata setup"}
-        if action == "update":
+        if action in ("update", "reconfigure"):
+            kw = {}
+            if action == "reconfigure":
+                b = body or {}
+                ctx = parse_ctx(b.get("context"))
+                kv = str(b.get("kv") or "int8")
+                cfg = str(b.get("config") or (self.assignment or {}).get("model") or "")
+                if not ctx or not STRATA_CFG_RE.match(cfg) or kv not in STRATA_KVS:
+                    return {**self.status(), "error": "Strata: Konfiguration, Kontext und KV-Cache angeben"}
+                gpus = (self._strata_fixed() if self.slot is not None else
+                        ((self.assignment or {}).get("strata_gpus") or "")) or ""
+                kw = {"config": cfg, "context": ctx, "kv": kv, "gpus": gpus}
             if (self.assignment or {}).get("engine") == "strata":
                 with self.lock:
-                    self.job += 1  # watch() must not restart it meanwhile; the update does
+                    self.job += 1  # watch() must not restart it meanwhile; the job does
                     self.state = "loading"
-            self.strata_update_at = strata_request("update")
+            self.strata_update_at = strata_request(action, **kw)
+            self.strata_job = action
             with self.lock:
-                self.event = "Strata wird aktualisiert …"
+                self.event = ("Strata wird aktualisiert …" if action == "update" else
+                              f"Strata wird neu eingerichtet (Kontext {kw['context']:,}, KV {kw['kv']}) …"
+                              .replace(",", "."))
             import threading
             threading.Thread(target=self._after_strata_update, daemon=True).start()
         elif action == "refresh":
@@ -6305,9 +6385,14 @@ class HostAgent:
         while time.time() < end and strata_result(at) is None:
             time.sleep(5)
         r = strata_result(at) or {}
+        upd = getattr(self, "strata_job", "update") == "update"
         with self.lock:
-            self.event = ("Strata aktualisiert" + (f" ({r.get('version')})" if r.get("version") else "") + "."
-                          if r.get("ok") else f"Strata-Update fehlgeschlagen: {r.get('error') or 'keine Antwort'}")
+            if r.get("ok"):
+                self.event = ("Strata aktualisiert" + (f" ({r.get('version')})" if r.get("version") else "") + "."
+                              if upd else "Strata neu eingerichtet.")
+            else:
+                self.event = (f"Strata-{'Update' if upd else 'Einrichtung'} fehlgeschlagen: "
+                              f"{r.get('error') or 'keine Antwort'}")
             a = self.assignment
         if a and a.get("engine") == "strata":
             self.assign(a)  # waits for it to be ready again
@@ -8419,7 +8504,9 @@ class HostManager:
             return self.info()
         if body.get("strata"):
             try:
-                res = self._call(self.hosts[hid], "/strata", {"action": str(body["strata"])}, timeout=10)
+                res = self._call(self.hosts[hid], "/strata",
+                                 {"action": str(body["strata"]),
+                                  **{k: body[k] for k in ("config", "context", "kv") if k in body}}, timeout=10)
             except Exception as e:  # noqa: BLE001
                 return {**self.info(), "error": f"Strata: {e}"}
             if res.get("error"):
