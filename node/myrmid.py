@@ -5468,8 +5468,9 @@ def _strata_configs(d: Path) -> list[str]:
 
 def _strata_version(d: Path) -> str:
     try:
-        out = subprocess.run(["git", "-C", str(d), "log", "-1", "--format=%h %cs"], capture_output=True, text=True,
-                             timeout=10)
+        # root reads the user's clone: without safe.directory git refuses ("dubious ownership")
+        out = subprocess.run(["git", "-c", f"safe.directory={d}", "-C", str(d), "log", "-1", "--format=%h %cs"],
+                             capture_output=True, text=True, timeout=10)
         return out.stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -5771,8 +5772,14 @@ def cmd_strata(args) -> None:
             return
         print(f"Ordner:   {conf['dir']} (Benutzer {conf['user']})")
         print(f"Dienst:   {STRATA_UNIT}: {strata_state()}")
+        if not info:
+            print(f"Antwort:  {STRATA_INFO} fehlt (der Host fragt sie an; prüfen: "
+                  f"systemctl status myrmid-strata-request.path)")
         print(f"Version:  {info.get('version') or '?'}")
         print(f"Konfig.:  {', '.join(info.get('configs') or []) or '?'}")
+        local = _strata_configs(Path(conf["dir"]))
+        if local != (info.get("configs") or []):
+            print(f"Im Ordner: {', '.join(local) or 'keine strata-*.json'} (Ordner {_strata_work(Path(conf['dir']))})")
         r = info.get("result") or {}
         if r:
             print(f"Zuletzt:  {r.get('action')} " + ("ok" if r.get("ok") else f"Fehler: {r.get('error')}"))
@@ -8326,7 +8333,7 @@ class HostManager:
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
                                                        "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned",
-                                                       "note", "snapshots", "rollback")},
+                                                       "note", "snapshots", "rollback", "engine", "strata")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]
