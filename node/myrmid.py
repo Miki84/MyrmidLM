@@ -5378,11 +5378,20 @@ def strata_health(port: int) -> Optional[dict]:
         return None
 
 
-def strata_log_tail(n: int = 40) -> list[str]:
+def strata_log_size() -> int:
+    try:
+        return STRATA_LOG.stat().st_size
+    except OSError:
+        return 0
+
+
+def strata_log_tail(n: int = 40, since: int = 0) -> list[str]:
+    """The log's last lines; since: only what came after that size (this start, not an older run's error)."""
     try:
         with open(STRATA_LOG, "rb") as f:
             f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - 64 * 1024))
+            end = f.tell()
+            f.seek(max(0, end - 64 * 1024, since if since <= end else 0))
             return f.read().decode(errors="replace").splitlines()[-n:]
     except OSError:
         return []
@@ -5419,6 +5428,7 @@ class StrataProc:
         self.stopped = False
 
     def start(self, config: str, key: str, gpus: str = "") -> None:
+        self.log_from = strata_log_size()
         self.asked = strata_request("start", config=config, port=self.port, key=key, gpus=gpus)
 
     def poll(self) -> Optional[int]:
@@ -6318,7 +6328,7 @@ class HostAgent:
                     self._set("error", f"Strata: {r.get('error')}")
                     return
                 if proc.poll() is not None:
-                    tail = [x for x in strata_log_tail(60) if x.strip()]
+                    tail = [x for x in strata_log_tail(60, getattr(proc, "log_from", 0)) if x.strip()]
                     why = next((x for x in reversed(tail) if any(k in x.lower() for k in
                                                                  ("error", "fehler", "traceback", "out of memory"))),
                                tail[-1] if tail else "")
