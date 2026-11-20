@@ -5173,7 +5173,7 @@ HOST_API_PORT = 8081
 HOST_STATE = CONFIG_DIR / "host.json"
 HOST_LAYOUT = CONFIG_DIR / "host-layout.json"
 HOST_INTERNAL_PORT = 18081  # the llama-servers listen on 127.0.0.1 from here up; the API port forwards to them
-HOST_LAYOUTS = ("split", "per_gpu")  # one model over all GPUs, or one model per GPU
+HOST_LAYOUTS = ("split", "per_gpu", "groups")  # one model over all GPUs, one per GPU, or one per group of GPUs
 
 
 PAIRED_KEY = CONFIG_DIR / "cluster_key"  # the key a master gave this PC (pairing)
@@ -5900,20 +5900,24 @@ class HostAgent:
     this PC's GPUs, or (slot) on one of them, when each GPU has its own model."""
 
     def __init__(self, args, key: str, slot: Optional[int] = None, gpu: Optional["Device"] = None,
-                 ram_limit_gb: Optional[float] = None, stats: Optional["SystemStats"] = None):
+                 ram_limit_gb: Optional[float] = None, stats: Optional["SystemStats"] = None,
+                 group: Optional[list] = None):
         import threading
 
         self.args, self.key = args, key
         self.slot, self.gpu, self.ram_limit_gb = slot, gpu, ram_limit_gb
+        # the GPUs this model may use: one (per GPU), several (a group), or all of the PC's (empty)
+        self.group: list = list(group) if group else ([gpu] if gpu else [])
+        tag = "grp" if group else "gpu"
         self.models_dir = Path(args.models_dir).expanduser()
         self.lock = threading.RLock()
         self.pc_id = host_id(args.port)
-        self.id = self.pc_id if slot is None else f"{self.pc_id}-gpu{slot}"
-        self.path = "" if slot is None else f"/gpu{slot}"  # prefix on the control and API ports
+        self.id = self.pc_id if slot is None else f"{self.pc_id}-{tag}{slot}"
+        self.path = "" if slot is None else f"/{tag}{slot}"  # prefix on the control and API ports
         self.api_port = HOST_INTERNAL_PORT + (slot or 0)  # llama-server, on 127.0.0.1
-        self.state_file = HOST_STATE if slot is None else CONFIG_DIR / f"host-gpu{slot}.json"
+        self.state_file = HOST_STATE if slot is None else CONFIG_DIR / f"host-{tag}{slot}.json"
         # Saved configurations (dashboard, and before every autotune): restorable.
-        self.snap_file = CONFIG_DIR / ("snapshots.json" if slot is None else f"snapshots-gpu{slot}.json")
+        self.snap_file = CONFIG_DIR / ("snapshots.json" if slot is None else f"snapshots-{tag}{slot}.json")
         self.rollback: dict = {}  # after an autotune: back to the snapshot if it keeps crashing
         self.event = ""  # something the host did on its own, shown in the card
         self.closed = False  # replaced by another layout
@@ -6018,10 +6022,15 @@ class HostAgent:
     def status(self) -> dict:
         node = self.node
         with self.lock:
-            name = socket.gethostname() if self.slot is None else f"{socket.gethostname()} · GPU {self.slot}"
+            name = socket.gethostname() if self.slot is None else \
+                f"{socket.gethostname()} · {'Gruppe' if self.path.startswith('/grp') else 'GPU'} {self.slot + (1 if self.path.startswith('/grp') else 0)}"
             st = {"id": self.id, "host": socket.gethostname(), "name": name, "v": 1, "state": self.state,
                   "error": self.error, "pc": self.pc_id, "path": self.path, "slot": self.slot,
-                  "gpu": f"{self.gpu.name} {self.gpu.description}" if self.gpu else None,
+                  "gpu": " + ".join(f"{g.name} {g.description}" for g in self.group) if self.group else None,
+                  "group": [g.name for g in self.group] if self.slot is not None else None,
+                  # its cards as nvidia-smi numbers them (the stats are in that order)
+                  "nv_index": [int(i) for i in self._strata_fixed().split(",")]
+                  if self.slot is not None and self._strata_fixed() else None,
                   "assignment": self.assignment, "model": self.model_path.stem if self.model_path else None,
                   "ctx": self.ctx, "estimate_tps": self.estimate_tps, "api_port": self.args.api_port,
                   "note": self.note if self.state == "ready" else "",
@@ -6040,7 +6049,7 @@ class HostAgent:
                 st["note"] = (st["note"] + " " if st["note"] else "") + self.event
         st["metrics"] = self._metrics() if st["engine"] != "strata" else {}
         st["stats"] = self.stats.sample()
-        if strata_conf() and (self.slot is None or self.gpu is not None):
+        if strata_conf() and (self.slot is None or self.group):
             info = strata_info()
             if not info and time.time() - getattr(self, "strata_asked", 0) > 60:
                 self.strata_asked = time.time()  # after a reboot /run is empty: root lists the configurations
@@ -6051,10 +6060,8 @@ class HostAgent:
             st["strata"] = {"configs": info.get("configs") or [], "version": info.get("version") or "",
                             "config_gpus": info.get("config_gpus") or {},
                             "state": strata_state(self.api_port)}
-            if self.slot is not None:  # one GPU of several: Strata gets exactly this one
-                if not hasattr(self, "strata_gpu"):
-                    self.strata_gpu = nvidia_index(self.gpu)
-                st["strata"]["fixed_gpu"] = self.strata_gpu
+            if self.slot is not None:  # one GPU or a group of several: Strata gets exactly these
+                st["strata"]["fixed_gpu"] = self._strata_fixed()
                 other = strata_running_port()
                 if other and other != self.api_port and strata_state() in ("active", "activating"):
                     st["strata"]["elsewhere"] = True
@@ -6214,13 +6221,11 @@ class HostAgent:
             self.stop_server()
             gpus = a.get("strata_gpus") or ""
             if self.slot is not None:  # one GPU of several: exactly this one, and one Strata per PC
-                idx = getattr(self, "strata_gpu", None)
-                if idx is None:
-                    idx = self.strata_gpu = nvidia_index(self.gpu)
+                idx = self._strata_fixed()
                 if idx is None:
                     self._set("error", "Strata: die Nummer dieser GPU (nvidia-smi) ist nicht zu ermitteln")
                     return
-                gpus = str(idx)
+                gpus = idx
                 other = strata_running_port()
                 if other and other != self.api_port and strata_state() in ("active", "activating", "reloading"):
                     self._set("error", "Strata läuft schon auf einer anderen GPU dieses PCs: "
@@ -6267,6 +6272,13 @@ class HostAgent:
         except Exception as e:  # noqa: BLE001 - report it to the master instead of dying
             if current():
                 self._set("error", f"Strata: {type(e).__name__}: {e}")
+
+    def _strata_fixed(self) -> Optional[str]:
+        """This slot's cards as Strata numbers them (nvidia-smi): "1" or "0,2"; None if one can't be found."""
+        if not hasattr(self, "strata_gpu"):
+            idx = [nvidia_index(g) for g in self.group]
+            self.strata_gpu = ",".join(str(i) for i in idx) if idx and None not in idx else None
+        return self.strata_gpu
 
     def strata(self, body: Optional[dict] = None) -> dict:
         """The dashboard: update Strata (it stops and starts again if it runs)."""
@@ -6417,13 +6429,13 @@ class HostAgent:
         return argparse.Namespace(model=str(path), ctx=a.get("ctx"), kv=a.get("kv") or "f16", mtp=0, workers="off",
                                   ram_limit=self.ram_limit_gb, api_key=self.key, host="127.0.0.1",
                                   port=self.api_port, extra=list(self.args.extra or []), scan_timeout=1.0,
-                                  only_devices=[self.gpu.name] if self.gpu else None,
+                                  only_devices=[g.name for g in self.group] or None,
                                   tune_slot=self.path, no_tune=no_tune, mmproj=a.get("vision") or "auto")
 
     def _plan(self, ns: argparse.Namespace) -> "ServerPlan":
         sp = build_server_fitting(ns, quiet=True, exit_on_fail=False)
-        if self.gpu:  # without it llama.cpp spreads the model over every GPU it sees
-            sp.cmd += ["--device", self.gpu.name]
+        if self.group:  # without it llama.cpp spreads the model over every GPU it sees
+            sp.cmd += ["--device", ",".join(g.name for g in self.group)]
         return sp
 
     # Saved configurations --------------------------------------------------------
@@ -6677,15 +6689,38 @@ class HostNode:
         self.agents: list[HostAgent] = []
         self.mac, self.bcast = "", ""
         self.switching = False
+        self.groups: list[list[str]] = []
         try:
-            self.layout = json.loads(HOST_LAYOUT.read_text()).get("layout", "split")
+            saved = json.loads(HOST_LAYOUT.read_text())
+            self.layout = saved.get("layout", "split")
+            self.groups = saved.get("groups") or []
         except (OSError, ValueError, AttributeError):
             self.layout = "split"
-        if self.layout not in HOST_LAYOUTS or (self.layout == "per_gpu" and len(self.gpus) < 2):
+        if self.layout == "groups" and self.check_groups(self.groups):
+            log(f"Host: the saved GPU groups no longer fit this PC ({self.check_groups(self.groups)}): one model "
+                "over all GPUs")
+            self.layout = "split"
+        if self.layout not in HOST_LAYOUTS or (self.layout in ("per_gpu", "groups") and len(self.gpus) < 2):
             self.layout = "split"
 
+    def check_groups(self, groups) -> str:
+        """What is wrong with GPU groups ([["CUDA0"], ["CUDA1", "CUDA2"]]), "" if nothing: every GPU in exactly one
+        group, at least two groups."""
+        names = [g.name for g in self.gpus]
+        if not isinstance(groups, list) or len(groups) < 2 or not all(isinstance(x, list) and x for x in groups):
+            return "mindestens zwei Gruppen mit je einer GPU oder mehr"
+        flat = [str(n) for grp in groups for n in grp]
+        if sorted(flat) != sorted(names):
+            return "jede GPU gehört in genau eine Gruppe (" + ", ".join(names) + ")"
+        return ""
+
     def _make(self) -> list[HostAgent]:
-        if self.layout == "per_gpu":
+        if self.layout == "groups":
+            ram_gb = memory_budget(False)[0] / 1024 / len(self.groups)  # models that spill share the RAM
+            agents = [HostAgent(self.args, self.key, slot=i, ram_limit_gb=ram_gb, stats=self.stats,
+                                group=[d for d in self.gpus if d.name in grp])  # llama.cpp's order
+                      for i, grp in enumerate(self.groups)]
+        elif self.layout == "per_gpu":
             ram_gb = memory_budget(False)[0] / 1024 / len(self.gpus)  # models that spill share the RAM
             agents = [HostAgent(self.args, self.key, slot=i, gpu=g, ram_limit_gb=ram_gb, stats=self.stats)
                       for i, g in enumerate(self.gpus)]
@@ -6723,6 +6758,7 @@ class HostNode:
 
     def layout_info(self) -> dict:
         return {"layout": self.layout, "switching": self.switching,
+                "groups": self.groups if self.layout == "groups" else [],
                 "slots": [{"id": a.id, "path": a.path} for a in self.agents],
                 "gpus": [{"name": g.name, "description": g.description, "total_mb": g.total_mb} for g in self.gpus]}
 
@@ -6735,9 +6771,14 @@ class HostNode:
         layout = str(body.get("layout") or "")
         if layout not in HOST_LAYOUTS:
             return {"ok": False, "error": f"layout must be one of {', '.join(HOST_LAYOUTS)}"}
-        if layout == "per_gpu" and len(self.gpus) < 2:
+        if layout in ("per_gpu", "groups") and len(self.gpus) < 2:
             return {"ok": False, "error": "this PC has fewer than two GPUs"}
-        if layout == self.layout:
+        groups = [[str(n) for n in grp] for grp in (body.get("groups") or [])] if layout == "groups" else []
+        if layout == "groups":
+            why = self.check_groups(groups)
+            if why:
+                return {"ok": False, "error": f"GPU-Gruppen: {why}"}
+        if layout == self.layout and groups == (self.groups if layout == "groups" else []):
             return {"ok": True, **self.layout_info()}
         if self.switching:
             return {"ok": False, "error": "a switch is running"}
@@ -6749,11 +6790,14 @@ class HostNode:
                 first = old[0].saved() if old else {}
                 for a in old:
                     a.close()
+                if layout == "groups" and groups != self.groups:  # other groups: their old models don't fit
+                    for f in CONFIG_DIR.glob("host-grp*.json"):
+                        f.unlink(missing_ok=True)
                 with self.lock:
-                    self.layout = layout
+                    self.layout, self.groups = layout, groups
                     try:
                         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                        HOST_LAYOUT.write_text(json.dumps({"layout": layout}))
+                        HOST_LAYOUT.write_text(json.dumps({"layout": layout, **({"groups": groups} if groups else {})}))
                     except OSError as e:
                         log(f"Host: could not save the layout ({e})")
                     self.agents = self._make()
@@ -6803,8 +6847,8 @@ class HostNode:
         for a in agents:
             if a.path and (path == a.path or path.startswith(a.path + "/")):
                 return a.api_port, path[len(a.path):] or "/"
-        if path.startswith("/gpu"):
-            return None, path  # a GPU of the other layout
+        if path.startswith("/gpu") or path.startswith("/grp"):
+            return None, path  # a GPU (group) of another layout
         return (agents[0].api_port if agents else None), path
 
     def stop(self) -> None:
@@ -6937,7 +6981,8 @@ def cmd_host(args) -> None:
     gpu_txt = ", ".join(sorted({d.description for d in gpus})) or "CPU"
     log(f"Host {socket.gethostname()}: control API on {address}:{args.port}, models in "
         f"{Path(args.models_dir).expanduser()}, API on port {args.api_port}; {gpu_txt}; "
-        + ("one model per GPU" if node.layout == "per_gpu" else "one model over all GPUs"))
+        + ({"per_gpu": "one model per GPU", "groups": f"one model per GPU group {node.groups}"}
+           .get(node.layout, "one model over all GPUs")))
     advs = []
     if not args.no_advertise:
         adv = Advertiser(HOST_TYPE, f"MyrmidLM Host {socket.gethostname()}", args.port,
@@ -8385,7 +8430,8 @@ class HostManager:
         if body.get("layout"):
             h = dict(self.hosts[hid], path="")  # the PC's first host answers for the layout
             try:
-                res = self._call(h, "/layout", {"layout": str(body["layout"])}, timeout=10)
+                res = self._call(h, "/layout", {"layout": str(body["layout"]), "groups": body.get("groups") or []},
+                                 timeout=10)
             except Exception as e:  # noqa: BLE001
                 return {**self.info(), "error": f"layout: {e}"}
             if not res.get("ok"):
@@ -8400,7 +8446,7 @@ class HostManager:
                 want = self.assign.get(old_first) if old_first else None
                 if want is None and old_first:
                     want = (self.hosts[old_first].get("status") or {}).get("assignment")
-                new_first = pc if body["layout"] == "split" else f"{pc}-gpu0"
+                new_first = {"split": pc, "groups": f"{pc}-grp0"}.get(body["layout"], f"{pc}-gpu0")
                 if want:
                     self.assign[new_first] = {k: want.get(k) for k in ("model", "role", "name", "ctx", "kv", "engine",
                                                                               "strata_gpus")
@@ -8459,7 +8505,7 @@ class HostManager:
                               "pc": h.get("pc"), "path": h.get("path") or "",
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
-                                                       "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned",
+                                                       "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned", "groups", "group", "nv_index",
                                                        "note", "snapshots", "rollback", "engine", "strata")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):

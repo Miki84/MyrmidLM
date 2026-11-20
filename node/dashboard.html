@@ -333,6 +333,9 @@
 .strata-gpus legend { font-size: .86rem; padding: 0 4px; }
 .strata-gpus .chk { display: flex; align-items: center; gap: 6px; font-weight: normal; margin: 3px 0; }
 .strata-gpus .chk input { width: auto; margin: 0; }
+.grp-edit { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 6px 0; display: grid; gap: 6px; }
+.grp-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-weight: normal; }
+.grp-row select { width: auto; }
 </style>
 </head>
 <body>
@@ -1344,6 +1347,41 @@ function tuneText(job, tuned) {
   return "";
 }
 const hostEdits = {};  // host id -> form values the user is typing, kept across refreshes
+const groupEdits = {};  // host id -> {open, sel: {gpu name: group number}} while the GPU groups are edited
+
+function groupSuggest(x) {
+  // the current groups, else cards of the same kind together
+  const sel = {};
+  if (x.layout === "groups" && (x.groups || []).length) {
+    x.groups.forEach((grp, i) => grp.forEach((n) => { sel[n] = i + 1; }));
+    return sel;
+  }
+  const kinds = [];
+  (x.gpus || []).forEach((g) => {
+    let k = kinds.indexOf(g.description);
+    if (k < 0) { kinds.push(g.description); k = kinds.length - 1; }
+    sel[g.name] = k + 1;
+  });
+  return sel;
+}
+
+function groupEditor(x) {
+  const ed = groupEdits[x.id];
+  if (!ed || !ed.open) {
+    if (x.layout !== "groups") return "";
+    const text = (x.groups || []).map((grp, i) => `Gruppe ${i + 1}: ${grp.map((n) => esc(gpuLabel(x, n))).join(" + ")}`).join(" · ");
+    return `<div class="note">${text} <button class="btn quiet small" type="button" data-groups-edit>Ändern</button></div>`;
+  }
+  const n = (x.gpus || []).length;
+  const rows = (x.gpus || []).map((g) => `<label class="grp-row"><span>${esc(gpuLabel(x, g.name))}</span><select data-grp-gpu="${esc(g.name)}">${Array.from({ length: n }, (_, i) => `<option value="${i + 1}"${ed.sel[g.name] === i + 1 ? " selected" : ""}>Gruppe ${i + 1}</option>`).join("")}</select></label>`).join("");
+  return `<div class="grp-edit"><div class="note">Jede Gruppe bekommt ein eigenes Modell (llama.cpp über alle ihre GPUs, oder Strata). Mindestens zwei Gruppen.</div>${rows}
+    <div class="kv"><button class="btn small" type="button" data-groups-apply>Gruppen übernehmen</button><button class="btn quiet small" type="button" data-groups-cancel>Abbrechen</button></div></div>`;
+}
+
+function gpuLabel(x, name) {
+  const g = (x.gpus || []).find((y) => y.name === name);
+  return g ? `${g.name}: ${g.description} (${Math.round((g.total_mb || 0) / 1024)} GB)` : name;
+}
 const STRATA_STATE = { active: "läuft", activating: "startet", deactivating: "stoppt", inactive: "aus", failed: "Fehler" };
 
 function hostStats(x) {
@@ -1351,7 +1389,8 @@ function hostStats(x) {
   const st = x.stats || {};
   if (!st.host || x.asleep) return "";
   let gpus = st.gpus || [];
-  if (x.slot != null && gpus[x.slot]) gpus = [gpus[x.slot]];
+  if (x.nv_index && x.nv_index.length && gpus.some((g) => g.index != null)) gpus = gpus.filter((g) => x.nv_index.includes(g.index));
+  else if (x.slot != null && gpus[x.slot]) gpus = [gpus[x.slot]];
   const ramPct = st.ram_total_mb ? 100 * st.ram_used_mb / st.ram_total_mb : null;
   return `<div class="host-stats">${gpus.map(gpuBlock).join("")}
     ${meter("CPU", st.cpu_pct, nf(st.cpu_pct, 0) + " %" + tempText(st.cpu_temp_c))}
@@ -1410,7 +1449,8 @@ function renderHosts(s) {
           <div class="seg" role="group" aria-label="Aufteilung der GPUs">
             <button type="button" class="seg-btn" data-layout="split" aria-pressed="${x.layout !== "per_gpu"}"${x.switching ? " disabled" : ""}>Ein Modell über alle GPUs</button>
             <button type="button" class="seg-btn" data-layout="per_gpu" aria-pressed="${x.layout === "per_gpu"}"${x.switching ? " disabled" : ""}>Jede GPU ein eigenes Modell</button>
-          </div>${x.switching ? `<span class="muted">stellt um …</span>` : ""}</div>`
+            ${nGpus >= 3 ? `<button type="button" class="seg-btn" data-layout-groups aria-pressed="${x.layout === "groups"}"${x.switching ? " disabled" : ""} title="GPUs zu Gruppen zusammenfassen: jede Gruppe ein Modell (z. B. eine Karte für Strata, zwei zusammen für ein llama.cpp-Modell)">GPU-Gruppen</button>` : ""}
+          </div>${x.switching ? `<span class="muted">stellt um …</span>` : ""}</div>${groupEditor(x)}`
       : "";
     const roleRow = x.switchable && !x.asleep
       ? `<div class="role-row"><span class="muted">Rolle: Host</span><button class="btn quiet small" type="button" data-role-ctl="${esc(x.addr)}" data-role="worker">Zum Worker machen</button></div>`
@@ -1462,6 +1502,10 @@ async function hostAction(body) {
 $("hosts").addEventListener("input", (ev) => {
   const card = ev.target.closest(".host"); if (!card) return;
   const id = card.dataset.id;
+  if (ev.target.dataset && ev.target.dataset.grpGpu) {
+    const ed = groupEdits[id]; if (ed) ed.sel[ev.target.dataset.grpGpu] = Number(ev.target.value);
+    return;
+  }
   if (ev.target.name === "strata_gpu") {
     const vals = [...card.querySelectorAll('input[name="strata_gpu"]:checked')].map((c) => c.value);
     hostEdits[id] = { ...(hostEdits[id] || {}), strata_gpus: vals.join(",") };
@@ -1511,6 +1555,23 @@ $("hosts").addEventListener("click", (ev) => {
   if (ev.target.matches("[data-hmaint]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, maintenance: ev.target.dataset.hmaint === "on" }); }
   if (ev.target.matches("[data-hwake]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, wake: true }); }
   if (ev.target.matches("[data-hsleep]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, sleep: true }); }
+  if (ev.target.closest("[data-layout-groups]") || ev.target.matches("[data-groups-edit]")) {
+    const x = (last && ((last.hosts || {}).hosts || []).find((h) => h.id === card.dataset.id)) || null;
+    if (x) { groupEdits[x.id] = { open: true, sel: groupSuggest(x) }; renderHosts(last); }
+    return;
+  }
+  if (ev.target.matches("[data-groups-cancel]")) { delete groupEdits[card.dataset.id]; renderHosts(last); return; }
+  if (ev.target.matches("[data-groups-apply]")) {
+    const ed = groupEdits[card.dataset.id]; if (!ed) return;
+    const byGroup = {};
+    Object.entries(ed.sel).forEach(([name, g]) => { (byGroup[g] = byGroup[g] || []).push(name); });
+    const groups = Object.keys(byGroup).sort((a, b) => a - b).map((k) => byGroup[k]);
+    if (groups.length < 2) { alert("Mindestens zwei Gruppen: sonst ist es „Ein Modell über alle GPUs“."); return; }
+    if (!confirm("Die GPUs werden neu gruppiert: " + groups.map((g, i) => `Gruppe ${i + 1}: ${g.join(" + ")}`).join(", ") + ".\n\nDie laufenden Modelle stoppen; Gruppe 1 lädt das bisherige Modell wieder, die anderen Gruppen bekommen eigene Karten zum Zuweisen.")) return;
+    delete groupEdits[card.dataset.id];
+    ev.target.disabled = true; hostAction({ host: card.dataset.id, layout: "groups", groups });
+    return;
+  }
   const lay = ev.target.closest("[data-layout]");
   if (lay && lay.getAttribute("aria-pressed") !== "true") {
     const perGpu = lay.dataset.layout === "per_gpu";
