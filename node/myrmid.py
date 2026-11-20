@@ -5390,8 +5390,10 @@ def strata_log_tail(n: int = 40) -> list[str]:
 
 def strata_request(action: str, **kw) -> float:
     """Asks root (myrmid-strata-request.service) to start, stop or update Strata. Returns the request's time."""
+    import threading
+
     at = time.time()
-    tmp = STRATA_REQ.with_suffix(".tmp")
+    tmp = STRATA_REQ.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")  # two threads may ask at once
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump({"action": action, "at": at, **kw}, f)
@@ -5454,9 +5456,48 @@ class StrataProc:
         return 0
 
 
-def strata_stop_running(why: str = "", port: int = 0) -> None:
-    """Stops Strata if it runs (llama-server takes the GPUs next)."""
+def nvidia_index(gpu: Optional["Device"]) -> Optional[int]:
+    """The nvidia-smi number of a llama.cpp device (CUDA1 ...): by its PCI address, else by its place among cards of
+    the same name (CUDA puts equal cards in PCI order, like nvidia-smi). Strata numbers cards as nvidia-smi does."""
+    if gpu is None or not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,pci.bus_id,name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    rows = []
+    for line in out.strip().splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) >= 3 and f[0].isdigit():
+            rows.append((int(f[0]), f[1].lower().split(":", 1)[-1], f[2]))
+    pci = (gpu.device_id or "").lower().split(":", 1)[-1]
+    if pci:
+        for idx, bus, _n in rows:
+            if bus == pci:
+                return idx
+    try:
+        same = sorted((d for d in probe(bench=False) if d.description == gpu.description and d.name[-1:].isdigit()),
+                      key=lambda d: int(re.sub(r"\D", "", d.name) or 0))
+        rank = [d.name for d in same].index(gpu.name)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    named = [idx for idx, _b, n in rows if n == gpu.description]
+    return named[rank] if rank < len(named) else None
+
+
+def strata_running_port() -> Optional[int]:
+    """The port Strata was last started on (root notes it), if it runs."""
+    r = (strata_info().get("running") or {})
+    return int(r["port"]) if r.get("port") else None
+
+
+def strata_stop_running(why: str = "", port: int = 0, only_own: bool = False) -> None:
+    """Stops Strata if it runs (llama-server takes the GPUs next). only_own (one GPU of several): only if it runs on
+    this slot's port; on another GPU it stays."""
     if not strata_conf() or strata_state(port) not in ("active", "activating", "reloading"):
+        return
+    if only_own and strata_running_port() not in (None, port):
         return
     log(f"Strata: stopping it{' (' + why + ')' if why else ''}")
     p = StrataProc(port, adopted=True)
@@ -5500,7 +5541,9 @@ def _strata_version(d: Path) -> str:
 def _strata_write_info(conf: dict, result: Optional[dict] = None) -> None:
     d = Path(conf["dir"]) if conf else None
     old = strata_info()
+    running = (result or {}).get("running", old.get("running")) if (result or {}).get("ok", True) else old.get("running")
     info = {"configs": _strata_configs(d) if d else [], "version": _strata_version(d) if d else "",
+            "running": running,
             "config_gpus": _strata_config_gpus(d) if d else {},
             "result": result if result is not None else old.get("result"), "at": time.time()}
     if not conf:
@@ -5596,6 +5639,7 @@ def strata_apply_request() -> None:
                 same = False
             if same and strata_state() in ("active", "activating"):
                 log(f"Strata: already running with {cfg}")
+                res["running"] = {"port": port, "gpus": gpus, "config": cfg}
             else:
                 fd = os.open(STRATA_ENV, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w") as f:
@@ -5603,11 +5647,13 @@ def strata_apply_request() -> None:
                 STRATA_LOG.parent.mkdir(parents=True, exist_ok=True)
                 log(f"Strata: starting with {cfg} on 127.0.0.1:{port}" + (f", GPUs {gpus}" if gpus else ""))
                 r = _systemctl("restart", STRATA_UNIT)
+                res["running"] = {"port": port, "gpus": gpus, "config": cfg}
                 if r.returncode:
                     raise UpdateError(f"systemctl restart {STRATA_UNIT}: {(r.stderr or r.stdout).strip()}")
         elif act == "stop":
             log("Strata: stopping")
             _systemctl("stop", STRATA_UNIT)
+            res["running"] = None
         elif act == "update":
             was = strata_state() in ("active", "activating")
             if was:
@@ -5994,7 +6040,7 @@ class HostAgent:
                 st["note"] = (st["note"] + " " if st["note"] else "") + self.event
         st["metrics"] = self._metrics() if st["engine"] != "strata" else {}
         st["stats"] = self.stats.sample()
-        if self.slot is None and strata_conf():
+        if strata_conf() and (self.slot is None or self.gpu is not None):
             info = strata_info()
             if not info and time.time() - getattr(self, "strata_asked", 0) > 60:
                 self.strata_asked = time.time()  # after a reboot /run is empty: root lists the configurations
@@ -6005,6 +6051,13 @@ class HostAgent:
             st["strata"] = {"configs": info.get("configs") or [], "version": info.get("version") or "",
                             "config_gpus": info.get("config_gpus") or {},
                             "state": strata_state(self.api_port)}
+            if self.slot is not None:  # one GPU of several: Strata gets exactly this one
+                if not hasattr(self, "strata_gpu"):
+                    self.strata_gpu = nvidia_index(self.gpu)
+                st["strata"]["fixed_gpu"] = self.strata_gpu
+                other = strata_running_port()
+                if other and other != self.api_port and strata_state() in ("active", "activating"):
+                    st["strata"]["elsewhere"] = True
         st["models"] = sorted({p.stem.split("-00001-of-")[0] for p in self.models_dir.glob("*.gguf")}) \
             if self.models_dir.is_dir() else []
         if node:  # the PC's layout: the master lists every slot and can switch it
@@ -6122,7 +6175,7 @@ class HostAgent:
         try:
             self._set("preparing")
             self.stop_server()
-            strata_stop_running("llama.cpp takes the GPUs", self.api_port)
+            strata_stop_running("llama.cpp takes the GPUs", self.api_port, only_own=self.slot is not None)
             path = self._local(a["model"])
             if path is None:
                 self._set("downloading")
@@ -6159,9 +6212,20 @@ class HostAgent:
         try:
             self._set("preparing")
             self.stop_server()
-            if self.slot is not None:
-                self._set("error", "Strata nutzt alle GPUs des PCs: Aufteilung „Ein Modell über alle GPUs“ wählen")
-                return
+            gpus = a.get("strata_gpus") or ""
+            if self.slot is not None:  # one GPU of several: exactly this one, and one Strata per PC
+                idx = getattr(self, "strata_gpu", None)
+                if idx is None:
+                    idx = self.strata_gpu = nvidia_index(self.gpu)
+                if idx is None:
+                    self._set("error", "Strata: die Nummer dieser GPU (nvidia-smi) ist nicht zu ermitteln")
+                    return
+                gpus = str(idx)
+                other = strata_running_port()
+                if other and other != self.api_port and strata_state() in ("active", "activating", "reloading"):
+                    self._set("error", "Strata läuft schon auf einer anderen GPU dieses PCs: "
+                                       "je PC geht nur eine Strata-Instanz (dort erst entladen)")
+                    return
             if not strata_conf():
                 self._set("error", "Strata ist auf diesem PC nicht eingerichtet: sudo myrmid strata setup")
                 return
@@ -6169,7 +6233,7 @@ class HostAgent:
                 return
             self._set("loading")
             proc = StrataProc(self.api_port)
-            proc.start(a["model"], self.key, a.get("strata_gpus") or "")
+            proc.start(a["model"], self.key, gpus)
             with self.lock:
                 self.proc, self.model_path, self.ctx, self.tail, self.cmd = proc, Path(a["model"]), None, [], []
                 self.estimate_tps, self.download, self.note = None, None, ""
