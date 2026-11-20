@@ -30,10 +30,19 @@ done
 command -v docker >/dev/null || { echo "docker is not installed" >&2; exit 1; }
 
 # The GPUs' architectures (8.6 -> 86): nvcc in the container can't see them.
-CAPS=""
-if command -v nvidia-smi >/dev/null; then
-    CAPS="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d '. ' | sort -u | paste -sd';' || true)"
-fi
+# Older chips also from their lspci names (GV100 -> 70): a driver newer than
+# 580 doesn't list them in nvidia-smi, the build would then skip them.
+old_archs() {
+    command -v lspci >/dev/null || return 0
+    local c
+    for c in $(lspci -d 10de: 2>/dev/null | grep -E 'VGA|3D|Display' | grep -oE '\b(GM|GP|GV)[0-9]+' || true); do
+        case "$c" in
+            GM10*) echo 50 ;; GM20*) echo 52 ;; GP100) echo 60 ;; GP10*) echo 61 ;; GV*) echo 70 ;;
+        esac
+    done
+}
+CAPS="$( { command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+    | tr -d '. '; old_archs; } | grep -E '^[0-9]+$' | sort -un | paste -sd';' || true)"
 if [[ -z "$IMAGE" ]]; then
     cuda_max="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: *[0-9]+' | grep -oE '[0-9]+$' | head -1 || true)"
     old=0

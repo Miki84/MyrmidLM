@@ -461,13 +461,69 @@ install_nvidia_smi() {
     esac
 }
 
+nv_old_gen() { [[ "$1" == maxwell || "$1" == pascal || "$1" == volta ]]; }
+
+# Version of the running driver (595.99.02), from nvidia-smi or the kernel module.
+nvidia_driver_version() {
+    local v=""
+    have nvidia-smi && v="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 || true)"
+    [[ -z "$v" && -r /proc/driver/nvidia/version ]] && \
+        v="$(head -1 /proc/driver/nvidia/version | grep -oE '[0-9]{3,}\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
+    echo "$v"
+}
+
+# The open kernel module (the default since 560) supports Turing and newer only.
+nvidia_open_module() { [[ -r /proc/driver/nvidia/version ]] && grep -q "Open Kernel Module" /proc/driver/nvidia/version; }
+
+# Maxwell, Pascal and Volta: the last driver branch is 580, with the
+# proprietary module. Switches an installed newer or open driver to it.
+nvidia_switch_to_580() {
+    local cur c pkg rm=()
+    case "$DISTRO" in
+        ubuntu|pop|linuxmint|elementary|zorin)
+            cur="$(dpkg-query -W -f='${db:Status-Status} ${Package}\n' 'nvidia-driver-*' nvidia-open 'nvidia-open-*' cuda-drivers 'cuda-drivers-*' 2>/dev/null \
+                | awk '$1 == "installed" {print $2}' || true)"
+            pkg=nvidia-driver-580
+            [[ "$cur" == *-server* ]] && apt_has nvidia-driver-580-server && pkg=nvidia-driver-580-server
+            apt_has "$pkg" || { warn "Paket $pkg gibt es in den Paketquellen nicht."; return 1; }
+            for c in $cur; do
+                [[ "$c" == "$pkg" ]] && continue
+                [[ "$c" =~ ^nvidia-driver-[0-9]+(-open|-server|-server-open)?$|^nvidia-open|^cuda-drivers ]] && rm+=("$c-")
+            done
+            # one apt transaction: the new driver in, the old one out ("paket-")
+            pkg_install "linux-headers-$(uname -r)" "$pkg" "${rm[@]}" ;;
+        fedora)
+            dnf info akmod-nvidia-580xx >/dev/null 2>&1 || { warn "akmod-nvidia-580xx gibt es in RPM Fusion nicht."; return 1; }
+            srun dnf install -y --allowerasing akmod-nvidia-580xx xorg-x11-drv-nvidia-580xx-cuda
+            info "Kernel-Modul wird gebaut (einige Minuten)..."
+            srun akmods --force || true ;;
+        *) return 1 ;;
+    esac
+}
+
+restart_and_rerun() {  # tells how to continue after the reboot, offers it, exits
+    echo
+    echo "    ${B}$1 Nach dem Neustart das Skript erneut starten:${N}"
+    if [[ -f "${BASH_SOURCE[0]:-}" ]]; then echo "    bash $(realpath "${BASH_SOURCE[0]}") ${ORIG_ARGS[*]}"
+    else echo "    curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash -s -- ${ORIG_ARGS[*]}"; fi
+    if ask_yn "Jetzt neu starten?" j; then srun systemctl reboot; fi
+    exit 0
+}
+
 install_nvidia_driver() {  # install_nvidia_driver GENERATION
     local gen="$1" helper=""
     case "$DISTRO" in
         ubuntu|pop|linuxmint|elementary|zorin)
-            # picks the right branch itself, legacy cards included
-            pkg_install ubuntu-drivers-common
-            srun ubuntu-drivers install ;;
+            # Older cards (also next to newer ones): branch 580 with the
+            # proprietary module. ubuntu-drivers would pick the newest branch
+            # or the open module for the newer card and skip the older one.
+            if nv_old_gen "$gen" && apt_has nvidia-driver-580; then
+                pkg_install "linux-headers-$(uname -r)" nvidia-driver-580
+            else
+                # picks the right branch itself
+                pkg_install ubuntu-drivers-common
+                srun ubuntu-drivers install
+            fi ;;
         debian)
             debian_enable_nonfree
             if [[ "$gen" == kepler ]]; then
@@ -589,14 +645,28 @@ install_cuda() {  # install_cuda PACKAGE DEFAULT_ANSWER
     return 0
 }
 
-find_cuda_bin() {  # sets CUDA_BIN to the newest nvcc found
-    local d
+cuda_major() { "$1/nvcc" --version 2>/dev/null | grep -oE 'release [0-9]+' | grep -oE '[0-9]+$' || true; }
+
+# find_cuda_bin [MAX_MAJOR]: sets CUDA_BIN to the newest nvcc found, with
+# MAX_MAJOR only up to that CUDA version (12: CUDA 13 dropped Maxwell to Volta).
+find_cuda_bin() {
+    local d max="${1:-}"
     CUDA_BIN=""
     for d in /usr/local/cuda/bin $(ls -d /usr/local/cuda-*/bin 2>/dev/null | sort -V) /opt/cuda/bin /usr/lib/cuda/bin; do
-        [[ -x "$d/nvcc" ]] && CUDA_BIN="$d"
+        cuda_ok "$d" "$max" && CUDA_BIN="$d"
     done
-    have nvcc && [[ -z "$CUDA_BIN" ]] && CUDA_BIN="$(dirname "$(command -v nvcc)")"
+    if [[ -z "$CUDA_BIN" ]] && have nvcc; then
+        d="$(dirname "$(command -v nvcc)")"
+        cuda_ok "$d" "$max" && CUDA_BIN="$d"
+    fi
     return 0
+}
+cuda_ok() {  # cuda_ok DIR [MAX_MAJOR]
+    local m
+    [[ -x "$1/nvcc" ]] || return 1
+    [[ -z "${2:-}" ]] && return 0
+    m="$(cuda_major "$1")"
+    [[ -n "$m" ]] && (( m <= $2 ))
 }
 
 # ── 4. GPU-Treiber, CUDA, Vulkan ─────────────────────────────────────────────
@@ -617,11 +687,7 @@ if has_vendor nvidia && [[ $RUN_DOCKER -eq 0 ]]; then
     esac
     if [[ "$NV_GEN" != fermi ]] && have nvidia-smi && nvidia-smi 2>&1 | grep -q "version mismatch"; then
         warn "Der NVIDIA-Treiber wurde gerade aktualisiert, läuft aber noch in der alten Version (Driver/library version mismatch)."
-        echo "    ${B}Ein Neustart ist nötig. Danach das Skript erneut starten:${N}"
-        if [[ -f "${BASH_SOURCE[0]:-}" ]]; then echo "    bash $(realpath "${BASH_SOURCE[0]}") ${ORIG_ARGS[*]}"
-        else echo "    curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash -s -- ${ORIG_ARGS[*]}"; fi
-        if ask_yn "Jetzt neu starten?" j; then srun systemctl reboot; fi
-        exit 0
+        restart_and_rerun "Ein Neustart ist nötig."
     fi
     if [[ "$NV_GEN" != fermi && -r /proc/driver/nvidia/version ]] && ! have nvidia-smi; then
         info "Der NVIDIA-Treiber läuft, aber nvidia-smi fehlt (das Dashboard zeigt sonst keine GPU-Werte). Installiere es ..."
@@ -632,17 +698,50 @@ if has_vendor nvidia && [[ $RUN_DOCKER -eq 0 ]]; then
         if ask_yn "NVIDIA-Treiber jetzt installieren? Danach ist ein Neustart nötig." j; then
             install_nvidia_driver "$NV_GEN"
             secure_boot_hint
-            echo
-            echo "    ${B}Treiber installiert. Nach dem Neustart das Skript erneut starten:${N}"
-            if [[ -f "${BASH_SOURCE[0]:-}" ]]; then echo "    bash $(realpath "${BASH_SOURCE[0]}") ${ORIG_ARGS[*]}"
-            else echo "    curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash -s -- ${ORIG_ARGS[*]}"; fi
-            if ask_yn "Jetzt neu starten?" j; then srun systemctl reboot; fi
-            exit 0
+            restart_and_rerun "Treiber installiert."
         fi
         warn "Ohne NVIDIA-Treiber wird die NVIDIA-Karte nicht genutzt."
     elif [[ "$NV_GEN" != fermi ]]; then
         if have nvidia-smi; then ok "Treiber: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | paste -sd';' -)"
         else ok "Treiber: $(head -1 /proc/driver/nvidia/version | grep -o 'Kernel Module.*' | cut -c1-60)"; fi
+        # An older card next to newer ones: a newer driver (or the open module)
+        # runs the newer cards and silently skips the older one.
+        NV_OLD_OK=0
+        if nv_old_gen "$NV_GEN"; then
+            drv="$(nvidia_driver_version)" why=""
+            if [[ -n "$drv" ]] && (( ${drv%%.*} > 580 )); then why="Treiber ${drv%%.*} unterstützt sie nicht mehr (letzter Zweig: 580)"
+            elif nvidia_open_module; then why="das offene Kernel-Modul unterstützt erst Turing und neuer"; fi
+            if [[ -z "$why" ]]; then
+                NV_OLD_OK=1
+            else
+                n_pci="$(lspci -d 10de: 2>/dev/null | grep -cE 'VGA|3D|Display' || true)"
+                n_smi="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)"
+                warn "Die ältere Karte ($NV_GEN) wird nicht genutzt: $why. nvidia-smi sieht $n_smi von $n_pci NVIDIA-Karten."
+                info "Treiber 580 mit proprietärem Modul betreibt alle Karten in diesem PC (CUDA höchstens 13.0)."
+                info "Das gilt für alle Programme auf diesem PC, die die NVIDIA-Karten nutzen."
+                if ask_yn "Auf Treiber 580 (proprietär) wechseln? Danach ist ein Neustart nötig." n; then
+                    if nvidia_switch_to_580; then
+                        secure_boot_hint
+                        restart_and_rerun "Treiber 580 installiert."
+                    fi
+                    warn "Wechsel nicht möglich: bitte Treiber 580 (proprietär, nicht -open) selbst installieren und das Skript erneut starten."
+                fi
+                warn "Die ältere Karte bleibt ungenutzt, die übrigen laufen normal."
+            fi
+        fi
+        # CUDA 13 can't build for the older card: prefer an installed CUDA 12,
+        # else 12.9 is installed below (only if the card is usable at all).
+        CUDA_NEW_BIN="" cuda_m=""
+        [[ -n "$CUDA_BIN" ]] && cuda_m="$(cuda_major "$CUDA_BIN")"
+        if [[ $NV_OLD_OK -eq 1 && "$BUILD_MODE" != docker && -n "$cuda_m" ]] && (( cuda_m >= 13 )); then
+            CUDA_NEW_BIN="$CUDA_BIN"
+            find_cuda_bin 12
+            if [[ -n "$CUDA_BIN" ]]; then
+                info "CUDA $cuda_m kennt die ältere Karte nicht: nehme $CUDA_BIN."
+            else
+                info "Das vorhandene CUDA $cuda_m kennt die ältere Karte nicht: CUDA 12.9 wird zusätzlich installiert."
+            fi
+        fi
         if [[ "$BUILD_MODE" == docker && "$NV_GEN" == kepler ]]; then
             info "Kepler-Karten laufen nur über Vulkan: es wird direkt gebaut, nicht im CUDA-Container."
             BUILD_MODE=native
@@ -666,6 +765,10 @@ if has_vendor nvidia && [[ $RUN_DOCKER -eq 0 ]]; then
                 def=n
             fi
             if install_cuda "$cuda_pkg" "$def"; then USE_CUDA=1
+            elif [[ -n "$CUDA_NEW_BIN" ]]; then
+                # no CUDA 12: the newer cards keep CUDA 13, build.sh leaves the older one out
+                CUDA_BIN="$CUDA_NEW_BIN" USE_CUDA=1
+                warn "Ohne CUDA 12.9 bleibt die ältere Karte ungenutzt; die übrigen laufen mit CUDA $(cuda_major "$CUDA_BIN")."
             else
                 warn "Ohne CUDA wird die NVIDIA-Karte über Vulkan genutzt (langsamer, aber funktioniert)."
                 USE_VULKAN=1

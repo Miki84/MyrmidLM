@@ -34,6 +34,22 @@ done
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# CUDA architectures of older NVIDIA chips from the names lspci shows
+# (GV100 -> 70). A driver newer than 580 doesn't list them in nvidia-smi.
+lspci_old_archs() {
+    have lspci || return 0
+    local c
+    for c in $(lspci -d 10de: 2>/dev/null | grep -E 'VGA|3D|Display' | grep -oE '\b(GM|GP|GV)[0-9]+' || true); do
+        case "$c" in
+            GM10*) echo 50 ;;
+            GM20*) echo 52 ;;
+            GP100) echo 60 ;;
+            GP10*) echo 61 ;;
+            GV*) echo 70 ;;
+        esac
+    done
+}
+
 # GPU vendors on the PCI bus: 0x10de NVIDIA, 0x1002 AMD, 0x8086 Intel.
 gpu_vendors() {
     local v
@@ -93,12 +109,29 @@ IFS=',' read -ra wanted <<< "$BACKENDS"
 for b in "${wanted[@]}"; do
     case "$b" in
         cuda)
-            [[ -x /usr/local/cuda/bin/nvcc ]] && export PATH="/usr/local/cuda/bin:$PATH"
-            # Native arches of every GPU in the box, else a broad default set.
+            # Only if no nvcc is on PATH yet: install.sh and the updater put the
+            # chosen one there (e.g. CUDA 12.9 for older cards), /usr/local/cuda
+            # may point to a newer one.
+            if ! have nvcc && [[ -x /usr/local/cuda/bin/nvcc ]]; then export PATH="/usr/local/cuda/bin:$PATH"; fi
             # Architectures of the GPUs in this PC (8.6 -> 86), else a broad set.
-            if [[ -z "${CUDA_ARCHS:-}" ]] && have nvidia-smi; then
-                CUDA_ARCHS="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
-                    | tr -d '. ' | sort -u | paste -sd';')"
+            # Older chips also from lspci: a newer driver doesn't list them.
+            if [[ -z "${CUDA_ARCHS:-}" ]]; then
+                CUDA_ARCHS="$( { have nvidia-smi && nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+                    | tr -d '. '; lspci_old_archs; } | grep -E '^[0-9]+$' | sort -un | paste -sd';' || true)"
+            fi
+            # CUDA 13 dropped Maxwell, Pascal and Volta (below 7.5): nvcc stops
+            # with "Unsupported gpu architecture". Build without them.
+            nvcc_major="$(nvcc --version 2>/dev/null | grep -oE 'release [0-9]+' | grep -oE '[0-9]+$' || true)"
+            if [[ -n "${CUDA_ARCHS:-}" && -n "$nvcc_major" ]] && (( nvcc_major >= 13 )); then
+                keep="" dropped=""
+                for a in ${CUDA_ARCHS//;/ }; do
+                    if (( ${a%%[!0-9]*} < 75 )); then dropped+=" $a"; else keep+="${keep:+;}$a"; fi
+                done
+                if [[ -n "$dropped" ]]; then
+                    echo "Warning: CUDA $nvcc_major can't build for the older GPU(s) (arch$dropped)." >&2
+                    echo "         They stay unused. Use CUDA 12.9 (and driver 580) for them." >&2
+                    CUDA_ARCHS="$keep"
+                fi
             fi
             echo "==> CUDA architectures: ${CUDA_ARCHS:-75;80;86;89}"
             flags+=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS:-75;80;86;89}") ;;
