@@ -5747,6 +5747,7 @@ def _strata_config_settings(d: Path) -> dict:
             elif x in ("--kv", "--kv-type", "--kv-cache") and args[i + 1] in STRATA_KVS:
                 st["kv"] = args[i + 1]
         if st:
+            st.setdefault("kv", "int8")  # Strata writes --kv only above 8K context; its default is int8
             out[name] = st
     return out
 
