@@ -5362,9 +5362,33 @@ def strata_state(port: int = 0) -> str:
         log(f"Strata: systemctl is-active {STRATA_UNIT} gave no answer ({why}); using the port instead")
     if st and st != "unknown":
         return st
+    # Without systemctl: Strata's process (also while it loads, before its port answers), then its port
+    if strata_pid(port):
+        return "active"
     if port:
         return "active" if strata_health(port) is not None else "inactive"
     return "unknown"
+
+
+def strata_pid(port: int = 0) -> Optional[int]:
+    """Strata's server process (serve/server.py --engine strata, on this port if given), from /proc: readable
+    without root, and there from the start, while the port only answers once the model is loaded."""
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return None
+    for d in pids:
+        try:
+            with open(f"/proc/{d}/cmdline", "rb") as f:
+                argv = f.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if not any(x.endswith("serve/server.py") for x in argv) or "strata" not in argv:
+            continue
+        if port and not any(argv[i] == "--port" and argv[i + 1] == str(port) for i in range(len(argv) - 1)):
+            continue
+        return int(d)
+    return None
 
 
 def strata_health(port: int) -> Optional[dict]:
