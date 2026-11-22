@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MyrmidLM-Cluster</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"%3E%3Crect width="1024" height="1024" rx="224" fill="#0f1e28"/%3E%3Cdefs%3E%3Cpolygon id="h" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/%3E%3C/defs%3E%3Cg stroke="#0f1e28" stroke-width="22"%3E%3Cuse href="#h" x="512" y="512" fill="#f0b54a"/%3E%3Cuse href="#h" x="512" y="282" fill="#4fc3b4"/%3E%3Cuse href="#h" x="512" y="742" fill="#4fc3b4" opacity=".75"/%3E%3Cuse href="#h" x="313" y="397" fill="#4fc3b4" opacity=".9"/%3E%3Cuse href="#h" x="711" y="397" fill="#4fc3b4" opacity=".6"/%3E%3Cuse href="#h" x="313" y="627" fill="#4fc3b4" opacity=".6"/%3E%3Cuse href="#h" x="711" y="627" fill="#4fc3b4" opacity=".9"/%3E%3C/g%3E%3Cg stroke="#0f1e28" stroke-width="18" stroke-linecap="round"%3E%3Cpath d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/%3E%3C/g%3E%3Cg fill="#0f1e28"%3E%3Ccircle cx="512" cy="512" r="40"/%3E%3C/g%3E%3Cg fill="#0f1e28"%3E%3Ccircle cx="512" cy="282" r="26"/%3E%3Ccircle cx="512" cy="742" r="26"/%3E%3Ccircle cx="313" cy="397" r="26"/%3E%3Ccircle cx="711" cy="397" r="26"/%3E%3Ccircle cx="313" cy="627" r="26"/%3E%3Ccircle cx="711" cy="627" r="26"/%3E%3C/g%3E%3C/svg%3E">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024'%3E%3Crect width='1024' height='1024' rx='224' fill='%230f1e28'/%3E%3Cdefs%3E%3Cpolygon id='h' points='0,-118 102,-59 102,59 0,118 -102,59 -102,-59'/%3E%3C/defs%3E%3Cg stroke='%230f1e28' stroke-width='22'%3E%3Cuse href='%23h' x='512' y='512' fill='%23f0b54a'/%3E%3Cuse href='%23h' x='512' y='282' fill='%234fc3b4'/%3E%3Cuse href='%23h' x='512' y='742' fill='%234fc3b4' opacity='.75'/%3E%3Cuse href='%23h' x='313' y='397' fill='%234fc3b4' opacity='.9'/%3E%3Cuse href='%23h' x='711' y='397' fill='%234fc3b4' opacity='.6'/%3E%3Cuse href='%23h' x='313' y='627' fill='%234fc3b4' opacity='.6'/%3E%3Cuse href='%23h' x='711' y='627' fill='%234fc3b4' opacity='.9'/%3E%3C/g%3E%3Cg stroke='%230f1e28' stroke-width='18' stroke-linecap='round'%3E%3Cpath d='M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627'/%3E%3C/g%3E%3Cg fill='%230f1e28'%3E%3Ccircle cx='512' cy='512' r='40'/%3E%3C/g%3E%3Cg fill='%230f1e28'%3E%3Ccircle cx='512' cy='282' r='26'/%3E%3Ccircle cx='512' cy='742' r='26'/%3E%3Ccircle cx='313' cy='397' r='26'/%3E%3Ccircle cx='711' cy='397' r='26'/%3E%3Ccircle cx='313' cy='627' r='26'/%3E%3Ccircle cx='711' cy='627' r='26'/%3E%3C/g%3E%3C/svg%3E">
 <script>try { const t = localStorage.getItem("myrmid-theme"); if (t === "dark" || t === "light") document.documentElement.dataset.theme = t; } catch (e) { /* no storage: follow the system */ }</script>
 <style>
   :root {
@@ -172,6 +172,21 @@
   #app:not(.mon) > #monitor { display: none; }
   #app.rig > :not(header):not(#rig):not(#offline) { display: none !important; }
   #app:not(.rig) > #rig { display: none; }
+  #app.help > :not(header):not(#help) { display: none !important; }
+  #app:not(.help) > #help { display: none; }
+  .help-top { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin: 6px 0 16px; }
+  .help-top input { font: inherit; padding: 8px 12px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface); color: var(--text); min-width: min(100%, 320px); }
+  .help-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 520px), 1fr)); gap: 14px; align-items: start; }
+  .help-card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; }
+  .help-card summary { cursor: pointer; font-weight: 650; font-size: 1rem; }
+  .help-card[open] summary { margin-bottom: 8px; }
+  .help-card p, .help-card li { font-size: .92rem; line-height: 1.5; }
+  .help-card ul { padding-left: 18px; margin: 6px 0; }
+  .help-card code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .86em; background: var(--surface-2); border: 1px solid var(--line); border-radius: 5px; padding: 0 4px; }
+  .help-card pre { position: relative; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 84px 10px 12px; font-size: .84rem; overflow-x: auto; white-space: pre; margin: 6px 0 10px; }
+  .help-card pre .copy { position: absolute; top: 6px; right: 6px; font: inherit; font-size: 11px; border: 1px solid var(--line); background: var(--surface); color: var(--muted); border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+  .help-card pre .copy:hover { color: var(--text); }
+  .help-card.hide { display: none; }
   .theme-btn { border: 1px solid var(--line); background: var(--surface); color: var(--muted); border-radius: 999px; width: 30px; height: 30px; cursor: pointer; margin-left: 6px; display: inline-grid; place-items: center; padding: 0; }
   .theme-btn:hover { color: var(--text); }
   /* Rig live */
@@ -439,7 +454,7 @@ table.req tr.bg-task td { opacity: .72; }
 <div class="wrap" id="app">
   <header class="top">
     <div>
-      <div class="title-row"><svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="34" height="34" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0f1e28"/><defs><polygon id="hlogo" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/></defs><g stroke="#0f1e28" stroke-width="22"><use href="#hlogo" x="512" y="512" fill="#f0b54a"/><use href="#hlogo" x="512" y="282" fill="#4fc3b4"/><use href="#hlogo" x="512" y="742" fill="#4fc3b4" opacity=".75"/><use href="#hlogo" x="313" y="397" fill="#4fc3b4" opacity=".9"/><use href="#hlogo" x="711" y="397" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="313" y="627" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="711" y="627" fill="#4fc3b4" opacity=".9"/></g><g stroke="#0f1e28" stroke-width="18" stroke-linecap="round"><path d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/></g><g fill="#0f1e28"><circle cx="512" cy="512" r="40"/></g><g fill="#0f1e28"><circle cx="512" cy="282" r="26"/><circle cx="512" cy="742" r="26"/><circle cx="313" cy="397" r="26"/><circle cx="711" cy="397" r="26"/><circle cx="313" cy="627" r="26"/><circle cx="711" cy="627" r="26"/></g></svg><h1>MyrmidLM-Cluster</h1><span class="tabs" role="tablist"><button type="button" role="tab" id="tab-main" aria-selected="true">Übersicht</button><button type="button" role="tab" id="tab-mon" aria-selected="false">Monitor</button><button type="button" role="tab" id="tab-rig" aria-selected="false">Rig live</button></span><button class="theme-btn" id="theme-btn" type="button" title="Design: automatisch (wie das System)">◐</button><a class="ver-badge" id="ver-badge" href="#update-panel" hidden></a><button class="btn quiet small chat-btn" id="chat-open" type="button">Chat testen</button></div>
+      <div class="title-row"><svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="34" height="34" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0f1e28"/><defs><polygon id="hlogo" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/></defs><g stroke="#0f1e28" stroke-width="22"><use href="#hlogo" x="512" y="512" fill="#f0b54a"/><use href="#hlogo" x="512" y="282" fill="#4fc3b4"/><use href="#hlogo" x="512" y="742" fill="#4fc3b4" opacity=".75"/><use href="#hlogo" x="313" y="397" fill="#4fc3b4" opacity=".9"/><use href="#hlogo" x="711" y="397" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="313" y="627" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="711" y="627" fill="#4fc3b4" opacity=".9"/></g><g stroke="#0f1e28" stroke-width="18" stroke-linecap="round"><path d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/></g><g fill="#0f1e28"><circle cx="512" cy="512" r="40"/></g><g fill="#0f1e28"><circle cx="512" cy="282" r="26"/><circle cx="512" cy="742" r="26"/><circle cx="313" cy="397" r="26"/><circle cx="711" cy="397" r="26"/><circle cx="313" cy="627" r="26"/><circle cx="711" cy="627" r="26"/></g></svg><h1>MyrmidLM-Cluster</h1><span class="tabs" role="tablist"><button type="button" role="tab" id="tab-main" aria-selected="true">Übersicht</button><button type="button" role="tab" id="tab-mon" aria-selected="false">Monitor</button><button type="button" role="tab" id="tab-rig" aria-selected="false">Rig live</button><button type="button" role="tab" id="tab-help" aria-selected="false">Hilfe</button></span><button class="theme-btn" id="theme-btn" type="button" title="Design: automatisch (wie das System)">◐</button><a class="ver-badge" id="ver-badge" href="#update-panel" hidden></a><button class="btn quiet small chat-btn" id="chat-open" type="button">Chat testen</button></div>
       <div class="model" id="model">Verbinde mit dem Master …</div>
       <details class="model-switch" id="model-switch">
         <summary>Modell und Kontext</summary>
@@ -644,6 +659,92 @@ table.req tr.bg-task td { opacity: .72; }
     </div>
   </section>
 
+  <section id="help" aria-label="Hilfe: Befehle und Hinweise">
+    <div class="help-top"><div><div class="rig-title">Hilfe</div><div class="muted" style="font-size:12.5px">Die wichtigsten Befehle und Hinweise. <code>MASTER</code> steht für die Adresse des Masters (hier: <code class="help-master">…</code>). Befehle mit <code>sudo</code> auf dem jeweiligen PC ausführen.</div></div>
+      <input id="help-filter" type="search" placeholder="Suchen, z. B. Strata, Key, Log, Platte …" aria-label="Hilfe durchsuchen"></div>
+    <div class="help-grid" id="help-grid">
+      <details class="help-card" open><summary>Clients anbinden (API, Key, Modellname)</summary>
+        <p>OpenAI-kompatible Adresse: <code class="help-api">http://MASTER:8080/v1</code>. Modellname <code>myrmid</code> (der Router entscheidet) oder ein Name aus der Router-Tabelle (dieses Modell gezielt). Den Schlüssel zeigt auf dem Master:</p>
+        <pre>sudo myrmid key</pre>
+        <p>Schnelltest von einem anderen PC:</p>
+        <pre class="help-curl">curl http://MASTER:8080/v1/chat/completions \
+  -H "Authorization: Bearer KEY" -H "Content-Type: application/json" \
+  -d '{"model":"myrmid","messages":[{"role":"user","content":"Hallo"}]}'</pre>
+        <p><b>Hermes</b> (<code>~/.hermes/config.yaml</code>): unter <code>providers:</code> einen Eintrag mit <code>base_url: http://MASTER:8080/v1</code> und <code>key_env: MYRMID_API_KEY</code>; Hilfsmodelle (z. B. <code>auxiliary.compression</code>) brauchen mindestens 64K Kontext. <b>Open WebUI</b>: Einstellungen → Verbindungen → OpenAI-API, Adresse und Key wie oben.</p>
+        <p>Jede Antwort trägt den Header <code>X-Myrmid-Backend</code> (welches Modell auf welchem Rechner). Mit <code>X-Myrmid-Route: big</code> oder <code>fast</code> legt ein Client die Rolle selbst fest.</p>
+      </details>
+      <details class="help-card" open><summary>Installieren und Rolle ändern</summary>
+        <p>Installation (und erneut ausführen, z. B. nach einem Treiber-Neustart):</p>
+        <pre>curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash</pre>
+        <p>Ohne Fragen, z. B. als Worker: <code>… | bash -s -- --role worker --yes</code>. Alle Optionen: <code>bash install.sh --help</code>.</p>
+        <p><b>Rollen:</b> Master (Router + Dashboard, eigenes Modell optional), Host (lädt ganze Modelle für den Router), Worker (leiht seine GPU einem Master). Ein Host wird in seiner Karte per „Zum Worker machen“ umgestellt und umgekehrt.</p>
+        <pre>myrmid --version
+myrmid detect          # Geräte, freier Speicher, Bandbreite</pre>
+      </details>
+      <details class="help-card"><summary>Updates</summary>
+        <p>Am einfachsten im Bereich <b>Version</b> der Übersicht: „Jetzt prüfen“, warten bis alle PCs gebaut haben, dann „Jetzt auf … umstellen“. Mit „Automatisch aktualisieren“ passiert das nachts, sobald zwei Minuten lang keine Anfrage läuft. Kommt ein Dienst danach nicht hoch, geht der PC von selbst zurück.</p>
+        <pre>myrmid update                # Stand
+sudo myrmid update check     # neue Version suchen und bauen
+sudo myrmid update activate  # umstellen
+sudo myrmid update rollback  # zurück zur vorigen Version
+journalctl -u myrmid-update -n 50 --no-pager</pre>
+        <p>Der Build braucht mindestens 3 GB freien Platz unter <code>/opt/myrmid</code>.</p>
+      </details>
+      <details class="help-card"><summary>Dienste und Logs</summary>
+        <pre>systemctl status myrmid-server    # Master
+systemctl status myrmid-host      # Host
+systemctl status myrmid-worker    # Worker
+journalctl -u myrmid-host -n 80 --no-pager
+journalctl -u myrmid-server -f    # laufend mitlesen</pre>
+        <p>Strata: <code>tail -f /var/log/myrmid/strata.log</code>, Updates und Neueinrichtung in <code>/var/log/myrmid/strata-update.log</code>. Einstellungen liegen in <code>/etc/myrmid/myrmid.conf</code>, Messwerte und Zustände unter <code>/var/lib/private/myrmid</code> (dort nur im Ordner <code>models</code> löschen).</p>
+      </details>
+      <details class="help-card"><summary>Modelle, GPUs, Autotune</summary>
+        <pre>myrmid models                 # Modelle hier und zum Herunterladen, nach Eignung
+myrmid download qwen3-4b      # Katalogname, Nummer aus „models“ oder user/repo:QUANT
+nvidia-smi --query-gpu=index,name,pcie.link.gen.current,pcie.link.width.current --format=csv</pre>
+        <p><b>Aufteilung</b> (Host-Karte, ab zwei GPUs): ein Modell über alle GPUs, jede GPU ein eigenes Modell, oder <b>GPU-Gruppen</b> (ab drei GPUs, z. B. drei Karten für ein großes Modell, eine für ein schnelles).</p>
+        <p><b>Autotune</b> misst die schnellsten Einstellungen für das geladene Modell; vorher „Konfiguration sichern“. Nach Hardware-Änderungen (andere Karte, anderer Steckplatz) erneut laufen lassen. Zeigt eine Karte weniger als x16, ist sie oft im falschen Steckplatz.</p>
+        <p><b>KV-Cache</b>: <code>q8_0</code> braucht halb so viel Speicher wie <code>f16</code>, praktisch ohne Verlust; K und V immer gleich (MyrmidLM setzt beide). CPU-Takt fest auf Leistung (Hosts mit CPU-Anteil):</p>
+        <pre>sudo systemctl enable --now myrmid-cpu-performance</pre>
+      </details>
+      <details class="help-card"><summary>Strata</summary>
+        <pre>sudo myrmid strata install --user NAME   # Strata klonen, einrichten, einbinden
+sudo myrmid strata setup                 # vorhandenes Strata einbinden
+myrmid strata                            # Stand</pre>
+        <ul>
+          <li>Laden dauert 2–3 Minuten (Experten in den RAM); der PC kann dabei kurz kaum reagieren. <b>Einmal „Laden“ klicken und warten.</b></li>
+          <li>Kontext und KV-Cache: in der Host-Karte unter „Strata-Einstellungen“ (richtet die Konfiguration neu ein).</li>
+          <li>GPUs: in der Karte wählen; für geteilte Modelle empfiehlt Strata ab 8 GB je Karte.</li>
+          <li>Nach „Strata aktualisieren“ im Log prüfen, ob alle Karten dabei sind (<code>layer split across GPUs</code>).</li>
+        </ul>
+      </details>
+      <details class="help-card"><summary>Router: wer antwortet</summary>
+        <ul>
+          <li><b>Rollen:</b> groß (Standard), schnell (kurze, einfache Anfragen), nur per Name.</li>
+          <li><b>Wer entscheidet:</b> Regeln (Tools, Bilder, lange Anfragen → groß), schnelles Modell (ordnet selbst ein) oder Beispiele (Ähnlichkeit zu Beispielsätzen). Braucht ein Modell mit Rolle „schnell“.</li>
+          <li><b>Fachgebiete:</b> z. B. Programmieren → Coder-Modell, per Stichwörtern. Geht auch ohne schnelles Modell.</li>
+          <li><b>Hintergrundaufträge</b> von Open WebUI (Titel, Tags, Folgefragen) gehen ans schnelle Modell.</li>
+          <li>Bei Gleichstand antwortet die kühlere GPU. Den Grund jeder Entscheidung zeigt der Monitor („Entschieden durch“).</li>
+          <li><b>Wartungsmodus</b> nimmt einen Host aus dem Routing, ohne ihn zu wecken oder schlafen zu legen.</li>
+        </ul>
+      </details>
+      <details class="help-card"><summary>Fehlerbehebung</summary>
+        <p><b>Platte voll:</b></p>
+        <pre>df -h /
+sudo ncdu -x /                              # größte Ordner (apt install ncdu)
+sudo rm /var/crash/*                        # Absturzabbilder, oft 30 GB und mehr
+sudo systemctl disable --now apport         # keine neuen (Ubuntu)
+docker builder prune -af                    # Build-Cache der CUDA-Builds</pre>
+        <p><b>Download von Hugging Face hängt</b> (meist kaputtes IPv6): IPv4 bevorzugen.</p>
+        <pre>echo 'precedence ::ffff:0:0/96  100' | sudo tee -a /etc/gai.conf</pre>
+        <p><b>Uhr geht falsch</b> (Logzeiten, nächtliche Updates):</p>
+        <pre>timedatectl
+sudo timedatectl set-ntp true
+sudo timedatectl set-timezone Europe/Berlin</pre>
+        <p><b>401 / invalid api key:</b> Key mit <code>sudo myrmid key</code> neu kopieren (Verwechslung 0/O, l/I). <b>503 / kein Modell:</b> Host schläft, ist in Wartung oder lädt noch: Host-Karte ansehen. <b>Speicherfehler beim Laden:</b> der Host versucht von selbst kleinere Stufen (weniger Cache, kleineres -ub, weniger Kontext) und zeigt es in der Karte; KV-Cache <code>q8_0</code> oder weniger Kontext hilft.</p>
+      </details>
+    </div>
+  </section>
   <section id="rig" aria-label="Rig live: alle GPUs">
     <div class="rig-top"><div><div class="rig-title">Cluster <em>live</em></div><div class="muted" style="font-size:12px" id="rig-stand">–</div></div>
       <div class="rig-kpis" id="rig-kpis"></div></div>
@@ -1939,6 +2040,7 @@ function render(s) {
   else if (location.hash === "#chat" && !render.chatOpened) { render.chatOpened = true; chatOpen(true); }
   if (location.hash === "#monitor" && !render.monOpened) { render.monOpened = true; monShow(true); }
   if (location.hash === "#rig" && !render.rigOpened) { render.rigOpened = true; showTab("rig"); }
+  if (location.hash === "#hilfe" && !render.helpOpened) { render.helpOpened = true; showTab("help"); }
   renderRig(s);
 }
 
@@ -1952,7 +2054,10 @@ function showTab(tab) {
   $("tab-main").setAttribute("aria-selected", String(tab === "main"));
   $("tab-mon").setAttribute("aria-selected", String(tab === "mon"));
   $("tab-rig").setAttribute("aria-selected", String(tab === "rig"));
-  const hash = { mon: "#monitor", rig: "#rig" }[tab] || "";
+  $("app").classList.toggle("help", tab === "help");
+  $("tab-help").setAttribute("aria-selected", String(tab === "help"));
+  const hash = { mon: "#monitor", rig: "#rig", help: "#hilfe" }[tab] || "";
+  if (tab === "help") helpPrepare();
   if (location.hash !== hash) history.replaceState(null, "", hash || location.pathname);
   if (tab === "mon") monFetch();
   if (tab === "rig" && last) renderRig(last);
@@ -1961,6 +2066,36 @@ function monShow(on) { showTab(on ? "mon" : "main"); }
 $("tab-main").addEventListener("click", () => showTab("main"));
 $("tab-mon").addEventListener("click", () => showTab("mon"));
 $("tab-rig").addEventListener("click", () => showTab("rig"));
+$("tab-help").addEventListener("click", () => showTab("help"));
+
+function helpPrepare() {
+  // the master's address into the examples, and a copy button on every command block (once)
+  const host = location.hostname || "MASTER";
+  document.querySelectorAll(".help-master").forEach((el) => { el.textContent = host; });
+  document.querySelectorAll("#help pre").forEach((pre) => {
+    if (pre.dataset.ready) return;
+    pre.dataset.ready = "1";
+    pre.innerHTML = pre.innerHTML.replace(/MASTER/g, esc(host));
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.className = "copy"; btn.textContent = "Kopieren";
+    btn.addEventListener("click", async () => {
+      const text = [...pre.childNodes].filter((n) => n !== btn).map((n) => n.textContent).join("").trim();
+      try { await navigator.clipboard.writeText(text); btn.textContent = "Kopiert"; }
+      catch (e) { const r = document.createRange(); r.selectNodeContents(pre); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); btn.textContent = "markiert: Strg+C"; }
+      setTimeout(() => { btn.textContent = "Kopieren"; }, 1800);
+    });
+    pre.appendChild(btn);
+  });
+  document.querySelectorAll(".help-card code").forEach((el) => { if (el.textContent.includes("MASTER")) el.textContent = el.textContent.replace(/MASTER/g, host); });
+}
+$("help-filter").addEventListener("input", () => {
+  const q = $("help-filter").value.trim().toLowerCase();
+  document.querySelectorAll("#help .help-card").forEach((c) => {
+    const hit = !q || c.textContent.toLowerCase().includes(q);
+    c.classList.toggle("hide", !hit);
+    if (q && hit) c.open = true;
+  });
+});
 
 const ICON = (d) => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
 const THEMES = [

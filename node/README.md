@@ -175,6 +175,8 @@ myrmid serve -m gross.gguf --assign "pc2=qwen3-32b,name=qwen32" --assign "pc3=qw
 
 **Rig live:** Der Reiter „Rig live“ (oder `/#rig`) zeigt jede GPU des Clusters als Karte, nach PC gruppiert: das Modell darauf (mit Engine, Rolle, GPU-Gruppe), laufende Anfragen, Auslastung, Leistung, Temperatur und VRAM; oben GPUs online, wie viele gerade rechnen, geladene Modelle, Leistung gesamt und die wärmste Karte. Schlafende Hosts erscheinen ausgegraut.
 
+**Hilfe:** Der Reiter „Hilfe“ (oder `/#hilfe`) sammelt die wichtigsten Befehle und Hinweise (Clients anbinden, Installation, Updates, Dienste und Logs, Modelle und GPUs, Strata, Router, Fehlerbehebung), mit Suchfeld und Kopier-Knopf an jedem Befehl; die Adresse des Masters ist schon eingesetzt.
+
 **Design:** Der Knopf neben den Reitern wechselt zwischen automatisch (wie das System), dunkel und hell; die Wahl merkt sich der Browser.
 
 **Monitor:** Der Reiter „Monitor“ oben im Dashboard (oder `/#monitor`) zeigt je Host oder für alle: Tempo der letzten Anfrage (schreiben, lesen), GPU-Auslastung, VRAM, GPU-Temperatur, Leistungsaufnahme, PCIe-Anbindung, CPU und RAM, jeweils mit Verlauf der letzten 5 Minuten; dazu die Kontext-Füllung der letzten Anfrage, wie viel des Prompts aus dem Cache kam, und eine Liste der letzten 200 Anfragen mit Absender (aus dem User-Agent: Open WebUI, Hermes, …), warum der Router so entschieden hat, wie lange das Einordnen dauerte, Prompt-, Cache- und Ausgabe-Token, Tempo und Dauer (`GET /api/monitor` auf dem Dashboard-Port). Die Werte kommen aus den „timings“ von llama-server, bei externen Servern aus „usage“.
