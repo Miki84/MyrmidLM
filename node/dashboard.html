@@ -414,6 +414,12 @@ table.req tr.bg-task td { opacity: .72; }
   .pill.net.on::before { background: var(--good); box-shadow: 0 0 6px var(--good); }
   .pill.net.slow { color: var(--warn); } .pill.net.slow::before { background: var(--warn); }
   .pill.net.off { color: var(--muted); }
+  .strata-inst { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 6px 0; }
+  .strata-inst summary { cursor: pointer; font-size: .9rem; }
+  .strata-inst.run { border-color: var(--warn); }
+  .strata-inst .si-form { align-items: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+  .strata-inst .si-form input { width: 110px; }
+  .bad-text { color: var(--bad); }
 </style>
 </head>
 <body>
@@ -1624,11 +1630,24 @@ function renderHosts(s) {
     const sSet0 = ((x.strata || {}).config_settings || {})[sCfgName] || {};
     const sCtx = e.strata_ctx ?? (sSet0.context || (a.engine === "strata" && x.ctx) || 131072);
     const sKv = e.strata_kv ?? (sSet0.kv || "int8");
-    const strataSettings = x.strata && engine === "strata" && sCfgName ? `<details class="wide strata-set"${e.strata_ctx !== undefined || e.strata_kv !== undefined ? " open" : ""}><summary>Strata-Einstellungen: Kontext und KV-Cache${sSet0.context ? ` <span class="note">(jetzt ${Number(sSet0.context).toLocaleString("de-DE")}${sSet0.kv ? ", " + esc(sSet0.kv) : ""})</span>` : ""}</summary>
+    const strataSettings = x.strata && engine === "strata" && sCfgName ? `<details class="wide strata-set"${e.strata_ctx !== undefined || e.strata_kv !== undefined || hostOpen[x.id + ":ss"] ? " open" : ""}><summary>Strata-Einstellungen: Kontext und KV-Cache${sSet0.context ? ` <span class="note">(jetzt ${Number(sSet0.context).toLocaleString("de-DE")}${sSet0.kv ? ", " + esc(sSet0.kv) : ""})</span>` : ""}</summary>
         <div class="note">Strata legt beides in der Konfiguration ${esc(sCfgName)} fest. „Übernehmen“ richtet sie mit Strata-Setup neu ein (ohne neuen Download) und startet Strata neu; das dauert ein paar Minuten.</div>
         <div class="kv"><label>Kontext<input name="strata_ctx" inputmode="numeric" value="${esc(String(sCtx))}" placeholder="z. B. 131072"></label>
         <label>KV-Cache<select name="strata_kv">${[["int8", "int8 (Standard)"], ["q4_0", "q4_0 (½ Speicher)"], ["k8v4", "k8v4 (K 8 Bit, V 4 Bit)"], ["fp16", "fp16 (voll, doppelter Speicher)"]].map(([v, t]) => `<option value="${v}"${v === sKv ? " selected" : ""}>${t}</option>`).join("")}</select></label>
         <button class="btn small" type="button" data-hstrata-reconf="${esc(sCfgName)}">Übernehmen</button></div></details>` : "";
+    const si = !x.strata && x.strata_install;
+    const strataInstallRow = !si ? "" : si.running
+      ? `<div class="strata-inst run"><b>Strata wird installiert …</b> <span class="note">${esc(si.last || "startet")}</span><div class="note">Mit Download des Modells (40–90 GB) kann das eine Weile dauern. Protokoll: <code>/var/log/myrmid/strata-install.log</code></div></div>`
+      : `<details class="strata-inst"${si.failed || hostOpen[x.id + ":si"] ? " open" : ""}><summary>Strata installieren <span class="note">(alternative Engine, auf diesem PC noch nicht eingerichtet)</span></summary>
+        ${si.failed ? `<div class="note bad-text">Letzter Versuch fehlgeschlagen: ${esc(si.last)}. Protokoll: <code>/var/log/myrmid/strata-install.log</code></div>` : ""}
+        ${!si.possible ? `<div class="note">Dieser PC kann das noch nicht aus dem Dashboard: einmal <code>install.sh</code> ausführen, oder auf dem PC <code>sudo myrmid strata install --user NAME</code>.</div>` : !(si.users || []).length ? `<div class="note">Kein passender Benutzer gefunden (Strata läuft nicht als root): auf dem PC <code>sudo myrmid strata install --user NAME</code>.</div>` : `
+        <div class="note">Klont Strata in den Home-Ordner des Benutzers, richtet es ohne Rückfragen ein (lädt das Modell, falls es noch nicht in <code>~/Strata-data/models</code> liegt) und bindet es ein. Danach gibt es hier die Engine-Auswahl.</div>
+        <div class="kv si-form"><label>Benutzer<select data-si="user" name="si_user">${si.users.map((u) => `<option${u === (e.si_user ?? si.users[0]) ? " selected" : ""}>${esc(u)}</option>`).join("")}</select></label>
+          <label>Modell<select data-si="model" name="si_model">${(si.models || ["IQ3_S"]).map((m) => `<option value="${m}"${m === (e.si_model ?? "IQ3_S") ? " selected" : ""}>${m}${m === "IQ3_S" ? " (empfohlen)" : ""}</option>`).join("")}</select></label>
+          <label>Kontext<input data-si="context" name="si_context" inputmode="numeric" value="${esc(e.si_context ?? "131072")}"></label>
+          <label>KV-Cache<select data-si="kv" name="si_kv">${["int8", "q4_0", "k8v4", "fp16"].map((k) => `<option${k === (e.si_kv ?? "int8") ? " selected" : ""}>${k}</option>`).join("")}</select></label>
+          <button class="btn small" type="button" data-strata-install>Installieren</button></div>`}
+      </details>`;
     const strataRow = x.strata ? `<div class="kv"><span class="note">Strata${x.strata.version ? " " + esc(x.strata.version) : ""} · Dienst ${esc(STRATA_STATE[x.strata.state] || x.strata.state || "?")}</span><button class="btn quiet small" type="button" data-hstrata="update" title="Update im Strata-Ordner (git pull, Engine, Pakete). Läuft Strata, wird es dafür kurz gestoppt.">Strata aktualisieren</button><button class="btn quiet small" type="button" data-hstrata="refresh" title="Konfigurationen neu einlesen">↻</button></div>` : "";
     const pr = x.progress;
     const eta = pr && pr.mb_s > 0.1 ? Math.max(0, (pr.total_mb - pr.done_mb) / pr.mb_s) : 0;
@@ -1664,7 +1683,7 @@ function renderHosts(s) {
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${x.gpu ? " · " + esc(x.gpu) : gpus ? " · " + gpus : ""}</div></div>
         <div class="pills">${x.online === undefined ? "" : `<div class="pill net ${x.online ? "on" : x.slow ? "slow" : "off"}" title="${x.online ? "Antwortet dem Master" : x.slow ? "Hat zuletzt nicht geantwortet (lädt oder ist ausgelastet?)" : x.asleep ? "Schläft oder ist aus: wird bei Bedarf per Wake-on-LAN geweckt" : "Antwortet nicht"}${x.seen_ago != null ? ` · zuletzt gesehen vor ${x.seen_ago < 120 ? x.seen_ago + " s" : Math.round(x.seen_ago / 60) + " min"}` : ""}">${x.online ? "online" : x.slow ? "antwortet langsam" : "offline"}</div>`}<div class="pill" title="Was das Modell gerade tut"><span class="dot ${cls}"></span><span>${txt}</span></div></div></div>
       ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${x.note ? `<div class="note">${esc(x.note)}</div>` : ""}${hostStats(x)}${layoutRow}${sleepRow}${maintRow}${roleRow}
-      ${strataRow}
+      ${strataRow}${strataInstallRow}
       ${x.engine !== "strata" && (x.state === "ready" || x.state === "tuning" || x.tuned || x.tune_job) ? `<div class="kv"><span class="note">${esc(tuneText(x.tune_job, x.tuned) || "Autotune: misst die schnellsten Einstellungen für dieses Modell auf diesem PC.")}</span>${
         x.tune_job && x.tune_job.state === "running" ? `<button class="btn quiet small" type="button" data-htune="cancel">Abbrechen</button>`
         : x.state === "ready" ? `<button class="btn quiet small" type="button" data-htune="start">${x.tuned ? "Autotune erneut" : "Autotune"}</button>${x.tuned ? `<button class="btn quiet small" type="button" data-htune="reset">Verwerfen</button>` : ""}` : ""}</div>` : ""}
@@ -1720,11 +1739,22 @@ $("hosts").addEventListener("submit", (ev) => {
   hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx"), kv: f.get("kv"), vision: f.get("vision"), engine: f.get("engine") || "llama", strata_gpus: f.getAll("strata_gpu").join(",") });
 });
 $("hosts").addEventListener("toggle", (ev) => {
-  if (ev.target.matches && ev.target.matches("details.snaps")) hostOpen[ev.target.closest(".host").dataset.id] = ev.target.open;
+  if (!ev.target.matches) return;
+  const id = (ev.target.closest(".host") || {}).dataset?.id;
+  if (ev.target.matches("details.snaps")) hostOpen[id] = ev.target.open;
+  if (ev.target.matches("details.strata-inst")) hostOpen[id + ":si"] = ev.target.open;
+  if (ev.target.matches("details.strata-set")) hostOpen[id + ":ss"] = ev.target.open;
 }, true);
 $("hosts").addEventListener("click", (ev) => {
   const card = ev.target.closest(".host"); if (!card) return;
   if (ev.target.matches("[data-unload]")) { delete hostEdits[card.dataset.id]; hostAction({ host: card.dataset.id, unload: true }); }
+  if (ev.target.matches("[data-strata-install]")) {
+    const v = (k) => (card.querySelector(`[data-si="${k}"]`) || {}).value || "";
+    if (!confirm(`Strata auf diesem PC für „${v("user")}“ installieren (Modell ${v("model")})?\n\nLädt das Modell herunter, falls es noch nicht da ist (40–90 GB), und dauert entsprechend.`)) return;
+    ev.target.disabled = true;
+    hostAction({ host: card.dataset.id, strata: "install", user: v("user"), model: v("model"), context: v("context").replace(/[.\s]/g, ""), kv: v("kv") });
+    return;
+  }
   if (ev.target.matches("[data-hstrata-reconf]")) {
     const ctx = (card.querySelector('input[name="strata_ctx"]') || {}).value || "";
     const kv = (card.querySelector('select[name="strata_kv"]') || {}).value || "int8";

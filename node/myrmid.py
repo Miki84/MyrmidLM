@@ -4400,7 +4400,10 @@ DEFAULT_REPO = "https://github.com/Miki84/MyrmidLM.git"
 SERVICES = ("myrmid-server", "myrmid-worker", "myrmid-host")
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 RELEASE_RE = re.compile(r"^(\d+\.\d+\.\d+|main-[0-9a-f]{7,40})$")
-UPDATE_ACTIONS = ("check", "prepare", "activate", "rollback", "auto")
+UPDATE_ACTIONS = ("check", "prepare", "activate", "rollback", "auto", "strata-install")
+STRATA_INSTALL_UNIT = "myrmid-strata-install"
+STRATA_INSTALL_LOG = Path("/var/log/myrmid/strata-install.log")
+STRATA_MODELS = ("IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0", "IQ1_M", "Q8_0")
 UPDATE_HEALTH_S = 30  # services must stay up this long after a switch
 UPDATE_SELF_AFTER_S = 7 * 86400  # a worker whose master never asks switches itself after a week
 MIN_BUILD_FREE_GB = 3
@@ -4834,6 +4837,8 @@ def update_apply_request() -> dict:
     if version is not None and not RELEASE_RE.match(str(version)):
         raise UpdateError(f"not a release: {version}")
     log(f"Update request: {action} {version or ''}".rstrip())
+    if action == "strata-install":
+        return strata_install_start(req)
     if action == "check":
         return update_check()
     if action == "prepare":
@@ -4844,6 +4849,40 @@ def update_apply_request() -> dict:
         return update_rollback()
     write_conf_value("AUTO", "on" if req.get("value") else "off")
     return write_update_state()
+
+
+def strata_install_start(req: dict) -> dict:
+    """The dashboard's "Strata installieren" (root): myrmid strata install as its own unit, so the update helper is
+    free again at once; its output goes to strata-install.log, which the host shows."""
+    import pwd
+
+    user = str(req.get("user") or "")
+    model = str(req.get("model") or "IQ3_S").upper()
+    ctx, kv = int(req.get("context") or 0), str(req.get("kv") or "int8")
+    try:
+        if pwd.getpwnam(user).pw_uid < 1000:
+            raise KeyError(user)
+    except KeyError:
+        raise UpdateError(f"no such user for Strata: {user!r}")
+    if model not in STRATA_MODELS or kv not in STRATA_KVS or (ctx and not 4096 <= ctx <= 1048576):
+        raise UpdateError("Strata: unknown model, KV cache or context")
+    if strata_conf():
+        raise UpdateError("Strata is already set up on this PC")
+    STRATA_INSTALL_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(STRATA_INSTALL_LOG, "a") as f:
+        f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} Strata installieren: {user}, {model}, "
+                f"Kontext {ctx or 'Standard'}, KV {kv} ===\n")
+    os.chmod(STRATA_INSTALL_LOG, 0o644)
+    cmd = ["systemd-run", f"--unit={STRATA_INSTALL_UNIT}", "--collect", "--quiet",
+           "-p", f"StandardOutput=append:{STRATA_INSTALL_LOG}", "-p", "StandardError=inherit",
+           "-p", "TimeoutStartSec=6h", "-E", "PYTHONUNBUFFERED=1",
+           str(PREFIX / "current" / "bin" / "myrmid"), "strata", "install", "--user", user, "--model", model,
+           "--kv", kv] + (["--context", str(ctx)] if ctx else [])
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        raise UpdateError(f"systemd-run: {(r.stderr or r.stdout).strip()[:300]}")
+    log(f"Strata: installing for {user} ({model}); log {STRATA_INSTALL_LOG}")
+    return {"ok": True}
 
 
 def request_update(body: dict) -> dict:
@@ -4858,7 +4897,8 @@ def request_update(body: dict) -> dict:
     if Path(UPDATE_REQUEST).exists():
         return {"ok": False, "error": "a request is still running"}
     tmp = Path(f"{UPDATE_REQUEST}.tmp")
-    tmp.write_text(json.dumps({"action": action, "version": version, "value": bool(body.get("value"))}))
+    tmp.write_text(json.dumps({"action": action, "version": version, "value": bool(body.get("value")),
+                               **{k: body[k] for k in ("user", "model", "context", "kv") if k in body}}))
     tmp.replace(UPDATE_REQUEST)
     return {"ok": True}
 
@@ -5490,6 +5530,22 @@ class StrataProc:
         return 0
 
 
+_HAS_NVIDIA: list = []
+
+
+def has_nvidia() -> bool:
+    """An NVIDIA GPU with a working driver (Strata needs one)."""
+    if not _HAS_NVIDIA:
+        ok = False
+        if shutil.which("nvidia-smi"):
+            try:
+                ok = "GPU " in subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10).stdout
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+        _HAS_NVIDIA.append(ok)
+    return _HAS_NVIDIA[0]
+
+
 def nvidia_index(gpu: Optional["Device"]) -> Optional[int]:
     """The nvidia-smi number of a llama.cpp device (CUDA1 ...): by its PCI address, else by its place among cards of
     the same name (CUDA puts equal cards in PCI order, like nvidia-smi). Strata numbers cards as nvidia-smi does."""
@@ -5954,7 +6010,12 @@ def strata_install(args) -> None:
     if not args.no_setup:
         print("\nStrata-Einrichtung (setup.sh, als " + user + "): Modell, Speicherort und Einstellungen wählen. "
               "Das Modell wird heruntergeladen (40-90 GB); Strata startet danach nicht, das macht MyrmidLM.\n")
-        code = as_user(["sh", "./setup.sh", "--no-start", *(args.setup_args or [])], d)
+        extra = list(args.setup_args or [])
+        if getattr(args, "model", None):  # from the dashboard: no questions (--yes), the choices given
+            extra = ["--yes", "--model", args.model] + (["--context", str(args.context)] if args.context else []) \
+                + (["--kv", args.kv] if args.kv else []) + extra
+        code = as_user(["sh", "./setup.sh", "--no-start", *extra], d) if not getattr(args, "model", None) else \
+            _run_as(user, ["sh", "./setup.sh", "--no-start", *extra], cwd=d, env=uenv, stdin=subprocess.DEVNULL).returncode
         if code:
             die(f"setup.sh endete mit Code {code}. Danach erneut: sudo myrmid strata install --user {user}")
     if not _strata_configs(d):
@@ -6149,6 +6210,8 @@ class HostAgent:
                 st["note"] = (st["note"] + " " if st["note"] else "") + self.event
         st["metrics"] = self._metrics() if st["engine"] != "strata" else {}
         st["stats"] = self.stats.sample()
+        if not strata_conf() and self.slot in (None, 0) and has_nvidia():
+            st["strata_install"] = self._strata_install_info()
         if strata_conf() and (self.slot is None or self.group):
             info = strata_info()
             if not info and time.time() - getattr(self, "strata_asked", 0) > 60:
@@ -6374,6 +6437,45 @@ class HostAgent:
             if current():
                 self._set("error", f"Strata: {type(e).__name__}: {e}")
 
+    def _strata_install_info(self) -> dict:
+        """For the card's "Strata installieren": who may run it, whether it runs, the log's last lines."""
+        import pwd
+
+        users = sorted(p.pw_name for p in pwd.getpwall()
+                       if 1000 <= p.pw_uid < 60000 and p.pw_dir.startswith("/home/")
+                       and not p.pw_shell.endswith(("nologin", "false")))
+        try:
+            st = subprocess.run(["systemctl", "is-active", STRATA_INSTALL_UNIT], capture_output=True, text=True,
+                                timeout=10).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            st = ""
+        tail = []
+        try:
+            with open(STRATA_INSTALL_LOG, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 16384))
+                tail = [x for x in f.read().decode(errors="replace").replace("\r", "\n").splitlines() if x.strip()]
+        except OSError:
+            pass
+        last = tail[-1].strip() if tail else ""
+        return {"users": users, "running": st in ("active", "activating"), "possible": UPDATE_HELPER.exists(),
+                "models": list(STRATA_MODELS), "last": last[:240],
+                "failed": bool(tail) and st not in ("active", "activating") and any(
+                    k in " ".join(tail[-6:]).lower() for k in ("error", "fehler", "endete mit code", "[x]"))}
+
+    def strata_install(self, body: dict) -> dict:
+        """The card: install Strata for a user (the root helper runs myrmid strata install)."""
+        b = {"action": "strata-install", "user": str(body.get("user") or ""),
+             "model": str(body.get("model") or "IQ3_S"), "kv": str(body.get("kv") or "int8"),
+             "context": parse_ctx(body.get("context")) or 0}
+        res = request_update(b)
+        if not res.get("ok"):
+            return {**self.status(), "error": f"Strata: {res.get('error')}"}
+        with self.lock:
+            self.event = (f"Strata wird für {b['user']} installiert ({b['model']}). Das dauert, mit Download des "
+                          "Modells, eine Weile; der Fortschritt steht in der Karte.")
+        return self.status()
+
     def _strata_fixed(self) -> Optional[str]:
         """This slot's cards as Strata numbers them (nvidia-smi): "1" or "0,2"; None if one can't be found."""
         if not hasattr(self, "strata_gpu"):
@@ -6384,6 +6486,8 @@ class HostAgent:
     def strata(self, body: Optional[dict] = None) -> dict:
         """The dashboard: update Strata (it stops and starts again if it runs)."""
         action = str((body or {}).get("action") or "")
+        if action == "install":
+            return self.strata_install(body or {})
         if not strata_conf():
             return {**self.status(), "error": "Strata ist auf diesem PC nicht eingerichtet: sudo myrmid strata setup"}
         if action in ("update", "reconfigure"):
@@ -8738,7 +8842,8 @@ class HostManager:
             try:
                 res = self._call(self.hosts[hid], "/strata",
                                  {"action": str(body["strata"]),
-                                  **{k: body[k] for k in ("config", "context", "kv") if k in body}}, timeout=10)
+                                  **{k: body[k] for k in ("config", "context", "kv", "user", "model") if k in body}},
+                                 timeout=10)
             except Exception as e:  # noqa: BLE001
                 return {**self.info(), "error": f"Strata: {e}"}
             if res.get("error"):
@@ -8830,7 +8935,7 @@ class HostManager:
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
                                                        "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned", "groups", "group", "nv_index",
-                                                       "note", "snapshots", "rollback", "engine", "strata")},
+                                                       "note", "snapshots", "rollback", "engine", "strata", "strata_install")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]
@@ -9663,6 +9768,9 @@ def main() -> None:
     st.add_argument("--dir", help="Strata's folder (default: /home/*/strata)")
     st.add_argument("--user", help="the user Strata runs as (default: the folder's owner)")
     st.add_argument("--keep-old", action="store_true", help="leave an existing strata.service running and enabled")
+    st.add_argument("--model", help="install: Strata's model (e.g. IQ3_S) without questions (--yes)")
+    st.add_argument("--context", type=int, help="install with --model: context length")
+    st.add_argument("--kv", choices=("int8", "q4_0", "k8v4", "fp16"), help="install with --model: KV cache")
     st.set_defaults(fn=cmd_strata)
 
     up = sub.add_parser("update", help="versions and updates (check, prepare, activate need sudo)",
