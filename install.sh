@@ -946,7 +946,24 @@ if (( avail_mb < 6000 )) && have systemctl; then
         sleep 2
     fi
 fi
-if [[ -x "$REL/bin/myrmid" ]]; then
+# A build from before the GPU driver ran (or without its toolkit) has only the CPU: if this run found the GPU's
+# backend but that build lacks it, build again instead of keeping it (else updates would stay CPU-only too).
+missing_backends() {
+    local b miss=()
+    for b in ${BACKENDS//,/ }; do
+        case "$b" in
+            cuda|vulkan|sycl) compgen -G "$REL/bin/libggml-$b*" >/dev/null || miss+=("$b") ;;
+            rocm) compgen -G "$REL/bin/libggml-hip*" >/dev/null || miss+=("$b") ;;
+        esac
+    done
+    echo "${miss[*]}"
+}
+REBUILD=0
+if [[ -x "$REL/bin/myrmid" && -n "$(missing_backends)" ]]; then
+    warn "Version $VER ist gebaut, aber ohne $(missing_backends) (vermutlich vor dem Treiber-Neustart): baue neu, damit die GPU genutzt wird."
+    REBUILD=1  # the old build keeps running until the new one is done
+fi
+if [[ -x "$REL/bin/myrmid" && $REBUILD -eq 0 ]]; then
     ok "Version $VER ist schon gebaut."
 else
     srun rm -rf "$REL.part"
@@ -960,7 +977,9 @@ else
     fi
     if [[ $DRY -eq 0 ]]; then
         echo "$VER" | $SUDO tee "$REL.part/bin/VERSION" >/dev/null
+        if [[ -e "$REL" ]]; then $SUDO rm -rf "$REL.old"; $SUDO mv "$REL" "$REL.old"; fi
         $SUDO mv "$REL.part" "$REL"
+        $SUDO rm -rf "$REL.old"
     fi
 fi
 # Version umschalten (atomar) und den Befehl myrmid für alle bereitstellen.

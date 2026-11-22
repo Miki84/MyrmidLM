@@ -7103,6 +7103,14 @@ def cmd_host(args) -> None:
         f"{Path(args.models_dir).expanduser()}, API on port {args.api_port}; {gpu_txt}; "
         + ({"per_gpu": "one model per GPU", "groups": f"one model per GPU group {node.groups}"}
            .get(node.layout, "one model over all GPUs")))
+    if not any(d.type == "gpu" for d in gpus) and shutil.which("nvidia-smi"):
+        try:
+            n_nv = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10).stdout.count("GPU ")
+        except (OSError, subprocess.TimeoutExpired):
+            n_nv = 0
+        if n_nv:
+            log(f"Host: nvidia-smi sees {n_nv} NVIDIA GPU(s), but this build of llama.cpp has no CUDA (built before "
+                "the driver ran?). Run install.sh again: it builds with CUDA now (or: --backends cuda).")
     advs = []
     if not args.no_advertise:
         adv = Advertiser(HOST_TYPE, f"MyrmidLM Host {socket.gethostname()}", args.port,
