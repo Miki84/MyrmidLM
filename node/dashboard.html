@@ -213,6 +213,10 @@
   .rc-head .tag { font-size: 10.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .rc-head .tag.acc { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
   .rc-head .dot { margin-left: auto; }
+  .rc-head { min-width: 0; }
+  .rc-head b { white-space: nowrap; flex-shrink: 0; }
+  .rc-head .rc-card { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; }
+  .rc-head .tag { flex-shrink: 0; }
   .rc-model { font-weight: 650; margin: 6px 0 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .rc-sub { font-size: 12px; color: var(--muted); min-height: 1.3em; }
   .rc-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px; }
@@ -2181,8 +2185,13 @@ function renderRig(s) {
     const models = [...new Set(p.entries.filter((e) => e.state === "ready" && e.model).map((e) => shortModel(e.model)))];
     const cards = gpus.map((g, i) => {
       const idx = g.index != null ? g.index : i;
-      const e = p.entries.find((x) => (x.nv_index || []).includes(idx)) || p.entries.find((x) => x.slot == null) || p.entries[0] || {};
-      const a = e.assignment || {};
+      let e = p.entries.find((x) => (x.nv_index || []).includes(idx)) || p.entries.find((x) => x.slot == null) || p.entries[0] || {};
+      let a = e.assignment || {};
+      // Strata over the whole PC uses only the cards chosen (or its configuration's): the others are free
+      if (a.engine === "strata" && e.slot == null) {
+        const chosen = String(a.strata_gpus || ((e.strata || {}).config_gpus || {})[a.model] || "").split(",").filter((v) => v !== "");
+        if (chosen.length && !chosen.includes(String(idx))) { e = { state: "idle", id: "" }; a = {}; }
+      }
       const inflight = bks.filter((b) => b.source === e.id).reduce((n, b) => n + (b.inflight || 0), 0);
       const busy = inflight > 0 || (g.util_pct || 0) >= 30;
       const st = e.state || "idle";
@@ -2194,7 +2203,8 @@ function renderRig(s) {
       const tags = [engine && `<span class="tag acc">${engine}</span>`, a.role && `<span class="tag">${esc(ROLE_TEXT[a.role] || a.role)}</span>`, e.slot != null && `<span class="tag">${esc(String(e.name || "").split(" · ")[1] || "")}</span>`].filter(Boolean).join("");
       const memPct = g.mem_total_mb ? 100 * g.mem_used_mb / g.mem_total_mb : 0;
       const sub = st === "ready" ? (inflight ? (inflight > 1 ? `${inflight} Anfragen laufen` : "1 Anfrage läuft") : (a.name ? `Name: ${esc(a.name)}` : "bereit")) : esc(e.error || "");
-      return `<div class="rcard ${cls}" title="${esc(g.name)}${pcieText(g).replace(/<[^>]+>/g, "")}"><div class="rc-head"><b>GPU ${idx}</b>${tags}<span class="dot ${st === "ready" ? (busy ? "busy" : "ok") : st === "error" ? "bad" : "warn"}"></span></div>
+      const card = String(g.name || "").replace(/^NVIDIA\s+/i, "").replace(/^(AMD|Intel)\s+/i, "");
+      return `<div class="rcard ${cls}" title="${esc(g.name)}${pcieText(g).replace(/<[^>]+>/g, "")}"><div class="rc-head"><b>GPU ${idx}</b><span class="rc-card">${esc(card)}</span>${tags}<span class="dot ${st === "ready" ? (busy ? "busy" : "ok") : st === "error" ? "bad" : st === "idle" ? "" : "warn"}"></span></div>
         <div class="rc-model">${esc(model)}</div><div class="rc-sub">${sub}</div>
         <div class="rc-stats">
           <div><span>Last</span><b>${g.util_pct == null ? "–" : nf(g.util_pct, 0) + " %"}</b>${bar(g.util_pct, "var(--warn)")}</div>
