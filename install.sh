@@ -952,7 +952,12 @@ missing_backends() {
     local b miss=()
     for b in ${BACKENDS//,/ }; do
         case "$b" in
-            cuda|vulkan|sycl) compgen -G "$REL/bin/libggml-$b*" >/dev/null || miss+=("$b") ;;
+            cuda|vulkan|sycl)
+                if ! compgen -G "$REL/bin/libggml-$b*" >/dev/null; then miss+=("$b")
+                # there, but a library it needs is missing (e.g. libnccl from older container builds): not usable
+                elif LD_LIBRARY_PATH="$REL/bin" ldd "$REL/bin/libggml-$b.so" 2>/dev/null | grep -v "libcuda\.so" | grep -q "not found"; then
+                    miss+=("$b")
+                fi ;;
             rocm) compgen -G "$REL/bin/libggml-hip*" >/dev/null || miss+=("$b") ;;
         esac
     done

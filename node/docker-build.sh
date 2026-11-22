@@ -65,10 +65,21 @@ docker run --rm --network host \
     -v "$ROOT:/src" -v "$OUT:/out" -w /src/node "$TAG" bash -euo pipefail -c '
         [[ -n "$LLAMA_CPP_REPO" ]] || unset LLAMA_CPP_REPO
         bash build.sh --backends "$1" --install "/out/$2" ${3:+-j "$3"}
-        # The CUDA libraries from the image (the driver library libcuda comes from the host).
+        # The CUDA libraries from the image (the driver library libcuda comes from the host): those under a
+        # cuda path, and NVIDIA libraries the image keeps elsewhere (NCCL in /usr/lib: newer ggml links it).
         for so in /out/"$2"/bin/*.so* /out/"$2"/bin/llama-server; do ldd "$so" 2>/dev/null || true; done \
-            | awk "\$3 ~ /cuda/ && \$3 !~ /stubs/ {print \$3}" | sort -u | while read -r lib; do
+            | awk "\$3 !~ /stubs/ && \$3 !~ /libcuda\\.so/ && (\$3 ~ /cuda/ || \$1 ~ /^lib(nccl|cublas|cublasLt|cudart|nvrtc|nvJitLink|cusparse|cufft|curand|cusolver)\\./) {print \$3}" \
+            | sort -u | while read -r lib; do
                 cp -L "$lib" "/out/$2/bin/"
             done
     ' _ "$BACKENDS" "$NAME" "$JOBS"
+# The GPU modules load at run time and fall back to the CPU without a word if a library is missing: check here.
+for mod in "$INSTALL_DIR"/bin/libggml-cuda.so "$INSTALL_DIR"/bin/libggml-hip.so; do
+    [[ -f "$mod" ]] || continue
+    missing="$(LD_LIBRARY_PATH="$INSTALL_DIR/bin" ldd "$mod" 2>/dev/null | awk '/not found/ && $1 !~ /^libcuda\.so/ {print $1}' | sort -u | paste -sd' ' -)"
+    if [[ -n "$missing" ]]; then
+        echo "ERROR: $(basename "$mod") needs $missing, which the build left out: the GPU would not be used." >&2
+        exit 1
+    fi
+done
 echo "==> Built in a container: $INSTALL_DIR"
