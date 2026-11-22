@@ -407,6 +407,13 @@ table.req td.why { max-width: 260px; white-space: normal; font-size: .85rem; col
 table.req tr.bg-task td { opacity: .72; }
   .switch-row { display: flex; align-items: center; gap: 8px; font-size: .92rem; }
   .switch-row input { width: auto; margin: 0; }
+  .pills { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+  .pill.net { font-size: 12px; padding: 3px 9px; }
+  .pill.net::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; background: var(--muted); }
+  .pill.net.on { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, var(--line)); }
+  .pill.net.on::before { background: var(--good); box-shadow: 0 0 6px var(--good); }
+  .pill.net.slow { color: var(--warn); } .pill.net.slow::before { background: var(--warn); }
+  .pill.net.off { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -1512,7 +1519,7 @@ function renderRouter(s) {
   }).join("");
 }
 
-const HOST_STATE = { idle: ["", "frei"], preparing: ["warn", "bereitet vor"], downloading: ["warn", "lädt herunter"],
+const HOST_STATE = { idle: ["", "kein Modell geladen"], preparing: ["warn", "bereitet vor"], downloading: ["warn", "lädt herunter"],
   loading: ["warn", "lädt das Modell"], ready: ["ok", "bereit"], error: ["bad", "Fehler"], unreachable: ["bad", "nicht erreichbar"],
   asleep: ["", "schläft oder aus"], tuning: ["warn", "Autotune läuft"] };
 
@@ -1655,7 +1662,7 @@ function renderHosts(s) {
          ${x.sleep_min && !x.wakeable ? `<div class="note">Keine MAC-Adresse bekannt (WLAN?): Aufwecken per Wake-on-LAN geht nur über Kabel.</div>` : ""}`;
     return `<article class="host" data-id="${esc(x.id)}">
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${x.gpu ? " · " + esc(x.gpu) : gpus ? " · " + gpus : ""}</div></div>
-        <div class="pill"><span class="dot ${cls}"></span><span>${txt}</span></div></div>
+        <div class="pills">${x.online === undefined ? "" : `<div class="pill net ${x.online ? "on" : x.slow ? "slow" : "off"}" title="${x.online ? "Antwortet dem Master" : x.slow ? "Hat zuletzt nicht geantwortet (lädt oder ist ausgelastet?)" : x.asleep ? "Schläft oder ist aus: wird bei Bedarf per Wake-on-LAN geweckt" : "Antwortet nicht"}${x.seen_ago != null ? ` · zuletzt gesehen vor ${x.seen_ago < 120 ? x.seen_ago + " s" : Math.round(x.seen_ago / 60) + " min"}` : ""}">${x.online ? "online" : x.slow ? "antwortet langsam" : "offline"}</div>`}<div class="pill" title="Was das Modell gerade tut"><span class="dot ${cls}"></span><span>${txt}</span></div></div></div>
       ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${x.note ? `<div class="note">${esc(x.note)}</div>` : ""}${hostStats(x)}${layoutRow}${sleepRow}${maintRow}${roleRow}
       ${strataRow}
       ${x.engine !== "strata" && (x.state === "ready" || x.state === "tuning" || x.tuned || x.tune_job) ? `<div class="kv"><span class="note">${esc(tuneText(x.tune_job, x.tuned) || "Autotune: misst die schnellsten Einstellungen für dieses Modell auf diesem PC.")}</span>${

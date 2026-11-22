@@ -8822,6 +8822,11 @@ class HostManager:
                               "can_sleep": bool((h.get("status") or {}).get("can_sleep")),
                               "switchable": bool((h.get("status") or {}).get("switchable")),
                               "pc": h.get("pc"), "path": h.get("path") or "",
+                              # reachable now (answered the last poll), apart from what its model does
+                              "online": not h.get("asleep") and not h.get("error") and not h.get("fails")
+                              and time.time() - (h.get("seen") or 0) < 60,
+                              "slow": bool(h.get("fails")) and not h.get("asleep"),
+                              "seen_ago": int(time.time() - h["seen"]) if h.get("seen") else None,
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
                                                        "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned", "groups", "group", "nv_index",
