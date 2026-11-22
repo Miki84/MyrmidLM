@@ -7263,6 +7263,22 @@ ROLE_WORDS = {"fast": ("fast", "schnell", "small"), "big": ("big", "large", "gro
 # its client name, e.g. a coder model for code). Edited in the dashboard.
 ROUTER_EXAMPLES = CONFIG_DIR / "router-examples.json"
 ROUTER_EXTERNAL = CONFIG_DIR / "external.json"  # other OpenAI servers in the router (Strata, vLLM, ...)
+ROUTER_SUBJECTS = CONFIG_DIR / "router-subjects.json"  # subjects (programming, reports ...) -> a model by name
+# Subjects: a request whose text has the subject's words goes to its model (by name). Off until switched on, and a
+# subject without a target does nothing.
+DEFAULT_SUBJECTS = {
+    "enabled": False, "ask_fast": False,
+    "subjects": [
+        {"name": "Programmieren", "target": "", "keywords": [
+            "code", "programm", "python", "javascript", "typescript", "java", "rust", "golang", "c++", "c#", "php",
+            "bash", "shell", "skript", "script", "funktion", "function", "klasse", "class", "methode", "bug",
+            "stacktrace", "traceback", "exception", "compiler", "kompilier", "sql", "regex", "api", "json", "yaml",
+            "docker", "kubernetes", "git", "refactor", "refaktor", "unit test", "debug", "html", "css", "react"]},
+        {"name": "Berichte", "target": "", "keywords": [
+            "bericht", "report", "zusammenfassung", "zusammenfassen", "protokoll", "dokumentation", "analyse",
+            "auswertung", "präsentation", "management summary", "stellungnahme", "konzept", "angebot"]},
+    ],
+}
 EMBED_MODEL = "ggml-org/embeddinggemma-300M-GGUF:Q8_0"  # 300 MB, many languages, runs on the CPU
 DEFAULT_EXAMPLES = {
     "threshold": 0.05,
@@ -7401,6 +7417,13 @@ class Router:
                 self.examples = saved
         except (OSError, ValueError):
             pass
+        self.subjects: dict = json.loads(json.dumps(DEFAULT_SUBJECTS))
+        try:
+            saved = json.loads(ROUTER_SUBJECTS.read_text())
+            if isinstance(saved, dict) and isinstance(saved.get("subjects"), list):
+                self.subjects = {**self.subjects, **saved}
+        except (OSError, ValueError):
+            pass
         self.embedder: Optional[Embedder] = None  # set by serve; started when mode is "examples"
         self.external: list[dict] = []  # other OpenAI servers (external.json)
         self.local_big: Optional[Backend] = backends[0] if backends else None
@@ -7523,6 +7546,15 @@ class Router:
             err = self._set_examples(body["examples"])
             if err:
                 return {**self.info(), "error": err}
+        if isinstance(body.get("subjects"), dict):
+            err = self._set_subjects(body["subjects"])
+            if err:
+                return {**self.info(), "error": err}
+        if body.get("test_subject") is not None:
+            t = str(body["test_subject"])
+            hit = self.subject_of({"messages": [{"role": "user", "content": t}]}, ask=True)
+            return {**self.info(), "test_subject": {"subject": hit[0]["name"] if hit else "", "why": hit[1] if hit else
+                                                    "kein Fachgebiet erkannt: normale Verteilung"}}
         if isinstance(body.get("external"), list):
             err = self.set_external(body["external"])
             if err:
@@ -7559,6 +7591,83 @@ class Router:
         except OSError as e:
             return f"could not save: {e}"
         return ""
+
+    def _set_subjects(self, sub: dict) -> str:
+        out = []
+        for c in sub.get("subjects") or []:
+            name = str(c.get("name") or "").strip()[:40]
+            target = str(c.get("target") or "").strip()[:80]
+            kws = c.get("keywords") or []
+            if isinstance(kws, str):
+                kws = kws.split(",")
+            kws = list(dict.fromkeys(str(k).strip().lower()[:60] for k in kws if str(k).strip()))[:80]
+            if name:
+                out.append({"name": name, "target": target, "keywords": kws})
+        with self.lock:
+            self.subjects = {"enabled": bool(sub.get("enabled")), "ask_fast": bool(sub.get("ask_fast")),
+                             "subjects": out[:12]}
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            ROUTER_SUBJECTS.write_text(json.dumps(self.subjects, indent=1, ensure_ascii=False))
+        except OSError as e:
+            return f"could not save: {e}"
+        log(f"Router: subjects {'on' if self.subjects['enabled'] else 'off'}: "
+            + ", ".join(f"{c['name']} -> {c['target'] or '-'}" for c in out))
+        return ""
+
+    def subject_of(self, body: dict, ask: bool = False) -> Optional[tuple[dict, str]]:
+        """(subject, reason) for a request, by its words (the last user message counts double); with ask_fast and
+        no clear word, the fast model picks one. None: no subject (the usual routing)."""
+        subs = [c for c in (self.subjects.get("subjects") or []) if c.get("keywords") or c.get("target")]
+        if not subs:
+            return None
+        msgs = body.get("messages") or [{"role": "user", "content": body.get("prompt", "")}]
+        users = [_message_text(m.get("content"))[0] for m in msgs if isinstance(m, dict) and m.get("role", "user") == "user"]
+        if not users:
+            return None
+        last = users[-1].lower()[:6000]
+        before = " ".join(users[-4:-1]).lower()[:6000]
+        best, best_n, best_kw = None, 0, ""
+        for c in subs:
+            n, first = 0, ""
+            for kw in c.get("keywords") or []:
+                pat = r"(?<![\w])" + re.escape(kw) if kw[:1].isalnum() else re.escape(kw)
+                k = 2 * len(re.findall(pat, last)) + len(re.findall(pat, before))
+                if k and not first:
+                    first = kw
+                n += k
+            if n > best_n:
+                best, best_n, best_kw = c, n, first
+        if best:
+            return best, f"Fachgebiet {best['name']} (Stichwort „{best_kw}“)"
+        if self.subjects.get("ask_fast"):
+            return self.ask_subject(users[-1], subs)
+        return None
+
+    def ask_subject(self, text: str, subs: list[dict]) -> Optional[tuple[dict, str]]:
+        """The fast model picks the subject (one letter, a few ms), or none."""
+        import urllib.request
+
+        fast = self.choose(self.role("fast"))
+        if fast is None:
+            return None
+        letters = "ABCDEFGHIJKL"
+        lines = "\n".join(f"{letters[i]}: {c['name']}" for i, c in enumerate(subs)) + "\nX: nichts davon / allgemein"
+        prompt = ("Ordne die Anfrage genau einem Fachgebiet zu. Antworte nur mit dem Buchstaben.\n" + lines)
+        req = {"messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text[:1500]}],
+               "max_tokens": 1, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}
+        try:
+            r = urllib.request.Request(fast.base + "/v1/chat/completions", data=json.dumps(req).encode(),
+                                       headers={"Content-Type": "application/json",
+                                                **({"Authorization": f"Bearer {fast.key}"} if fast.key else {})})
+            with urllib.request.urlopen(r, timeout=3) as resp:
+                ans = json.loads(resp.read())["choices"][0]["message"].get("content", "").strip().upper()[:1]
+        except (OSError, ValueError, KeyError, IndexError):
+            return None
+        i = letters.find(ans) if ans else -1
+        if 0 <= i < len(subs):
+            return subs[i], f"Fachgebiet {subs[i]['name']} (schnelles Modell)"
+        return None
 
     def score_examples(self, text: str) -> Optional[list[dict]]:
         """Each category's best similarity to the text, best first (None: no embedding model)."""
@@ -7630,7 +7739,7 @@ class Router:
             fast = self.fast or next((b for b in self.backends if b.name == "fast"), None)
             emb = self.embedder
             return {"available": True, "enabled": self.enabled, "mode": self.mode, "prefer_fast": self.prefer_fast,
-                    "examples": self.examples,
+                    "examples": self.examples, "subjects": self.subjects,
                     "vision": [b.group or b.label for b in self.backends if b.vision],
                     "external": [{k: v for k, v in e.items() if k != "key"} | {"has_key": bool(e.get("key"))}
                                  for e in getattr(self, "external", [])],
@@ -7825,8 +7934,25 @@ class Router:
                 return self._pick_group(vis, "Bild: Modell mit Bildverständnis", need, loose)
             if self.backends and all(b.vision is False for b in self.backends if b.healthy):
                 raise NoVision("Kein Modell im Cluster kann Bilder lesen")
+        if self.subjects.get("enabled") and not task:
+            hit = self.subject_of(body)
+            if hit and hit[0].get("target"):
+                target = hit[0]["target"]
+                if target in ("big", "fast"):
+                    if self.choose(self.fits(self.role(target), need)) or self.sleeper(self.role(target)):
+                        return self._pick_role(target, hit[1], need, loose)
+                else:
+                    group = self.group(target)
+                    if group and (self.choose(self.fits(group, need)) or self.sleeper(group)):
+                        return self._pick_group(group, hit[1], need, loose)
+                # its model isn't there: the usual routing, and the monitor says why
+                subject_miss = f"{hit[1]}, „{target}“ nicht bereit"
+            else:
+                subject_miss = ""
+        else:
+            subject_miss = ""
         if not self.enabled:
-            return self._pick_role("big", "Router aus", need, loose)
+            return self._pick_role("big", subject_miss or "Router aus", need, loose)
         by_example = None
         if self.mode == "examples":
             msgs = body.get("messages") or [{"role": "user", "content": body.get("prompt", "")}]

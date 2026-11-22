@@ -5,19 +5,23 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MyrmidLM-Cluster</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"%3E%3Crect width="1024" height="1024" rx="224" fill="#0f1e28"/%3E%3Cdefs%3E%3Cpolygon id="h" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/%3E%3C/defs%3E%3Cg stroke="#0f1e28" stroke-width="22"%3E%3Cuse href="#h" x="512" y="512" fill="#f0b54a"/%3E%3Cuse href="#h" x="512" y="282" fill="#4fc3b4"/%3E%3Cuse href="#h" x="512" y="742" fill="#4fc3b4" opacity=".75"/%3E%3Cuse href="#h" x="313" y="397" fill="#4fc3b4" opacity=".9"/%3E%3Cuse href="#h" x="711" y="397" fill="#4fc3b4" opacity=".6"/%3E%3Cuse href="#h" x="313" y="627" fill="#4fc3b4" opacity=".6"/%3E%3Cuse href="#h" x="711" y="627" fill="#4fc3b4" opacity=".9"/%3E%3C/g%3E%3Cg stroke="#0f1e28" stroke-width="18" stroke-linecap="round"%3E%3Cpath d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/%3E%3C/g%3E%3Cg fill="#0f1e28"%3E%3Ccircle cx="512" cy="512" r="40"/%3E%3C/g%3E%3Cg fill="#0f1e28"%3E%3Ccircle cx="512" cy="282" r="26"/%3E%3Ccircle cx="512" cy="742" r="26"/%3E%3Ccircle cx="313" cy="397" r="26"/%3E%3Ccircle cx="711" cy="397" r="26"/%3E%3Ccircle cx="313" cy="627" r="26"/%3E%3Ccircle cx="711" cy="627" r="26"/%3E%3C/g%3E%3C/svg%3E">
+<script>try { const t = localStorage.getItem("myrmid-theme"); if (t === "dark" || t === "light") document.documentElement.dataset.theme = t; } catch (e) { /* no storage: follow the system */ }</script>
 <style>
   :root {
-    --bg: #0f1e28;
-    --surface: #152936;
-    --surface-2: #1b3242;
-    --line: #25404f;
-    --text: #e4edf2;
-    --muted: #8ca3b2;
-    --good: #5fd39a;
-    --warn: #f0b54a;
-    --bad: #ef6f6f;
-    --focus: #8fd3ff;
-    --c0: #4fc3b4; --c1: #f0b54a; --c2: #a091f2; --c3: #ef7f98; --c4: #6cb4f0; --c5: #b5c95c;
+    /* dark: deep navy, quiet cards, green for good, amber for warm, violet as the accent */
+    --bg: #0a0f1a;
+    --surface: #111827;
+    --surface-2: #172033;
+    --line: #1f2a3d;
+    --text: #e8edf5;
+    --muted: #8b96aa;
+    --good: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --focus: #a78bfa;
+    --accent: #a78bfa;
+    --mem: #3b82f6;
+    --c0: #34d399; --c1: #fbbf24; --c2: #a78bfa; --c3: #f472b6; --c4: #60a5fa; --c5: #a3e635;
     --radius-l: 14px;
     --radius-s: 6px;
     font-family: system-ui, "Segoe UI", Ubuntu, Cantarell, "Noto Sans", sans-serif;
@@ -26,13 +30,20 @@
     color-scheme: dark;
   }
   @media (prefers-color-scheme: light) {
-    :root {
+    :root:not([data-theme="dark"]) {
       --bg: #eef3f6; --surface: #ffffff; --surface-2: #f4f8fa; --line: #d3dee5;
       --text: #12242f; --muted: #587080; --good: #1f9d63; --warn: #b9780d; --bad: #c73e3e;
-      --focus: #1d6fb8;
+      --focus: #1d6fb8; --accent: #6c58d6; --mem: #2f6fd0;
       --c0: #1d9c8e; --c1: #c98a12; --c2: #6c58d6; --c3: #cf4a6c; --c4: #2f86cc; --c5: #7a8f24;
       color-scheme: light;
     }
+  }
+  :root[data-theme="light"] {
+    --bg: #eef3f6; --surface: #ffffff; --surface-2: #f4f8fa; --line: #d3dee5;
+    --text: #12242f; --muted: #587080; --good: #1f9d63; --warn: #b9780d; --bad: #c73e3e;
+    --focus: #1d6fb8; --accent: #6c58d6; --mem: #2f6fd0;
+    --c0: #1d9c8e; --c1: #c98a12; --c2: #6c58d6; --c3: #cf4a6c; --c4: #2f86cc; --c5: #7a8f24;
+    color-scheme: light;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text); }
@@ -159,6 +170,44 @@
   .tabs button[aria-selected="true"] { background: var(--surface-2); color: var(--text); }
   #app.mon > :not(header):not(#monitor):not(#offline) { display: none !important; }
   #app:not(.mon) > #monitor { display: none; }
+  #app.rig > :not(header):not(#rig):not(#offline) { display: none !important; }
+  #app:not(.rig) > #rig { display: none; }
+  .theme-btn { border: 1px solid var(--line); background: var(--surface); color: var(--muted); border-radius: 999px; width: 30px; height: 30px; cursor: pointer; margin-left: 6px; display: inline-grid; place-items: center; padding: 0; }
+  .theme-btn:hover { color: var(--text); }
+  /* Rig live */
+  .rig-top { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin: 6px 0 16px; }
+  .rig-title { font-size: 1.15rem; font-weight: 750; letter-spacing: .06em; text-transform: uppercase; }
+  .rig-title em { font-style: normal; color: var(--accent); }
+  .rig-kpis { display: flex; gap: 10px; flex-wrap: wrap; }
+  .kpi { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 9px 14px; min-width: 120px; }
+  .kpi span { display: block; font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+  .kpi b { display: block; font-size: 1.45rem; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .kpi small { display: block; font-size: 11px; color: var(--muted); }
+  .rig-pcs { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 560px), 1fr)); gap: 16px; }
+  .rig-pc { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px 14px; }
+  .rig-pc-head { display: flex; justify-content: space-between; gap: 12px; font-size: 11.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; }
+  .rig-pc-head b { color: var(--text); font-weight: 700; }
+  .rig-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+  .rcard { background: var(--surface-2); border: 1px solid var(--line); border-left: 3px solid var(--good); border-radius: 9px; padding: 10px 12px; min-width: 0; transition: box-shadow .3s, border-color .3s; }
+  .rcard.off { border-left-color: var(--line); opacity: .6; }
+  .rcard.load { border-left-color: var(--warn); }
+  .rcard.busy { border-color: var(--warn); box-shadow: 0 0 0 1px var(--warn), 0 0 18px -6px var(--warn); }
+  .rcard.err { border-left-color: var(--bad); }
+  .rc-head { display: flex; align-items: center; gap: 8px; }
+  .rc-head b { font-size: .98rem; }
+  .rc-head .tag { font-size: 10.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rc-head .tag.acc { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .rc-head .dot { margin-left: auto; }
+  .rc-model { font-weight: 650; margin: 6px 0 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rc-sub { font-size: 12px; color: var(--muted); min-height: 1.3em; }
+  .rc-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px; }
+  .rc-stats span { display: block; font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+  .rc-stats b { display: block; font-size: .95rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .rc-stats b small { font-weight: 400; color: var(--muted); font-size: 10.5px; }
+  .rc-stats i { display: block; height: 3px; border-radius: 2px; background: var(--line); margin-top: 4px; overflow: hidden; }
+  .rc-stats i > u { display: block; height: 100%; background: var(--good); }
+  .t-ok { color: var(--good); } .t-warm { color: var(--warn); } .t-hot { color: var(--bad); }
+  .rig-note { font-size: 12px; color: var(--muted); margin-top: 14px; }
   .mon-pick { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 14px; }
   .mon-pick button { border: 1px solid var(--line); background: var(--surface); color: var(--muted); border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; font-size: 13px; }
   .mon-pick button[aria-pressed="true"] { color: var(--text); border-color: var(--c0); }
@@ -341,6 +390,8 @@
 .strata-set .kv { align-items: flex-end; gap: 10px; flex-wrap: wrap; }
 table.req td.why { max-width: 260px; white-space: normal; font-size: .85rem; color: var(--muted, #6b7280); }
 table.req tr.bg-task td { opacity: .72; }
+  .switch-row { display: flex; align-items: center; gap: 8px; font-size: .92rem; }
+  .switch-row input { width: auto; margin: 0; }
 </style>
 </head>
 <body>
@@ -388,7 +439,7 @@ table.req tr.bg-task td { opacity: .72; }
 <div class="wrap" id="app">
   <header class="top">
     <div>
-      <div class="title-row"><svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="34" height="34" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0f1e28"/><defs><polygon id="hlogo" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/></defs><g stroke="#0f1e28" stroke-width="22"><use href="#hlogo" x="512" y="512" fill="#f0b54a"/><use href="#hlogo" x="512" y="282" fill="#4fc3b4"/><use href="#hlogo" x="512" y="742" fill="#4fc3b4" opacity=".75"/><use href="#hlogo" x="313" y="397" fill="#4fc3b4" opacity=".9"/><use href="#hlogo" x="711" y="397" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="313" y="627" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="711" y="627" fill="#4fc3b4" opacity=".9"/></g><g stroke="#0f1e28" stroke-width="18" stroke-linecap="round"><path d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/></g><g fill="#0f1e28"><circle cx="512" cy="512" r="40"/></g><g fill="#0f1e28"><circle cx="512" cy="282" r="26"/><circle cx="512" cy="742" r="26"/><circle cx="313" cy="397" r="26"/><circle cx="711" cy="397" r="26"/><circle cx="313" cy="627" r="26"/><circle cx="711" cy="627" r="26"/></g></svg><h1>MyrmidLM-Cluster</h1><span class="tabs" role="tablist"><button type="button" role="tab" id="tab-main" aria-selected="true">Übersicht</button><button type="button" role="tab" id="tab-mon" aria-selected="false">Monitor</button></span><a class="ver-badge" id="ver-badge" href="#update-panel" hidden></a><button class="btn quiet small chat-btn" id="chat-open" type="button">Chat testen</button></div>
+      <div class="title-row"><svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="34" height="34" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0f1e28"/><defs><polygon id="hlogo" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/></defs><g stroke="#0f1e28" stroke-width="22"><use href="#hlogo" x="512" y="512" fill="#f0b54a"/><use href="#hlogo" x="512" y="282" fill="#4fc3b4"/><use href="#hlogo" x="512" y="742" fill="#4fc3b4" opacity=".75"/><use href="#hlogo" x="313" y="397" fill="#4fc3b4" opacity=".9"/><use href="#hlogo" x="711" y="397" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="313" y="627" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="711" y="627" fill="#4fc3b4" opacity=".9"/></g><g stroke="#0f1e28" stroke-width="18" stroke-linecap="round"><path d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/></g><g fill="#0f1e28"><circle cx="512" cy="512" r="40"/></g><g fill="#0f1e28"><circle cx="512" cy="282" r="26"/><circle cx="512" cy="742" r="26"/><circle cx="313" cy="397" r="26"/><circle cx="711" cy="397" r="26"/><circle cx="313" cy="627" r="26"/><circle cx="711" cy="627" r="26"/></g></svg><h1>MyrmidLM-Cluster</h1><span class="tabs" role="tablist"><button type="button" role="tab" id="tab-main" aria-selected="true">Übersicht</button><button type="button" role="tab" id="tab-mon" aria-selected="false">Monitor</button><button type="button" role="tab" id="tab-rig" aria-selected="false">Rig live</button></span><button class="theme-btn" id="theme-btn" type="button" title="Design: automatisch (wie das System)">◐</button><a class="ver-badge" id="ver-badge" href="#update-panel" hidden></a><button class="btn quiet small chat-btn" id="chat-open" type="button">Chat testen</button></div>
       <div class="model" id="model">Verbinde mit dem Master …</div>
       <details class="model-switch" id="model-switch">
         <summary>Modell und Kontext</summary>
@@ -486,6 +537,23 @@ table.req tr.bg-task td { opacity: .72; }
       </form>
       <ul class="ex-scores" id="ex-scores" aria-live="polite"></ul>
     </div>
+    <details class="examples" id="subjects">
+      <summary><b>Fachgebiete</b> <span class="muted" id="sub-state"></span></summary>
+      <p class="muted" style="margin:0">Anfragen eines Fachgebiets gehen an ein bestimmtes Modell, z. B. Programmieren an ein Coder-Modell, Berichte an ein Modell, das gut schreibt. Erkannt an Stichwörtern in der Anfrage (die letzte Nachricht zählt doppelt). Ein Fachgebiet ohne Ziel tut nichts; ist sein Modell nicht bereit, verteilt der Router wie sonst. Funktioniert auch ohne schnelles Modell. Bilder, Hintergrundaufträge und Anfragen mit festem Modellnamen gehen vor.</p>
+      <label class="switch-row"><input type="checkbox" id="sub-on"> Nach Fachgebiet verteilen</label>
+      <label class="switch-row"><input type="checkbox" id="sub-ask"> Passt kein Stichwort: das schnelle Modell ordnet ein (kostet je Anfrage ein paar Millisekunden)</label>
+      <div class="ex-cats" id="sub-list"></div>
+      <div class="row">
+        <button class="btn quiet" type="button" id="sub-add">Fachgebiet hinzufügen</button>
+        <button class="btn" type="button" id="sub-save">Speichern</button>
+        <span class="muted" id="sub-msg" role="status"></span>
+      </div>
+      <form class="row" id="sub-test">
+        <input id="sub-test-text" placeholder="Testsatz, z. B. „Warum wirft mein Python-Skript einen KeyError?“" style="flex:1">
+        <button class="btn quiet" type="submit">Testen</button>
+      </form>
+      <div class="muted" id="sub-test-res" aria-live="polite"></div>
+    </details>
     <details class="examples" id="external">
       <summary><b>Externe Server</b> <span class="muted" id="ext-count"></span></summary>
       <p class="muted" style="margin:0">Andere OpenAI-kompatible Server im Router, z. B. Strata oder vLLM auf einem PC im Netz. Clients erreichen sie über den Namen; mit Rolle „schnell“ oder „groß“ entscheidet auch der Router über sie.</p>
@@ -576,6 +644,12 @@ table.req tr.bg-task td { opacity: .72; }
     </div>
   </section>
 
+  <section id="rig" aria-label="Rig live: alle GPUs">
+    <div class="rig-top"><div><div class="rig-title">Cluster <em>live</em></div><div class="muted" style="font-size:12px" id="rig-stand">–</div></div>
+      <div class="rig-kpis" id="rig-kpis"></div></div>
+    <div class="rig-pcs" id="rig-pcs"></div>
+    <p class="rig-note">Jede GPU des Clusters mit dem Modell, das auf ihr läuft. Gelb umrandet: rechnet gerade (laufende Anfrage oder Auslastung ab 30 %). Werte von den Hosts, alle paar Sekunden.</p>
+  </section>
   <section id="monitor" aria-label="Leistungsmonitor">
     <div class="mon-pick" id="mon-pick"></div>
     <div class="tiles">
@@ -1319,6 +1393,7 @@ function renderRouter(s) {
     <td class="num" title="${b.measured ? "gemessen" : "geschätzt"}">${b.tps ? (b.measured ? "" : "≈ ") + nf(b.tps, 1) : "–"}</td>
     <td class="num">${b.inflight}</td><td class="num">${nf(b.served, 0)}</td></tr>`).join("");
   renderExamples(r);
+  renderSubjects(r);
   renderExternal(r);
   const ff = $("fastfirst-switch");
   if (!ff.dataset.busy) ff.setAttribute("aria-checked", String(!!r.prefer_fast));
@@ -1654,6 +1729,41 @@ function renderExamples(r) {
   }).join("");
 }
 
+let subDraft = null;
+function renderSubjects(r) {
+  const box = $("subjects");
+  box.hidden = !r.available;
+  if (box.hidden) return;
+  const sub = r.subjects || { enabled: false, subjects: [] };
+  const active = (sub.subjects || []).filter((c) => c.target);
+  $("sub-state").textContent = sub.enabled ? `(an: ${active.map((c) => `${c.name} → ${c.target}`).join(", ") || "kein Fachgebiet mit Ziel"})` : "(aus)";
+  if (box.contains(document.activeElement)) return;
+  if (!subDraft) subDraft = JSON.parse(JSON.stringify(sub));
+  $("sub-on").checked = !!subDraft.enabled;
+  $("sub-ask").checked = !!subDraft.ask_fast;
+  $("sub-ask").disabled = !r.has_fast;
+  const targets = [["", "– kein Ziel –"], ...exTargets(r)];
+  $("sub-list").innerHTML = (subDraft.subjects || []).map((c, i) => {
+    const opts = targets.some(([v]) => v === c.target) ? targets : [...targets, [c.target, c.target + " (nicht da)"]];
+    return `<div class="ex-cat" data-i="${i}">
+      <div class="row"><input data-k="name" value="${esc(c.name)}" aria-label="Name des Fachgebiets">
+        <select data-k="target" aria-label="Ziel">${opts.map(([v, t]) => `<option value="${esc(v)}"${v === (c.target || "") ? " selected" : ""}>→ ${esc(t)}</option>`).join("")}</select>
+        <button class="btn quiet small" type="button" data-sdel="${i}" aria-label="Fachgebiet entfernen">✕</button></div>
+      <textarea data-k="keywords" aria-label="Stichwörter für ${esc(c.name)}" placeholder="Stichwörter, mit Komma getrennt (Wortanfänge genügen: „programm“ trifft auch „Programmierung“)">${esc((c.keywords || []).join(", "))}</textarea></div>`;
+  }).join("");
+}
+function subRead() {
+  if (!subDraft) return;
+  subDraft.enabled = $("sub-on").checked;
+  subDraft.ask_fast = $("sub-ask").checked;
+  document.querySelectorAll("#sub-list .ex-cat").forEach((el) => {
+    const c = subDraft.subjects[+el.dataset.i]; if (!c) return;
+    c.name = el.querySelector('[data-k="name"]').value.trim();
+    c.target = el.querySelector('[data-k="target"]').value;
+    c.keywords = el.querySelector('[data-k="keywords"]').value.split(",").map((x) => x.trim()).filter(Boolean);
+  });
+}
+
 let extDraft = null;
 function renderExternal(r) {
   const box = $("external");
@@ -1828,20 +1938,109 @@ function render(s) {
   if (!$("chat").hidden) chatModels();
   else if (location.hash === "#chat" && !render.chatOpened) { render.chatOpened = true; chatOpen(true); }
   if (location.hash === "#monitor" && !render.monOpened) { render.monOpened = true; monShow(true); }
+  if (location.hash === "#rig" && !render.rigOpened) { render.rigOpened = true; showTab("rig"); }
+  renderRig(s);
 }
 
 /* ── Monitor ────────────────────────────────────────────────────────── */
 
 const mon = { pick: "all", hist: {}, all: false, data: null, busy: false };
-function monShow(on) {
-  $("app").classList.toggle("mon", on);
-  $("tab-main").setAttribute("aria-selected", String(!on));
-  $("tab-mon").setAttribute("aria-selected", String(on));
-  if (on) { if (location.hash !== "#monitor") history.replaceState(null, "", "#monitor"); monFetch(); }
-  else if (location.hash === "#monitor") history.replaceState(null, "", location.pathname);
+function showTab(tab) {
+  // "main", "mon" (monitor) or "rig" (all GPUs live)
+  $("app").classList.toggle("mon", tab === "mon");
+  $("app").classList.toggle("rig", tab === "rig");
+  $("tab-main").setAttribute("aria-selected", String(tab === "main"));
+  $("tab-mon").setAttribute("aria-selected", String(tab === "mon"));
+  $("tab-rig").setAttribute("aria-selected", String(tab === "rig"));
+  const hash = { mon: "#monitor", rig: "#rig" }[tab] || "";
+  if (location.hash !== hash) history.replaceState(null, "", hash || location.pathname);
+  if (tab === "mon") monFetch();
+  if (tab === "rig" && last) renderRig(last);
 }
-$("tab-main").addEventListener("click", () => monShow(false));
-$("tab-mon").addEventListener("click", () => monShow(true));
+function monShow(on) { showTab(on ? "mon" : "main"); }
+$("tab-main").addEventListener("click", () => showTab("main"));
+$("tab-mon").addEventListener("click", () => showTab("mon"));
+$("tab-rig").addEventListener("click", () => showTab("rig"));
+
+const ICON = (d) => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const THEMES = [
+  ["", ICON('<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>'), "automatisch (wie das System)"],
+  ["dark", ICON('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'), "dunkel"],
+  ["light", ICON('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'), "hell"]];
+function themeSet(t) {
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  try { if (t) localStorage.setItem("myrmid-theme", t); else localStorage.removeItem("myrmid-theme"); } catch (e) { /* not kept */ }
+  const th = THEMES.find((x) => x[0] === t) || THEMES[0];
+  $("theme-btn").innerHTML = th[1]; $("theme-btn").title = "Design: " + th[2] + " (klicken zum Wechseln)";
+}
+$("theme-btn").addEventListener("click", () => {
+  const cur = document.documentElement.dataset.theme || "";
+  const i = THEMES.findIndex((x) => x[0] === cur);
+  themeSet(THEMES[(i + 1) % THEMES.length][0]);
+});
+themeSet(document.documentElement.dataset.theme || "");
+
+function renderRig(s) {
+  if (!$("app").classList.contains("rig")) return;
+  const hosts = ((s.hosts || {}).hosts || []);
+  const bks = ((s.router || {}).backends || []);
+  const pcs = {}, order = [];
+  for (const h of hosts) {
+    const key = h.pc || h.id;
+    if (!pcs[key]) { pcs[key] = { name: (h.stats || {}).host || String(h.name || key).split(" · ")[0], entries: [], stats: null, asleep: false }; order.push(key); }
+    const p = pcs[key];
+    p.entries.push(h);
+    if ((h.stats || {}).host) p.stats = h.stats;
+    if (h.asleep) p.asleep = true;
+  }
+  let online = 0, total = 0, busyN = 0, power = 0, hot = null;
+  const loaded = hosts.filter((h) => h.state === "ready").length;
+  const tclass = (t) => t == null ? "" : t >= 78 ? "t-hot" : t >= 65 ? "t-warm" : "t-ok";
+  const bar = (pct, color) => `<i><u style="width:${Math.max(0, Math.min(100, pct || 0)).toFixed(0)}%;background:${color}"></u></i>`;
+  const html = order.map((key) => {
+    const p = pcs[key];
+    const gpus = ((p.stats || {}).gpus || []);
+    if (!gpus.length) {
+      const n = Math.max(1, ...p.entries.map((e) => (e.gpus || []).length));
+      total += n;
+      return `<div class="rig-pc"><div class="rig-pc-head"><b>${esc(p.name)}</b><span>${p.asleep ? "schläft" : "keine Werte"}</span></div>
+        <div class="rig-cards">${Array.from({ length: n }, (_, i) => `<div class="rcard off"><div class="rc-head"><b>GPU ${i}</b><span class="dot"></span></div><div class="rc-model">${p.asleep ? "schläft" : "–"}</div><div class="rc-sub">${p.asleep ? "wird bei Bedarf geweckt" : ""}</div></div>`).join("")}</div></div>`;
+    }
+    const models = [...new Set(p.entries.filter((e) => e.state === "ready" && e.model).map((e) => shortModel(e.model)))];
+    const cards = gpus.map((g, i) => {
+      const idx = g.index != null ? g.index : i;
+      const e = p.entries.find((x) => (x.nv_index || []).includes(idx)) || p.entries.find((x) => x.slot == null) || p.entries[0] || {};
+      const a = e.assignment || {};
+      const inflight = bks.filter((b) => b.source === e.id).reduce((n, b) => n + (b.inflight || 0), 0);
+      const busy = inflight > 0 || (g.util_pct || 0) >= 30;
+      const st = e.state || "idle";
+      total += 1; online += 1; if (busy) busyN += 1; power += g.power_w || 0;
+      if (g.temp_c != null && (!hot || g.temp_c > hot.t)) hot = { t: g.temp_c, where: `GPU ${idx} · ${p.name}` };
+      const cls = busy ? "busy" : st === "ready" ? "" : st === "error" ? "err" : ["loading", "preparing", "downloading", "tuning"].includes(st) ? "load" : "off";
+      const model = st === "ready" ? shortModel(e.model) : ((HOST_STATE[st] || [])[1] || st);
+      const engine = a.engine === "strata" ? "Strata" : "";
+      const tags = [engine && `<span class="tag acc">${engine}</span>`, a.role && `<span class="tag">${esc(ROLE_TEXT[a.role] || a.role)}</span>`, e.slot != null && `<span class="tag">${esc(String(e.name || "").split(" · ")[1] || "")}</span>`].filter(Boolean).join("");
+      const memPct = g.mem_total_mb ? 100 * g.mem_used_mb / g.mem_total_mb : 0;
+      const sub = st === "ready" ? (inflight ? (inflight > 1 ? `${inflight} Anfragen laufen` : "1 Anfrage läuft") : (a.name ? `Name: ${esc(a.name)}` : "bereit")) : esc(e.error || "");
+      return `<div class="rcard ${cls}" title="${esc(g.name)}${pcieText(g).replace(/<[^>]+>/g, "")}"><div class="rc-head"><b>GPU ${idx}</b>${tags}<span class="dot ${st === "ready" ? (busy ? "busy" : "ok") : st === "error" ? "bad" : "warn"}"></span></div>
+        <div class="rc-model">${esc(model)}</div><div class="rc-sub">${sub}</div>
+        <div class="rc-stats">
+          <div><span>Last</span><b>${g.util_pct == null ? "–" : nf(g.util_pct, 0) + " %"}</b>${bar(g.util_pct, "var(--warn)")}</div>
+          <div><span>Leistung</span><b>${g.power_w == null ? "–" : nf(g.power_w, 0) + " W"}</b>${bar((g.power_w || 0) / 3, "var(--c4)")}</div>
+          <div><span>Temp.</span><b class="${tclass(g.temp_c)}">${g.temp_c == null ? "–" : nf(g.temp_c, 0) + " °C"}</b>${bar(((g.temp_c || 0) - 20) * 100 / 70, g.temp_c >= 78 ? "var(--bad)" : g.temp_c >= 65 ? "var(--warn)" : "var(--good)")}</div>
+          <div><span>Speicher</span><b>${g.mem_total_mb ? nf(g.mem_used_mb / 1024, 1) : "–"}<small> / ${g.mem_total_mb ? nf(g.mem_total_mb / 1024, 0) : "?"} GB</small></b>${bar(memPct, "var(--mem)")}</div>
+        </div></div>`;
+    }).join("");
+    return `<div class="rig-pc"><div class="rig-pc-head"><b>${esc(p.name)}</b><span>${esc(models.join(" · ") || "kein Modell geladen")}</span></div><div class="rig-cards">${cards}</div></div>`;
+  }).join("");
+  $("rig-pcs").innerHTML = html || `<p class="muted">Noch keine Hosts im Netz.</p>`;
+  const kpi = (label, value, small, cls) => `<div class="kpi"><span>${label}</span><b class="${cls || ""}">${value}</b>${small ? `<small>${small}</small>` : ""}</div>`;
+  $("rig-kpis").innerHTML = kpi("GPUs online", `${online} / ${total}`) + kpi("Rechnen gerade", busyN, "", busyN ? "t-warm" : "")
+    + kpi("Modelle geladen", loaded) + kpi("Leistung gesamt", `${nf(power, 0)} W`)
+    + kpi("Wärmste Karte", hot ? `${nf(hot.t, 0)} °C` : "–", hot ? esc(hot.where) : "", hot ? tclass(hot.t) : "");
+  $("rig-stand").textContent = "Stand " + new Date().toLocaleTimeString("de-DE");
+}
+function shortModel(m) { return String(m || "").replace(/-\d{5}-of-\d{5}$/, "").replace(/\.gguf$/, ""); }
 $("m-all").addEventListener("click", () => { mon.all = !mon.all; $("m-all").textContent = mon.all ? "Weniger" : "Alle anzeigen"; monRender(last); });
 $("mon-pick").addEventListener("click", (ev) => { const id = ev.target.dataset && ev.target.dataset.pick; if (id) { mon.pick = id; monRender(last); } });
 async function monFetch() {
@@ -1969,6 +2168,33 @@ $("ex-cats").addEventListener("click", (ev) => {
 });
 $("ex-add").addEventListener("click", () => {
   exRead(); exDraft.categories.push({ name: "code", target: "big", examples: [] }); $("ex-add").blur(); renderExamples(last.router);
+});
+$("sub-list").addEventListener("click", (ev) => {
+  const i = ev.target.dataset && ev.target.dataset.sdel; if (i == null) return;
+  subRead(); subDraft.subjects.splice(+i, 1); ev.target.blur(); renderSubjects(last.router);
+});
+$("sub-add").addEventListener("click", () => {
+  subRead(); subDraft.subjects.push({ name: "Neues Fachgebiet", target: "", keywords: [] }); $("sub-add").blur(); renderSubjects(last.router);
+});
+$("sub-save").addEventListener("click", async () => {
+  subRead();
+  $("sub-msg").textContent = "Speichert …";
+  try {
+    const r = await api("/api/router", { method: "POST", body: JSON.stringify({ subjects: subDraft }) });
+    if (r.error) { $("sub-msg").textContent = r.error; return; }
+    subDraft = null; $("sub-msg").textContent = "Gespeichert.";
+    $("sub-save").blur(); last.router = { ...last.router, ...r }; renderRouter(last);
+  } catch (e) { $("sub-msg").textContent = "Speichern fehlgeschlagen."; }
+});
+$("sub-test").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const text = $("sub-test-text").value.trim(); if (!text) return;
+  $("sub-test-res").textContent = "Prüft …";
+  try {
+    const r = await api("/api/router", { method: "POST", body: JSON.stringify({ test_subject: text }) });
+    const t = r.test_subject || {};
+    $("sub-test-res").textContent = t.subject ? `→ ${t.why} (gespeicherte Stichwörter)` : t.why || "–";
+  } catch (e) { $("sub-test-res").textContent = "Test fehlgeschlagen."; }
 });
 $("ex-save").addEventListener("click", async () => {
   exRead();
