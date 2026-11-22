@@ -7186,6 +7186,48 @@ def _message_text(content) -> tuple[str, bool]:
     return "\n".join(text), image
 
 
+OPENWEBUI_TASKS = (  # Open WebUI's task prompts ("### Task: ..."), what they make
+    ("title", "Titel"), ("tags", "Tags"), ("follow-up", "Folgefragen"), ("follow_up", "Folgefragen"),
+    ("search quer", "Suchanfragen"), ("queries", "Suchanfragen"), ("autocomplet", "Vervollständigen"),
+    ("emoji", "Emoji"), ("image prompt", "Bildbeschreibung"))
+
+
+def client_name(ua: str) -> str:
+    """Who asked, from the User-Agent, short: what the monitor shows."""
+    u = ua.lower()
+    for key, name in (("openwebui", "Open WebUI"), ("open-webui", "Open WebUI"), ("hermes", "Hermes"),
+                      ("chapper", "Chapper"), ("opencode", "opencode"), ("myrmid", "Dashboard"), ("curl", "curl"),
+                      ("python-requests", "Python"), ("openai/python", "OpenAI-SDK (Python)"),
+                      ("openai/js", "OpenAI-SDK (JS)"), ("aiohttp", "aiohttp")):
+        if key in u:
+            return name
+    return ua.split("/")[0][:24] if ua else ""
+
+
+def background_task(body: dict) -> str:
+    """A client's background job instead of a question from a person: Open WebUI asks with a prompt that starts
+    "### Task:" for a chat's title, tags, follow-up questions, search queries. Returns what it makes, "" if none."""
+    msgs = body.get("messages") if isinstance(body, dict) else None
+    if not isinstance(msgs, list) or not msgs:
+        return ""
+    last = next((m for m in reversed(msgs) if isinstance(m, dict) and m.get("role") == "user"), None)
+    text = _message_text(last.get("content"))[0] if last else ""
+    if not re.match(r"\s*#{2,4}\s*Task\s*:", text):
+        return ""
+    head = text[:400].lower()
+    return next((name for key, name in OPENWEBUI_TASKS if key in head), "Open WebUI")
+
+
+def host_gpu_temp(st: dict) -> float:
+    """A host's hottest GPU from its status (a GPU or group card: only its own cards), 0 if unknown."""
+    gpus = ((st.get("stats") or {}).get("gpus") or [])
+    own = st.get("nv_index")
+    if own:
+        gpus = [g for g in gpus if g.get("index") in own] or gpus
+    temps = [float(g.get("temp_c") or 0) for g in gpus if g.get("temp_c")]
+    return max(temps) if temps else 0.0
+
+
 @dataclass
 class Backend:
     name: str  # role: "big", "fast", or "extra" (only by its model name)
@@ -7207,6 +7249,7 @@ class Backend:
     upstream_model: str = ""  # external server: the model name it wants in requests
     vision: Optional[bool] = None  # reads images (from the server's /props; None: not known yet)
     efforts: dict = field(default_factory=dict)  # reasoning_effort a client sends -> one its template takes
+    temp: float = 0.0  # its hottest GPU (°C; 0: not known): of equally busy ones, the cooler one answers
 
     @property
     def speed(self) -> float:
@@ -7393,6 +7436,7 @@ class Router:
                 prev = old.get((h.source, h.base))
                 if prev:
                     prev.name, prev.label, prev.group, prev.where, prev.ctx = h.name, h.label, h.group, h.where, h.ctx
+                    prev.temp = h.temp
                     if prev.label != h.label or prev.est_tps != h.est_tps:
                         prev.est_tps = h.est_tps
                     if prev.asleep != h.asleep:
@@ -7650,10 +7694,14 @@ class Router:
         if not ok:
             return None
         known = [b.speed for b in ok if b.speed > 0]
+        # Of equally good ones the cooler GPU (in 5 °C steps, so a degree back and forth doesn't flip it); a hot
+        # card slows down by itself, and spreading the heat keeps all of them fast.
+        def cool(b: Backend) -> int:
+            return int(b.temp // 5) if b.temp else 0
         if self.prefer_fast and known and len(ok) > 1:
             slowest = min(known)  # no measurement or estimate yet: count it as the slowest
-            return min(ok, key=lambda b: ((b.inflight + 1) / (b.speed or slowest), b.served))
-        return min(ok, key=lambda b: (b.inflight, b.served))
+            return min(ok, key=lambda b: (round((b.inflight + 1) / (b.speed or slowest), 3), cool(b), b.served))
+        return min(ok, key=lambda b: (b.inflight, cool(b), b.served))
 
     def role(self, role: str) -> list[Backend]:
         return [b for b in self.backends if b.name == role]
@@ -7743,6 +7791,12 @@ class Router:
     def decide(self, body: dict, headers) -> tuple[Backend, str]:
         """Which model answers. Raises ContextTooLong when none has room."""
         need, loose = self.need(body)
+        task = background_task(body)
+        if task and self.enabled and not (headers.get("X-Myrmid-Route") or "").strip() and not has_images(body):
+            # Open WebUI's own small jobs (title, tags, follow-up questions ...): the fast model, without asking the
+            # classifier, so they don't hold up the big one; the big one only if no fast one is ready
+            if self.choose(self.fits(self.role("fast"), need)):
+                return self._pick_role("fast", f"Hintergrundauftrag ({task})", need, loose)
         forced = ((headers.get("X-Myrmid-Route") or headers.get("X-PrivateLM-Route") or "").strip()
                   or str(body.get("model", "")).strip()).lower()
         # "privatelm" was the router's name before the rename: clients set up then keep working
@@ -7795,7 +7849,7 @@ class Router:
             route, reason = by_example or ("fast", reason + " (Beispiele nicht bereit)")
         return self._pick_role(route, reason, need, loose)
 
-    def classify(self, body: dict) -> tuple[str, str]:
+    def classify(self, body: dict) -> tuple[str, str]:  # noqa: C901
         """Rules first (what the small model can't do), then the shape of the
         request. Errs towards the big model: a wrong 'big' costs time, a
         wrong 'fast' costs quality."""
@@ -7923,6 +7977,7 @@ class Router:
             def do_POST(self):
                 if not self._auth():
                     return self._json(401, {"error": {"message": "Invalid API Key", "type": "authentication_error"}})
+                decide_ms = 0  # how long the router took to choose (monitor)
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n) if n else b""
                 path = self.path.split("?", 1)[0]
@@ -7933,8 +7988,10 @@ class Router:
                     pass
                 if path.rstrip("/") in ("/v1/chat/completions", "/chat/completions", "/v1/completions",
                                         "/completions", "/completion") and isinstance(body, dict):
+                    t_decide = time.time()
                     try:
                         backend, reason = router.decide(body, self.headers)
+                        decide_ms = round((time.time() - t_decide) * 1000)
                     except NoVision as e:
                         return self._json(400, {"error": {
                             "message": f"{e}. Ein Vision-Modell laden (z. B. qwen3-vl-8b, mit seinem mmproj) und das "
@@ -7952,6 +8009,7 @@ class Router:
                     router.record(backend, reason, chars, bool(body.get("stream")))
                 else:
                     backend, reason = router._pick_role("big", "keine Chat-Anfrage")
+                    decide_ms = 0
                 if backend.asleep and router.waker:
                     woke = router.waker(backend)
                     if woke is None:
@@ -7966,6 +8024,7 @@ class Router:
                         reason += f", {backend.where} nicht aufgewacht"
                         woke = alt
                     backend = woke
+                self.decide_ms = decide_ms
                 self._forward(backend, "POST", raw, reason)
 
             def _forward(self, backend: Backend, method: str, raw: Optional[bytes], reason: str) -> None:
@@ -8048,7 +8107,9 @@ class Router:
                         backend.inflight -= 1
                     if self.path.split("?", 1)[0].rstrip("/").endswith(("completions", "messages", "responses")):
                         try:
-                            router.note_request(backend, status, tail, raw, reason, started, alone)
+                            router.note_request(backend, status, tail, raw, reason, started, alone,
+                                                decide_ms=getattr(self, "decide_ms", 0),
+                                                client=self.headers.get("User-Agent") or "")
                         except Exception as e:  # noqa: BLE001 - the monitor must never break serving
                             log(f"Monitor: {e}")
                     found = re.findall(rb'"timings"\s*:\s*(\{[^{}]*\})', tail) if alone and tail else []
@@ -8066,7 +8127,7 @@ class Router:
         return H
 
     def note_request(self, b: Backend, status: int, tail: bytes, raw: Optional[bytes], reason: str,
-                     started: float, alone: bool) -> None:
+                     started: float, alone: bool, decide_ms: int = 0, client: str = "") -> None:
         """One line for the monitor: from llama-server's "timings" (tokens
         read, reused from the cache, written, and the speeds), else from the
         OpenAI "usage" an external server sends."""
@@ -8087,7 +8148,9 @@ class Router:
              "prompt": prompt, "reused": reused, "output": out,
              "pp": round(float(t.get("prompt_per_second") or 0), 1), "tg": round(float(t.get("predicted_per_second") or 0), 1),
              "secs": round(time.time() - started, 1), "reason": reason, "ctx": b.ctx or 0, "alone": alone,
-             "image": bool(raw and (b'"image_url"' in raw or b'"input_image"' in raw))}
+             "image": bool(raw and (b'"image_url"' in raw or b'"input_image"' in raw)),
+             "decide_ms": decide_ms, "temp": round(b.temp) if b.temp else None,
+             "client": client_name(client)}
         with self.lock:
             self.reqlog.append(e)
             tot = self.reqtotals
@@ -8412,7 +8475,7 @@ class HostManager:
                                         f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}{h.get('path') or ''}",
                                         self.key, st["model"], group=a.get("name") or st["model"],
                                         where=h["name"], source=hid, ctx=st.get("ctx") or 0,
-                                        est_tps=float(st.get("estimate_tps") or 0)))
+                                        est_tps=float(st.get("estimate_tps") or 0), temp=host_gpu_temp(st)))
         self.router.set_hosts(backends)
 
     # Sleep and wake ------------------------------------------------------------
