@@ -219,6 +219,8 @@
   .rc-head .tag { flex-shrink: 0; }
   .rc-model { font-weight: 650; margin: 6px 0 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .rc-sub { font-size: 12px; color: var(--muted); min-height: 1.3em; }
+  .rc-spark-wrap { margin-top: 6px; }
+  .rc-spark { display: block; width: 100%; height: 34px; }
   .rc-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px; }
   .rc-stats span { display: block; font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
   .rc-stats b { display: block; font-size: .95rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -2107,6 +2109,7 @@ function render(s) {
   if (location.hash === "#monitor" && !render.monOpened) { render.monOpened = true; monShow(true); }
   if (location.hash === "#rig" && !render.rigOpened) { render.rigOpened = true; showTab("rig"); }
   if (location.hash === "#hilfe" && !render.helpOpened) { render.helpOpened = true; showTab("help"); }
+  rigCollect(s);
   renderRig(s);
 }
 
@@ -2181,6 +2184,31 @@ $("theme-btn").addEventListener("click", () => {
 });
 themeSet(document.documentElement.dataset.theme || "");
 
+const rigHist = {};  // "pc:gpu" -> recent load (%) samples, kept while the page is open (also off the tab)
+const RIG_SAMPLES = 90;
+function rigCollect(s) {
+  const seen = new Set();
+  for (const h of ((s.hosts || {}).hosts || [])) {
+    const st = h.stats || {};
+    if (!st.host || seen.has(st.host)) continue;
+    seen.add(st.host);
+    (st.gpus || []).forEach((g, i) => {
+      const key = `${st.host}:${g.index != null ? g.index : i}`;
+      const v = g.util_pct != null ? g.util_pct : null;
+      const arr = rigHist[key] || (rigHist[key] = []);
+      arr.push(v);
+      if (arr.length > RIG_SAMPLES) arr.splice(0, arr.length - RIG_SAMPLES);
+    });
+  }
+}
+function sparkSvg(vals, color) {
+  // load over the last minutes: an area under a line, 0..100 %
+  const n = RIG_SAMPLES, pad = n - vals.length;
+  const pts = vals.map((x, i) => x == null ? null : `${((pad + i) * 300 / (n - 1)).toFixed(1)},${(33 - Math.min(100, x) / 100 * 31).toFixed(1)}`).filter(Boolean);
+  if (pts.length < 2) return `<svg class="rc-spark" viewBox="0 0 300 34" preserveAspectRatio="none" aria-hidden="true"><line x1="0" y1="33" x2="300" y2="33" stroke="var(--line)" stroke-width="1" vector-effect="non-scaling-stroke"/></svg>`;
+  const x0 = pts[0].split(",")[0], x1 = pts[pts.length - 1].split(",")[0];
+  return `<svg class="rc-spark" viewBox="0 0 300 34" preserveAspectRatio="none" aria-hidden="true"><line x1="0" y1="33" x2="300" y2="33" stroke="var(--line)" stroke-width="1" vector-effect="non-scaling-stroke"/><polygon points="${x0},34 ${pts.join(" ")} ${x1},34" fill="${color}" opacity="0.18"/><polyline points="${pts.join(" ")}" fill="none" stroke="${color}" stroke-width="1.6" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg>`;
+}
 function renderRig(s) {
   if (!$("app").classList.contains("rig")) return;
   const hosts = ((s.hosts || {}).hosts || []);
@@ -2231,6 +2259,7 @@ function renderRig(s) {
       const card = String(g.name || "").replace(/^NVIDIA\s+/i, "").replace(/^(AMD|Intel)\s+/i, "");
       return `<div class="rcard ${cls}" title="${esc(g.name)}${pcieText(g).replace(/<[^>]+>/g, "")}"><div class="rc-head"><b>GPU ${idx}</b><span class="rc-card">${esc(card)}</span>${tags}<span class="dot ${st === "ready" ? (busy ? "busy" : "ok") : st === "error" ? "bad" : st === "idle" ? "" : "warn"}"></span></div>
         <div class="rc-model">${esc(model)}</div><div class="rc-sub">${sub}</div>
+        <div class="rc-spark-wrap" title="Auslastung der letzten Minuten">${sparkSvg(rigHist[`${p.name}:${idx}`] || [], busy ? "var(--warn)" : "var(--good)")}</div>
         <div class="rc-stats">
           <div><span>Last</span><b>${g.util_pct == null ? "–" : nf(g.util_pct, 0) + " %"}</b>${bar(g.util_pct, "var(--warn)")}</div>
           <div><span>Leistung</span><b>${g.power_w == null ? "–" : nf(g.power_w, 0) + " W"}</b>${bar((g.power_w || 0) / 3, "var(--c4)")}</div>
