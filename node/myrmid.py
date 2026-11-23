@@ -133,11 +133,18 @@ class Device:
         return self.type in ("gpu", "igpu")
 
 
-def usable_gpus(devices: list[Device]) -> list[Device]:
+# GPUs this PC keeps for something else (a host's embedding model): the planner
+# leaves them out, and llama-server gets --device without them.
+RESERVED_GPUS: set[str] = set()
+
+
+def usable_gpus(devices: list[Device], include_reserved: bool = False) -> list[Device]:
     """The GPUs llama.cpp would use, the same way it picks them: each card
     once (a card seen by CUDA and Vulkan, or ROCm and Vulkan, has one PCI ID;
     the first backend wins), and integrated GPUs only without a dedicated
-    one."""
+    one. Reserved GPUs (RESERVED_GPUS) are left out unless asked for."""
+    if not include_reserved and RESERVED_GPUS:
+        devices = [d for d in devices if d.name not in RESERVED_GPUS]
     gpus: list[Device] = []
     for d in devices:
         if d.type != "gpu":
@@ -5213,7 +5220,11 @@ HOST_API_PORT = 8081
 HOST_STATE = CONFIG_DIR / "host.json"
 HOST_LAYOUT = CONFIG_DIR / "host-layout.json"
 HOST_INTERNAL_PORT = 18081  # the llama-servers listen on 127.0.0.1 from here up; the API port forwards to them
-HOST_LAYOUTS = ("split", "per_gpu", "groups")  # one model over all GPUs, one per GPU, or one per group of GPUs
+HOST_LAYOUTS = ("split", "per_gpu", "groups")
+HOST_EMBED = CONFIG_DIR / "host-embed.json"  # the host's embedding model and its device
+EMBED_PORT = HOST_INTERNAL_PORT + 90  # its llama-server on 127.0.0.1; the API port forwards /embed/... to it
+EMBED_MODELS = {"bge-m3": "gpustack/bge-m3-GGUF:Q8_0"}  # short names in the dashboard -> Hugging Face
+EMBED_CPU_THREADS = 4  # on the CPU: leave the rest to the big model (MoE experts in RAM)  # one model over all GPUs, one per GPU, or one per group of GPUs
 
 
 PAIRED_KEY = CONFIG_DIR / "cluster_key"  # the key a master gave this PC (pairing)
@@ -6235,6 +6246,8 @@ class HostAgent:
         if node:  # the PC's layout: the master lists every slot and can switch it
             st.update(node.layout_info())
             st["layout_owner"] = bool(node.agents) and node.agents[0] is self
+            if st["layout_owner"]:
+                st["embed"] = node.embed.status()
         return st
 
     # Commands ------------------------------------------------------------------
@@ -6682,7 +6695,8 @@ class HostAgent:
                 dargs = argparse.Namespace(draft_model="auto", draft_max=DRAFT_N_MAX, ctx=ns.ctx)
                 draft = find_draft(dargs, str(Path(path).resolve()))
                 if draft:
-                    devs = [d for d in probe(bench=False) if not self.group or d.name in {g.name for g in self.group}]
+                    devs = [d for d in probe(bench=False) if (not self.group or d.name in {g.name for g in self.group})
+                            and d.name not in RESERVED_GPUS]
                     opts, reserve, dinfo = plan_draft(dargs, draft, devs)
                     info = {"kind": "Entwurf", "text": f"Entwurfsmodell {dinfo['model']} ({dinfo['size_gb']} GB, "
                                                        f"{dinfo['device']}), bis {dinfo['n_max']} Tokens voraus"}
@@ -6700,6 +6714,9 @@ class HostAgent:
         sp = build_server_fitting(ns, quiet=True, exit_on_fail=False)
         if self.group:  # without it llama.cpp spreads the model over every GPU it sees
             sp.cmd += ["--device", ",".join(g.name for g in self.group)]
+        elif RESERVED_GPUS:  # a GPU of this PC runs the embedding model: keep the big one off it
+            rest = [g.name for g in usable_gpus(probe(bench=False))]
+            sp.cmd += ["--device", ",".join(rest) if rest else "none"]
         return sp
 
     # Saved configurations --------------------------------------------------------
@@ -6933,6 +6950,153 @@ class HostAgent:
         self.stop_server()
 
 
+class EmbedService:
+    """The host's embedding model (e.g. bge-m3 for a knowledge base in Open
+    WebUI/Formica): its own small llama-server next to the big model, on the
+    CPU or on a GPU kept for it (RESERVED_GPUS). The host's API port passes
+    /embed/... to it, and the master's router sends /v1/embeddings here."""
+
+    def __init__(self, args, key: str, all_gpus: list):
+        import threading
+
+        self.args, self.key = args, key
+        self.all_gpus = all_gpus  # every GPU of this PC, the reserved one too
+        self.models_dir = Path(args.models_dir).expanduser()
+        self.lock = threading.RLock()
+        self.conf = self.load()
+        if self.conf["device"] != "cpu" and self.conf["device"] not in {g.name for g in all_gpus}:
+            log(f"Embeddings: GPU {self.conf['device']} gibt es nicht mehr, laufen auf der CPU")
+            self.conf["device"] = "cpu"
+        self.state, self.error = ("off" if not self.conf["model"] else "idle"), ""
+        self.proc: Optional[subprocess.Popen] = None
+        self.file: Optional[Path] = None
+        self.tail: list = []
+        self.job = 0
+
+    @staticmethod
+    def load() -> dict:
+        try:
+            d = json.loads(HOST_EMBED.read_text())
+            return {"model": str(d.get("model") or ""), "device": str(d.get("device") or "cpu")}
+        except (OSError, ValueError, AttributeError):
+            return {"model": "", "device": "cpu"}
+
+    @staticmethod
+    def reserved_for(conf: dict) -> set:
+        return {conf["device"]} if conf.get("model") and conf.get("device", "cpu") != "cpu" else set()
+
+    def reserved(self) -> set:
+        return self.reserved_for(self.conf)
+
+    def _set(self, state: str, error: str = "") -> None:
+        with self.lock:
+            self.state, self.error = state, error
+        log(f"Embeddings: {state}{': ' + error if error else ''}")
+
+    def status(self) -> dict:
+        with self.lock:
+            return {"model": self.conf["model"], "device": self.conf["device"], "state": self.state,
+                    "error": self.error, "file": self.file.name if self.file else None,
+                    "models": sorted(EMBED_MODELS),
+                    "devices": [{"name": "cpu", "description": f"CPU ({EMBED_CPU_THREADS} Threads)"}]
+                    + [{"name": g.name, "description": g.description, "total_mb": g.total_mb} for g in self.all_gpus]}
+
+    def set(self, body: dict) -> dict:
+        model = str(body.get("model") or "").strip()
+        device = str(body.get("device") or "cpu").strip()
+        if device != "cpu" and device not in {g.name for g in self.all_gpus}:
+            return {"ok": False, "error": f"unbekanntes Gerät: {device}"}
+        if model and model not in EMBED_MODELS and "/" not in model:
+            return {"ok": False, "error": f"Modell: {', '.join(EMBED_MODELS)} oder user/repo:QUANT"}
+        old = self.reserved()
+        with self.lock:
+            self.conf = {"model": model, "device": device}
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            HOST_EMBED.write_text(json.dumps(self.conf))
+        except OSError as e:
+            log(f"Embeddings: could not save ({e})")
+        log(f"Embeddings: {model or 'aus'}" + (f" auf {device}" if model else ""))
+        self.restart()
+        return {"ok": True, "reserve_changed": old != self.reserved(), **self.status()}
+
+    def restart(self) -> None:
+        import threading
+
+        self.stop()
+        if not self.conf["model"]:
+            self._set("off")
+            return
+        job = self.job
+        threading.Thread(target=self._run, args=(job,), daemon=True).start()
+
+    def stop(self) -> None:
+        with self.lock:
+            self.job += 1
+            proc, self.proc = self.proc, None
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def _run(self, job: int) -> None:
+        import threading
+        import urllib.request
+
+        conf = dict(self.conf)
+        target = EMBED_MODELS.get(conf["model"], conf["model"])
+        self._set("downloading")
+        try:
+            path = fetch_model(target, self.models_dir, quiet=True)
+        except Exception as e:  # noqa: BLE001 - shown on the host card
+            if job == self.job:
+                self._set("error", f"Download: {e}"[:300])
+            return
+        self.file = path
+        fails = 0
+        while job == self.job:
+            cmd = [find_bin("llama-server"), "-m", str(path), "--embeddings", "--host", "127.0.0.1",
+                   "--port", str(EMBED_PORT), "-c", "16384", "-np", "4", "-b", "4096", "-ub", "4096",
+                   "--api-key", self.key]
+            if conf["device"] == "cpu":
+                cmd += ["--device", "none", "-ngl", "0", "-t", str(EMBED_CPU_THREADS)]
+            else:
+                cmd += ["--device", conf["device"], "-ngl", "999"]
+            self._set("starting")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            with self.lock:
+                if job != self.job:
+                    proc.terminate()
+                    return
+                self.proc, self.tail = proc, []
+
+            def read(p=proc) -> None:
+                for line in p.stdout:
+                    self.tail = (self.tail + [line.rstrip()])[-40:]
+            threading.Thread(target=read, daemon=True).start()
+            for _ in range(180):
+                if proc.poll() is not None or job != self.job:
+                    break
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{EMBED_PORT}/health", timeout=2) as r:
+                        if r.status == 200:
+                            self._set("ready")
+                            fails = 0
+                            break
+                except Exception:  # noqa: BLE001 - still loading
+                    pass
+                time.sleep(1)
+            proc.wait()
+            if job != self.job:
+                return
+            fails += 1
+            why = next((t for t in reversed(self.tail) if "error" in t.lower()), self.tail[-1] if self.tail else "")
+            self._set("error", f"llama-server beendet (Code {proc.returncode}){': ' + why[:200] if why else ''}")
+            time.sleep(min(300, 10 * fails))
+
+
 class HostNode:
     """The host on one PC: one HostAgent over all GPUs (layout "split"), or
     one per dedicated GPU ("per_gpu"), switched from the master's dashboard.
@@ -6946,6 +7110,13 @@ class HostNode:
         self.args, self.key = args, key
         self.lock = threading.RLock()
         self.devices = probe(bench=False)
+        # the embedding model first: a GPU it keeps is not for the big models
+        self.embed = EmbedService(args, key, [d for d in usable_gpus(self.devices, include_reserved=True)
+                                              if d.type == "gpu"])
+        RESERVED_GPUS.clear()
+        RESERVED_GPUS.update(self.embed.reserved())
+        if RESERVED_GPUS:
+            log(f"Host: {', '.join(sorted(RESERVED_GPUS))} bleibt dem Embedding-Modell vorbehalten")
         self.gpus = [d for d in usable_gpus(self.devices) if d.type == "gpu"]
         self.stats = SystemStats(self.devices)
         self.get_routes: dict = {}
@@ -7002,7 +7173,8 @@ class HostNode:
                 posts.update({f"{prefix}/assign": a.assign, f"{prefix}/unload": a.unload, f"{prefix}/tune": a.tune,
                               f"{prefix}/sleep": a.sleep, f"{prefix}/strata": a.strata})
         posts.update({"/layout": self.set_layout, "/role": lambda body: request_role(str(body.get("role") or "")),
-                      "/update": request_update})
+                      "/update": request_update, "/embed": self.set_embed})
+        gets["/embed"] = self.embed.status
         # the handler holds these dicts: change them in place
         self.get_routes.clear()
         self.get_routes.update(gets)
@@ -7019,6 +7191,51 @@ class HostNode:
             threading.Thread(target=a.watch, daemon=True).start()
             a.restore()
         threading.Thread(target=self.watch_resume, daemon=True).start()
+        if self.embed.conf["model"]:
+            self.embed.restart()
+
+    def set_embed(self, body: dict) -> dict:
+        """Embedding model on/off and its device (dashboard). A GPU it gets
+        (or gives back) changes what the big models may use: they reload."""
+        import threading
+
+        if self.switching:
+            return {"ok": False, "error": "a switch is running"}
+        res = self.embed.set(body)
+        if not res.get("ok") or not res.get("reserve_changed"):
+            return res
+        self.switching = True
+
+        def run() -> None:
+            try:
+                old = self.agents
+                first = old[0].saved() if old else {}
+                for a in old:
+                    a.close()
+                with self.lock:
+                    RESERVED_GPUS.clear()
+                    RESERVED_GPUS.update(self.embed.reserved())
+                    self.gpus = [d for d in usable_gpus(probe(bench=False)) if d.type == "gpu"]
+                    if (self.layout in ("per_gpu", "groups") and len(self.gpus) < 2) or \
+                            (self.layout == "groups" and self.check_groups(self.groups)):
+                        log("Host: the GPU layout no longer fits without the embedding GPU: one model over all GPUs")
+                        self.layout, self.groups = "split", []
+                        try:
+                            HOST_LAYOUT.write_text(json.dumps({"layout": "split"}))
+                        except OSError:
+                            pass
+                    self.agents = self._make()
+                    self._set_routes()
+                log(f"Host: big models on {', '.join(g.name for g in self.gpus) or 'CPU'}"
+                    + (f", embeddings on {', '.join(sorted(RESERVED_GPUS))}" if RESERVED_GPUS else ""))
+                for i, a in enumerate(self.agents):
+                    threading.Thread(target=a.watch, daemon=True).start()
+                    a.restore(inherit=first if i == 0 else None)
+            finally:
+                self.switching = False
+
+        threading.Thread(target=run, daemon=True).start()
+        return res
 
     def layout_info(self) -> dict:
         return {"layout": self.layout, "switching": self.switching,
@@ -7107,6 +7324,8 @@ class HostNode:
 
     def backend_port(self, path: str) -> tuple[Optional[int], str]:
         """The llama-server for a request on the API port, and the path for it."""
+        if path == "/embed" or path.startswith("/embed/"):
+            return (EMBED_PORT if self.embed.state == "ready" else None), path[len("/embed"):] or "/"
         agents = self.agents
         for a in agents:
             if a.path and (path == a.path or path.startswith(a.path + "/")):
@@ -7118,6 +7337,7 @@ class HostNode:
     def stop(self) -> None:
         for a in self.agents:
             a.close()
+        self.embed.stop()
 
 
 def _host_wait_for_master(args) -> None:
@@ -7548,6 +7768,8 @@ class Router:
         import threading
 
         self.backends = list(backends)
+        self.embedders: list[dict] = []  # hosts with an embedding model: base URL, key, where
+        self.embed_next = 0
         self.fast_ctx = fast_ctx
         self.enabled, self.mode = enabled, mode
         self.public_name, self.key = public_name, key
@@ -7600,6 +7822,17 @@ class Router:
     @property
     def fast(self) -> Optional[Backend]:
         return next((b for b in self.backends if b.name == "fast" and b.source == "local"), None)
+
+    def set_embedders(self, embedders: list[dict]) -> None:
+        with self.lock:
+            self.embedders = list(embedders)
+
+    def pick_embedder(self) -> Optional[dict]:
+        with self.lock:
+            if not self.embedders:
+                return None
+            self.embed_next = (self.embed_next + 1) % len(self.embedders)
+            return self.embedders[self.embed_next]
 
     def set_hosts(self, hosts: list[Backend]) -> None:
         """Replaces the hosts' backends, keeping health and counters of the
@@ -8264,6 +8497,8 @@ class Router:
                     body = json.loads(raw) if raw else {}
                 except ValueError:
                     pass
+                if path.rstrip("/") in ("/v1/embeddings", "/embeddings"):
+                    return self._embed(raw)
                 if path.rstrip("/") in ("/v1/chat/completions", "/chat/completions", "/v1/completions",
                                         "/completions", "/completion") and isinstance(body, dict):
                     t_decide = time.time()
@@ -8304,6 +8539,39 @@ class Router:
                     backend = woke
                 self.decide_ms = decide_ms
                 self._forward(backend, "POST", raw, reason)
+
+            def _embed(self, raw: bytes) -> None:
+                """/v1/embeddings: to a host's embedding model (round robin), not to a chat model."""
+                tried = 0
+                while True:
+                    e = router.pick_embedder()
+                    if not e:
+                        return self._json(503, {"error": {
+                            "message": "Kein Embedding-Modell im Cluster. Im MyrmidLM-Dashboard bei einem Host unter "
+                                       "„Embeddings“ einschalten (z. B. bge-m3).",
+                            "type": "server_error", "code": "no_embedding_model"}})
+                    u = urlsplit(e["base"])
+                    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=300)
+                    try:
+                        conn.request("POST", u.path.rstrip("/") + "/v1/embeddings", body=raw,
+                                     headers={"Content-Type": "application/json",
+                                              **({"Authorization": f"Bearer {e['key']}"} if e.get("key") else {})})
+                        resp = conn.getresponse()
+                        data = resp.read()
+                    except OSError as err:
+                        tried += 1
+                        if tried < len(router.embedders):
+                            continue
+                        return self._json(502, {"error": {"message": f"Embedding-Modell auf {e['where']} nicht "
+                                                                     f"erreichbar: {err}", "type": "server_error"}})
+                    finally:
+                        conn.close()
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", resp.getheader("Content-Type") or "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
 
             def _forward(self, backend: Backend, method: str, raw: Optional[bytes], reason: str) -> None:
                 raw = fix_effort(raw, backend.efforts)
@@ -8757,7 +9025,15 @@ class HostManager:
                                         self.key, st["model"], group=a.get("name") or st["model"],
                                         where=h["name"], source=hid, ctx=st.get("ctx") or 0,
                                         est_tps=float(st.get("estimate_tps") or 0), temp=host_gpu_temp(st)))
+            embedders = []
+            for hid, h in self.hosts.items():
+                st = h.get("status") or {}
+                em = st.get("embed") or {}
+                if em.get("state") == "ready" and not h.get("asleep") and not h.get("error") and not self.in_maint(hid):
+                    embedders.append({"base": f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}/embed",
+                                      "key": self.key, "where": h["name"], "model": em.get("model")})
         self.router.set_hosts(backends)
+        self.router.set_embedders(embedders)
 
     # Sleep and wake ------------------------------------------------------------
 
@@ -8922,6 +9198,20 @@ class HostManager:
             self.save()
             self.rescan, self.last_scan = True, 0
             return self.info()
+        if "embed" in body:
+            h = dict(self.hosts[hid], path="")  # the PC's first host answers for the embedding model
+            em = body.get("embed") or {}
+            try:
+                res = self._call(h, "/embed", {"model": str(em.get("model") or ""),
+                                               "device": str(em.get("device") or "cpu")}, timeout=15)
+            except Exception as e:  # noqa: BLE001
+                return {**self.info(), "error": f"Embeddings: {e}"}
+            if not res.get("ok"):
+                return {**self.info(), "error": res.get("error") or "Embeddings: fehlgeschlagen"}
+            log(f"Host {h['name']}: embeddings {em.get('model') or 'aus'} ({em.get('device') or 'cpu'})")
+            if res.get("reserve_changed"):
+                self.rescan, self.last_scan = True, 0
+            return self.info()
         if body.get("sleep"):
             threading.Thread(target=self.sleep, args=(hid, "from the dashboard"), daemon=True).start()
             return self.info()
@@ -8980,7 +9270,8 @@ class HostManager:
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
                                                        "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned", "groups", "group", "nv_index",
-                                                       "note", "snapshots", "rollback", "engine", "strata", "strata_install", "spec_info")},
+                                                       "note", "snapshots", "rollback", "engine", "strata", "strata_install", "spec_info",
+                                                       "embed")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]

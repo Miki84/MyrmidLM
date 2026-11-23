@@ -1672,6 +1672,15 @@ function renderHosts(s) {
             ${nGpus >= 3 ? `<button type="button" class="seg-btn" data-layout-groups aria-pressed="${x.layout === "groups"}"${x.switching ? " disabled" : ""} title="GPUs zu Gruppen zusammenfassen: jede Gruppe ein Modell (z. B. eine Karte für Strata, zwei zusammen für ein llama.cpp-Modell)">GPU-Gruppen</button>` : ""}
           </div>${x.switching ? `<span class="muted">stellt um …</span>` : ""}</div>${groupEditor(x)}`
       : "";
+    const em = x.embed;
+    const EM_STATE = { off: "aus", idle: "wartet", downloading: "lädt das Modell herunter …", starting: "startet …", ready: "bereit", error: "Fehler" };
+    const emModel = e.embed_model ?? (em ? em.model : ""), emDev = e.embed_device ?? (em ? em.device : "cpu");
+    const embedRow = !em || x.asleep ? "" : `<div class="kv embed-row" title="Ein Embedding-Modell für Wissensdatenbanken (z. B. Open WebUI/Formica). Der Master bietet es als /v1/embeddings an.">
+        <label>Embeddings<select name="embed_model"><option value=""${!emModel ? " selected" : ""}>aus</option>${(em.models || []).map((m) => `<option${m === emModel ? " selected" : ""}>${esc(m)}</option>`).join("")}${emModel && !(em.models || []).includes(emModel) ? `<option selected>${esc(emModel)}</option>` : ""}</select></label>
+        <label>auf<select name="embed_device">${(em.devices || []).map((d) => `<option value="${esc(d.name)}"${d.name === emDev ? " selected" : ""}>${esc(d.name === "cpu" ? d.description : d.name + " " + d.description)}</option>`).join("")}</select></label>
+        <button class="btn quiet small" type="button" data-hembed>Übernehmen</button>
+        <span class="note"><span class="dot ${em.state === "ready" ? "ok" : em.state === "error" ? "bad" : em.state === "off" ? "" : "busy"}"></span> ${esc(EM_STATE[em.state] || em.state)}${em.state === "ready" && em.device !== "cpu" ? ` · ${esc(em.device)} nur für Embeddings` : ""}</span></div>
+      ${em.error ? `<div class="note bad">${esc(em.error)}</div>` : ""}`;
     const roleRow = x.switchable && !x.asleep
       ? `<div class="role-row"><span class="muted">Rolle: Host</span><button class="btn quiet small" type="button" data-role-ctl="${esc(x.addr)}" data-role="worker">Zum Worker machen</button></div>`
       : "";
@@ -1687,7 +1696,7 @@ function renderHosts(s) {
     return `<article class="host" data-id="${esc(x.id)}">
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${x.gpu ? " · " + esc(x.gpu) : gpus ? " · " + gpus : ""}</div></div>
         <div class="pills">${x.online === undefined ? "" : `<div class="pill net ${x.online ? "on" : x.slow ? "slow" : "off"}" title="${x.online ? "Antwortet dem Master" : x.slow ? "Hat zuletzt nicht geantwortet (lädt oder ist ausgelastet?)" : x.asleep ? "Schläft oder ist aus: wird bei Bedarf per Wake-on-LAN geweckt" : "Antwortet nicht"}${x.seen_ago != null ? ` · zuletzt gesehen vor ${x.seen_ago < 120 ? x.seen_ago + " s" : Math.round(x.seen_ago / 60) + " min"}` : ""}">${x.online ? "online" : x.slow ? "antwortet langsam" : "offline"}</div>`}<div class="pill" title="Was das Modell gerade tut"><span class="dot ${cls}"></span><span>${txt}</span></div></div></div>
-      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${x.note ? `<div class="note">${esc(x.note)}</div>` : ""}${hostStats(x)}${layoutRow}${sleepRow}${maintRow}${roleRow}
+      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${x.note ? `<div class="note">${esc(x.note)}</div>` : ""}${hostStats(x)}${layoutRow}${embedRow}${sleepRow}${maintRow}${roleRow}
       ${x.spec_info && x.spec_info.text && x.engine !== "strata" ? `<div class="note">Vorausraten: ${esc(x.spec_info.text)}</div>` : ""}
       ${strataRow}${strataInstallRow}
       ${x.engine !== "strata" && (x.state === "ready" || x.state === "tuning" || x.tuned || x.tune_job) ? `<div class="kv"><span class="note">${esc(tuneText(x.tune_job, x.tuned) || "Autotune: misst die schnellsten Einstellungen für dieses Modell auf diesem PC.")}</span>${
@@ -1796,6 +1805,19 @@ $("hosts").addEventListener("click", (ev) => {
     if (confirm(`${name} entfernen?\n\nSein Modell wird entladen (wenn er erreichbar ist), und der Master vergisst ihn mit Zuweisung und Einstellungen. Taucht der PC wieder im Netz auf, wird er nicht automatisch aufgenommen; unten unter „Entfernte Hosts“ lässt er sich wieder aufnehmen.\n\nGilt für den ganzen PC (alle GPUs).`)) {
       ev.target.disabled = true; hostAction({ host: card.dataset.id, remove: true });
     }
+  }
+  if (ev.target.matches("[data-hembed]")) {
+    const id = card.dataset.id;
+    const x = (last && ((last.hosts || {}).hosts || []).find((h) => h.id === id)) || {};
+    const model = (card.querySelector('[name="embed_model"]') || {}).value || "";
+    const device = (card.querySelector('[name="embed_device"]') || {}).value || "cpu";
+    const old = x.embed || {};
+    const gpuBefore = old.model && old.device !== "cpu" ? old.device : "", gpuAfter = model && device !== "cpu" ? device : "";
+    if (gpuBefore !== gpuAfter && !confirm(gpuAfter
+      ? `${gpuAfter} wird nur noch für das Embedding-Modell genutzt. Das große Modell dieses PCs lädt dafür neu, ohne diese GPU.`
+      : `${gpuBefore} wird wieder frei. Das große Modell dieses PCs lädt dafür neu und nutzt sie wieder.`)) return;
+    if (hostEdits[id]) { delete hostEdits[id].embed_model; delete hostEdits[id].embed_device; }
+    ev.target.disabled = true; hostAction({ host: id, embed: { model, device } });
   }
   if (ev.target.matches("[data-hmaint]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, maintenance: ev.target.dataset.hmaint === "on" }); }
   if (ev.target.matches("[data-hwake]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, wake: true }); }
