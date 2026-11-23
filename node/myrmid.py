@@ -6205,7 +6205,8 @@ class HostAgent:
                                 for x in self.snapshots()],
                   "rollback": bool(self.rollback),
                   "update": update_brief(),
-                  "engine": (self.assignment or {}).get("engine") or "llama"}
+                  "engine": (self.assignment or {}).get("engine") or "llama",
+                  "spec_info": getattr(self, "spec_info", {}) or {}}
             if self.event:
                 st["note"] = (st["note"] + " " if st["note"] else "") + self.event
         st["metrics"] = self._metrics() if st["engine"] != "strata" else {}
@@ -6250,6 +6251,8 @@ class HostAgent:
              "ctx": parse_ctx(body.get("ctx")),
              "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16",
              "vision": body.get("vision") if body.get("vision") in ("auto", "cpu", "off") else "auto"}
+        if body.get("spec") in ("mtp", "draft"):
+            a["spec"] = body["spec"]
         if body.get("engine") == "strata":  # model = one of Strata's strata-*.json; it brings its own settings
             if not STRATA_CFG_RE.match(model):
                 return {"error": "Strata: Konfiguration strata-<name>.json wählen"}
@@ -6650,11 +6653,48 @@ class HostAgent:
         self._set("error", last_err or "llama-server startet nicht")
 
     def _ns(self, path: Path, a: dict, no_tune: bool = False) -> argparse.Namespace:
-        return argparse.Namespace(model=str(path), ctx=a.get("ctx"), kv=a.get("kv") or "f16", mtp=0, workers="off",
-                                  ram_limit=self.ram_limit_gb, api_key=self.key, host="127.0.0.1",
-                                  port=self.api_port, extra=list(self.args.extra or []), scan_timeout=1.0,
-                                  only_devices=[g.name for g in self.group] or None,
-                                  tune_slot=self.path, no_tune=no_tune, mmproj=a.get("vision") or "auto")
+        ns = argparse.Namespace(model=str(path), ctx=a.get("ctx"), kv=a.get("kv") or "f16", mtp=0, workers="off",
+                                ram_limit=self.ram_limit_gb, api_key=self.key, host="127.0.0.1",
+                                port=self.api_port, extra=list(self.args.extra or []), scan_timeout=1.0,
+                                only_devices=[g.name for g in self.group] or None,
+                                tune_slot=self.path, no_tune=no_tune, mmproj=a.get("vision") or "auto")
+        self._spec(ns, path, a.get("spec") or "off")
+        return ns
+
+    def _spec(self, ns: argparse.Namespace, path: Path, spec: str) -> None:
+        """Speculative decoding for this model: MTP (its own extra layers guess ahead) or a small draft model of
+        the same family (found on this PC or downloaded once). Worked out once per model and choice."""
+        key = (str(path), spec)
+        cached = getattr(self, "spec_cache", None)
+        if not cached or cached[0] != key:
+            opts, reserve, info, mtp = [], {}, {}, 0
+            if spec == "mtp":
+                try:
+                    n = gguf_info(str(path), CTX_STEPS[0]).n_nextn
+                except Exception:  # noqa: BLE001 - a file the planner reads anyway; without MTP then
+                    n = 0
+                if n:
+                    mtp = HOST_MTP_DEPTH
+                    info = {"kind": "MTP", "text": f"MTP: rät bis {mtp} Tokens voraus (eingebaute Schichten)"}
+                else:
+                    info = {"kind": "", "text": "MTP: dieses Modell hat keine MTP-Schichten, läuft ohne"}
+            elif spec == "draft":
+                dargs = argparse.Namespace(draft_model="auto", draft_max=DRAFT_N_MAX, ctx=ns.ctx)
+                draft = find_draft(dargs, str(Path(path).resolve()))
+                if draft:
+                    devs = [d for d in probe(bench=False) if not self.group or d.name in {g.name for g in self.group}]
+                    opts, reserve, dinfo = plan_draft(dargs, draft, devs)
+                    info = {"kind": "Entwurf", "text": f"Entwurfsmodell {dinfo['model']} ({dinfo['size_gb']} GB, "
+                                                       f"{dinfo['device']}), bis {dinfo['n_max']} Tokens voraus"}
+                else:
+                    info = {"kind": "", "text": "Entwurfsmodell: keins passend gefunden, läuft ohne (siehe Log)"}
+            cached = self.spec_cache = (key, opts, reserve, info, mtp)
+        _, opts, reserve, info, mtp = cached
+        ns.mtp, ns.draft_opts, ns.draft_info = mtp, list(opts), dict(info)
+        if reserve:
+            ns.reserve_mb = dict(reserve)
+        with self.lock:
+            self.spec_info = info if spec != "off" else {}
 
     def _plan(self, ns: argparse.Namespace) -> "ServerPlan":
         sp = build_server_fitting(ns, quiet=True, exit_on_fail=False)
@@ -8388,7 +8428,9 @@ class Router:
              "secs": round(time.time() - started, 1), "reason": reason, "ctx": b.ctx or 0, "alone": alone,
              "image": bool(raw and (b'"image_url"' in raw or b'"input_image"' in raw)),
              "decide_ms": decide_ms, "temp": round(b.temp) if b.temp else None,
-             "client": client_name(client)}
+             "client": client_name(client),
+             # speculative decoding (MTP or a draft model): share of the guessed tokens the model kept
+             "spec": round(int(t.get("draft_n_accepted") or 0) / int(t["draft_n"]), 2) if t.get("draft_n") else None}
         with self.lock:
             self.reqlog.append(e)
             tot = self.reqtotals
@@ -8621,7 +8663,8 @@ class HostManager:
                 and (have.get("kv") or "f16") == (want.get("kv") or "f16") \
                 and (have.get("vision") or "auto") == (want.get("vision") or "auto") \
                 and (have.get("engine") or "llama") == (want.get("engine") or "llama") \
-                and (have.get("strata_gpus") or "") == (want.get("strata_gpus") or ""):  # older hosts: no such fields
+                and (have.get("strata_gpus") or "") == (want.get("strata_gpus") or "") \
+                and (have.get("spec") or "off") == (want.get("spec") or "off"):  # older hosts: no such fields
             return
         last = self.pushed.get(hid)
         if last and last[0] == json.dumps(want, sort_keys=True) and time.time() - last[1] < 60:
@@ -8873,8 +8916,8 @@ class HostManager:
                 new_first = {"split": pc, "groups": f"{pc}-grp0"}.get(body["layout"], f"{pc}-gpu0")
                 if want:
                     self.assign[new_first] = {k: want.get(k) for k in ("model", "role", "name", "ctx", "kv", "engine",
-                                                                              "strata_gpus")
-                                              if want.get(k) is not None or k not in ("engine", "strata_gpus")}
+                                                                              "strata_gpus", "spec")
+                                              if want.get(k) is not None or k not in ("engine", "strata_gpus", "spec")}
                     self.pushed.pop(new_first, None)
             self.save()
             self.rescan, self.last_scan = True, 0
@@ -8900,6 +8943,8 @@ class HostManager:
                                 "ctx": parse_ctx(ctx),
                                 "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16",
                                 "vision": body.get("vision") if body.get("vision") in ("auto", "cpu", "off") else "auto"}
+            if body.get("spec") in ("mtp", "draft") and body.get("engine") != "strata":
+                self.assign[hid]["spec"] = body["spec"]
             if body.get("engine") == "strata":  # Strata's strata-*.json brings context and the rest
                 gpus = str(body.get("strata_gpus") or "").replace(" ", "")
                 self.assign[hid].update(engine="strata", ctx=None, kv="f16", vision="auto",
@@ -8935,7 +8980,7 @@ class HostManager:
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
                                                        "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned", "groups", "group", "nv_index",
-                                                       "note", "snapshots", "rollback", "engine", "strata", "strata_install")},
+                                                       "note", "snapshots", "rollback", "engine", "strata", "strata_install", "spec_info")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]
@@ -9011,6 +9056,7 @@ DRAFT_CATALOG = [
 DRAFT_MAX_SHARE = 0.12  # a draft larger than this share of the big model rarely pays off
 DRAFT_MIN_MB = 500  # the smallest catalog drafts (Q8_0) are about this size
 DRAFT_N_MAX = 8
+HOST_MTP_DEPTH = 2  # tokens MTP guesses ahead on a host (more rarely pays off: later guesses miss more often)
 
 
 def gguf_vocab(path: str) -> Optional[dict]:
