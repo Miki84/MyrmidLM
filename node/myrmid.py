@@ -5224,7 +5224,20 @@ HOST_LAYOUTS = ("split", "per_gpu", "groups")
 HOST_EMBED = CONFIG_DIR / "host-embed.json"  # the host's embedding model and its device
 EMBED_PORT = HOST_INTERNAL_PORT + 90  # its llama-server on 127.0.0.1; the API port forwards /embed/... to it
 EMBED_MODELS = {"bge-m3": "gpustack/bge-m3-GGUF:Q8_0"}  # short names in the dashboard -> Hugging Face
-EMBED_CPU_THREADS = 4  # on the CPU: leave the rest to the big model (MoE experts in RAM)  # one model over all GPUs, one per GPU, or one per group of GPUs
+EMBED_CPU_THREADS = 4  # on the CPU: leave the rest to the big model (MoE experts in RAM)
+HOST_IMAGE = CONFIG_DIR / "host-image.json"  # the host's image model (stable-diffusion.cpp) and its device
+IMAGE_PORT = HOST_INTERNAL_PORT + 91  # its sd-server on 127.0.0.1; the API port forwards /image/... to it
+IMAGE_CPU_THREADS = 8
+SDCPP_DIR = CACHE_DIR / "sdcpp"  # sd.cpp source and build (build-sdcpp.sh)
+IMAGE_MODELS = {  # short names in the dashboard -> one checkpoint file (Hugging Face) and good defaults
+    "sd15": {"label": "SD 1.5", "steps": 20, "cfg": 7.0, "file": "v1-5-pruned-emaonly-fp16.safetensors",
+             "url": "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/"
+                    "v1-5-pruned-emaonly-fp16.safetensors"},
+    "sd-turbo": {"label": "SD Turbo", "steps": 4, "cfg": 1.0, "file": "sd_turbo.safetensors",
+                 "url": "https://huggingface.co/stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors"},
+    "sdxl-turbo": {"label": "SDXL Turbo", "steps": 4, "cfg": 1.0, "file": "sd_xl_turbo_1.0_fp16.safetensors",
+                   "url": "https://huggingface.co/stabilityai/sdxl-turbo/resolve/main/sd_xl_turbo_1.0_fp16.safetensors"},
+}  # one model over all GPUs, one per GPU, or one per group of GPUs
 
 
 PAIRED_KEY = CONFIG_DIR / "cluster_key"  # the key a master gave this PC (pairing)
@@ -6248,6 +6261,7 @@ class HostAgent:
             st["layout_owner"] = bool(node.agents) and node.agents[0] is self
             if st["layout_owner"]:
                 st["embed"] = node.embed.status()
+                st["image"] = node.image.status()
         return st
 
     # Commands ------------------------------------------------------------------
@@ -7097,6 +7111,231 @@ class EmbedService:
             time.sleep(min(300, 10 * fails))
 
 
+class ImageService:
+    """The host's image model: stable-diffusion.cpp's sd-server next to the
+    big model, on the CPU or on a GPU kept for it (RESERVED_GPUS), like the
+    embedding model. MyrmidLM builds sd-server once (build-sdcpp.sh, CUDA,
+    Vulkan or CPU) and loads the checkpoint once. The host's API port passes
+    /image/... to it (with the cluster key), the router /v1/images/..."""
+
+    def __init__(self, args, key: str, all_gpus: list):
+        import threading
+
+        self.args, self.key, self.all_gpus = args, key, all_gpus
+        self.models_dir = Path(args.models_dir).expanduser() / "images"
+        self.lock = threading.RLock()
+        self.conf = self.load()
+        if self.conf["device"] != "cpu" and self.conf["device"] not in {g.name for g in all_gpus}:
+            log(f"Bilder: GPU {self.conf['device']} gibt es nicht mehr, laufen auf der CPU")
+            self.conf["device"] = "cpu"
+        self.state, self.error, self.progress = ("off" if not self.conf["model"] else "idle"), "", ""
+        self.proc: Optional[subprocess.Popen] = None
+        self.tail: list = []
+        self.job = 0
+
+    @staticmethod
+    def load() -> dict:
+        try:
+            d = json.loads(HOST_IMAGE.read_text())
+            return {"model": str(d.get("model") or ""), "device": str(d.get("device") or "cpu")}
+        except (OSError, ValueError, AttributeError):
+            return {"model": "", "device": "cpu"}
+
+    @staticmethod
+    def reserved_for(conf: dict) -> set:
+        return {conf["device"]} if conf.get("model") and conf.get("device", "cpu") != "cpu" else set()
+
+    def reserved(self) -> set:
+        return self.reserved_for(self.conf)
+
+    def binary(self) -> Path:
+        return SDCPP_DIR / "build" / "bin" / "sd-server"
+
+    def built_backend(self) -> str:
+        try:
+            return (SDCPP_DIR / "backend").read_text().strip()
+        except OSError:
+            return ""
+
+    def _set(self, state: str, error: str = "", progress: str = "") -> None:
+        with self.lock:
+            self.state, self.error, self.progress = state, error, progress
+        if state != "downloading" or not progress:
+            log(f"Bilder: {state}{': ' + error if error else ''}")
+
+    def status(self) -> dict:
+        with self.lock:
+            return {"model": self.conf["model"], "device": self.conf["device"], "state": self.state,
+                    "error": self.error, "progress": self.progress, "backend": self.built_backend() or None,
+                    "models": {k: v["label"] for k, v in IMAGE_MODELS.items()},
+                    "devices": [{"name": "cpu", "description": f"CPU ({IMAGE_CPU_THREADS} Threads)"}]
+                    + [{"name": g.name, "description": g.description, "total_mb": g.total_mb} for g in self.all_gpus]}
+
+    def set(self, body: dict) -> dict:
+        model = str(body.get("model") or "").strip()
+        device = str(body.get("device") or "cpu").strip()
+        if device != "cpu" and device not in {g.name for g in self.all_gpus}:
+            return {"ok": False, "error": f"unbekanntes Gerät: {device}"}
+        if model and model not in IMAGE_MODELS:
+            return {"ok": False, "error": f"Modell: {', '.join(IMAGE_MODELS)}"}
+        old = self.reserved()
+        with self.lock:
+            self.conf = {"model": model, "device": device}
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            HOST_IMAGE.write_text(json.dumps(self.conf))
+        except OSError as e:
+            log(f"Bilder: could not save ({e})")
+        log(f"Bilder: {model or 'aus'}" + (f" auf {device}" if model else ""))
+        self.restart()
+        return {"ok": True, "reserve_changed": old != self.reserved(), **self.status()}
+
+    def restart(self) -> None:
+        import threading
+
+        self.stop()
+        if not self.conf["model"]:
+            self._set("off")
+            return
+        threading.Thread(target=self._run, args=(self.job,), daemon=True).start()
+
+    def stop(self) -> None:
+        with self.lock:
+            self.job += 1
+            proc, self.proc = self.proc, None
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def _build(self, job: int) -> bool:
+        script = PREFIX / "src" / "node" / "build-sdcpp.sh"
+        if not script.exists():
+            script = Path(__file__).resolve().parent / "build-sdcpp.sh"
+        envp = dict(os.environ)
+        try:
+            cb = read_conf().get("CUDA_BIN")
+            if cb:
+                envp["PATH"] = f"{cb}:{envp.get('PATH', '')}"
+        except Exception:  # noqa: BLE001 - not installed (dev): /usr/local/cuda as usual
+            pass
+        logf = SDCPP_DIR.parent / "sdcpp-build.log"
+        SDCPP_DIR.mkdir(parents=True, exist_ok=True)
+        self._set("building", progress="stable-diffusion.cpp wird gebaut (einmalig, mit CUDA 10 bis 30 Minuten)")
+        with open(logf, "w") as lf:
+            p = subprocess.Popen(["nice", "-n", "15", "bash", str(script), "--dest", str(SDCPP_DIR)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envp)
+            with self.lock:
+                self.proc = p
+            for line in p.stdout:
+                lf.write(line)
+                lf.flush()
+                if line.startswith("==>"):
+                    self.progress = line[4:].strip()
+                elif re.match(r"^\[\s*\d+%\]", line):
+                    self.progress = "Baue " + line.split("]")[0].strip("[ ") + " %"
+            rc = p.wait()
+        if job != self.job:
+            return False
+        if rc or not self.binary().exists():
+            self._set("error", f"Bauen fehlgeschlagen (Code {rc}), Log: {logf}")
+            return False
+        return True
+
+    def _download(self, job: int, m: dict) -> Optional[Path]:
+        import urllib.request
+
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        path = self.models_dir / m["file"]
+        if path.exists() and path.stat().st_size > 0:
+            return path
+        part = path.with_name(path.name + ".part")
+        self._set("downloading", progress=f"{m['file']} …")
+        try:
+            req = urllib.request.Request(m["url"], headers={"User-Agent": "MyrmidLM"})
+            with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
+                total, done, last = int(r.headers.get("Content-Length") or 0), 0, 0.0
+                while job == self.job:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if time.time() - last > 2:
+                        last = time.time()
+                        self.progress = (f"{m['file']}: {done / 2**30:.1f} von {total / 2**30:.1f} GB"
+                                         if total else f"{m['file']}: {done / 2**30:.1f} GB")
+            if job != self.job:
+                return None
+            part.rename(path)
+            return path
+        except Exception as e:  # noqa: BLE001 - shown on the host card
+            if job == self.job:
+                self._set("error", f"Download: {e}"[:300])
+            return None
+
+    def _run(self, job: int) -> None:
+        import threading
+        import urllib.request
+
+        conf = dict(self.conf)
+        m = IMAGE_MODELS[conf["model"]]
+        if not self.binary().exists() and not self._build(job):
+            return
+        if conf["device"] != "cpu" and self.built_backend() == "cpu":
+            self._set("error", "sd-server wurde ohne GPU gebaut (kein CUDA-Toolkit/Vulkan gefunden): "
+                               "Gerät auf CPU stellen oder Toolkit installieren und neu bauen")
+            return
+        path = self._download(job, m)
+        if not path or job != self.job:
+            return
+        fails = 0
+        while job == self.job:
+            cmd = [str(self.binary()), "--listen-ip", "127.0.0.1", "--listen-port", str(IMAGE_PORT),
+                   "--model-dir", str(self.models_dir), "-m", str(path),
+                   "--steps", str(m["steps"]), "--cfg-scale", str(m["cfg"])]
+            envp = dict(os.environ)
+            if conf["device"] == "cpu":
+                cmd += ["-t", str(IMAGE_CPU_THREADS)]
+                envp.update(CUDA_VISIBLE_DEVICES="", GGML_VK_VISIBLE_DEVICES="")
+            else:
+                idx = re.sub(r"\D", "", conf["device"]) or "0"
+                envp.update(CUDA_VISIBLE_DEVICES=idx, SD_VK_DEVICE=idx)
+            self._set("starting")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envp)
+            with self.lock:
+                if job != self.job:
+                    proc.terminate()
+                    return
+                self.proc, self.tail = proc, []
+
+            def read(p=proc) -> None:
+                for line in p.stdout:
+                    self.tail = (self.tail + [line.rstrip()])[-40:]
+            threading.Thread(target=read, daemon=True).start()
+            for _ in range(300):
+                if proc.poll() is not None or job != self.job:
+                    break
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{IMAGE_PORT}/v1/models", timeout=2) as r:
+                        if r.status == 200:
+                            self._set("ready")
+                            fails = 0
+                            break
+                except Exception:  # noqa: BLE001 - still loading
+                    pass
+                time.sleep(1)
+            proc.wait()
+            if job != self.job:
+                return
+            fails += 1
+            why = next((t for t in reversed(self.tail) if "error" in t.lower()), self.tail[-1] if self.tail else "")
+            self._set("error", f"sd-server beendet (Code {proc.returncode}){': ' + why[:200] if why else ''}")
+            time.sleep(min(300, 10 * fails))
+
+
 class HostNode:
     """The host on one PC: one HostAgent over all GPUs (layout "split"), or
     one per dedicated GPU ("per_gpu"), switched from the master's dashboard.
@@ -7113,10 +7352,11 @@ class HostNode:
         # the embedding model first: a GPU it keeps is not for the big models
         self.embed = EmbedService(args, key, [d for d in usable_gpus(self.devices, include_reserved=True)
                                               if d.type == "gpu"])
+        self.image = ImageService(args, key, self.embed.all_gpus)
         RESERVED_GPUS.clear()
-        RESERVED_GPUS.update(self.embed.reserved())
+        RESERVED_GPUS.update(self.embed.reserved() | self.image.reserved())
         if RESERVED_GPUS:
-            log(f"Host: {', '.join(sorted(RESERVED_GPUS))} bleibt dem Embedding-Modell vorbehalten")
+            log(f"Host: {', '.join(sorted(RESERVED_GPUS))} bleibt Embeddings/Bildern vorbehalten")
         self.gpus = [d for d in usable_gpus(self.devices) if d.type == "gpu"]
         self.stats = SystemStats(self.devices)
         self.get_routes: dict = {}
@@ -7173,8 +7413,9 @@ class HostNode:
                 posts.update({f"{prefix}/assign": a.assign, f"{prefix}/unload": a.unload, f"{prefix}/tune": a.tune,
                               f"{prefix}/sleep": a.sleep, f"{prefix}/strata": a.strata})
         posts.update({"/layout": self.set_layout, "/role": lambda body: request_role(str(body.get("role") or "")),
-                      "/update": request_update, "/embed": self.set_embed})
+                      "/update": request_update, "/embed": self.set_embed, "/image": self.set_image})
         gets["/embed"] = self.embed.status
+        gets["/image"] = self.image.status
         # the handler holds these dicts: change them in place
         self.get_routes.clear()
         self.get_routes.update(gets)
@@ -7193,15 +7434,25 @@ class HostNode:
         threading.Thread(target=self.watch_resume, daemon=True).start()
         if self.embed.conf["model"]:
             self.embed.restart()
+        if self.image.conf["model"]:
+            self.image.restart()
 
     def set_embed(self, body: dict) -> dict:
-        """Embedding model on/off and its device (dashboard). A GPU it gets
-        (or gives back) changes what the big models may use: they reload."""
+        """Embedding model on/off and its device (dashboard)."""
+        return self._set_side(self.embed, body)
+
+    def set_image(self, body: dict) -> dict:
+        """Image model on/off and its device (dashboard)."""
+        return self._set_side(self.image, body)
+
+    def _set_side(self, service, body: dict) -> dict:
+        """A side model (embeddings, images) on/off and its device. A GPU it
+        gets (or gives back) changes what the big models may use: they reload."""
         import threading
 
         if self.switching:
             return {"ok": False, "error": "a switch is running"}
-        res = self.embed.set(body)
+        res = service.set(body)
         if not res.get("ok") or not res.get("reserve_changed"):
             return res
         self.switching = True
@@ -7214,7 +7465,7 @@ class HostNode:
                     a.close()
                 with self.lock:
                     RESERVED_GPUS.clear()
-                    RESERVED_GPUS.update(self.embed.reserved())
+                    RESERVED_GPUS.update(self.embed.reserved() | self.image.reserved())
                     self.gpus = [d for d in usable_gpus(probe(bench=False)) if d.type == "gpu"]
                     if (self.layout in ("per_gpu", "groups") and len(self.gpus) < 2) or \
                             (self.layout == "groups" and self.check_groups(self.groups)):
@@ -7227,7 +7478,7 @@ class HostNode:
                     self.agents = self._make()
                     self._set_routes()
                 log(f"Host: big models on {', '.join(g.name for g in self.gpus) or 'CPU'}"
-                    + (f", embeddings on {', '.join(sorted(RESERVED_GPUS))}" if RESERVED_GPUS else ""))
+                    + (f", embeddings/images on {', '.join(sorted(RESERVED_GPUS))}" if RESERVED_GPUS else ""))
                 for i, a in enumerate(self.agents):
                     threading.Thread(target=a.watch, daemon=True).start()
                     a.restore(inherit=first if i == 0 else None)
@@ -7326,6 +7577,8 @@ class HostNode:
         """The llama-server for a request on the API port, and the path for it."""
         if path == "/embed" or path.startswith("/embed/"):
             return (EMBED_PORT if self.embed.state == "ready" else None), path[len("/embed"):] or "/"
+        if path == "/image" or path.startswith("/image/"):
+            return (IMAGE_PORT if self.image.state == "ready" else None), path[len("/image"):] or "/"
         agents = self.agents
         for a in agents:
             if a.path and (path == a.path or path.startswith(a.path + "/")):
@@ -7338,6 +7591,7 @@ class HostNode:
         for a in self.agents:
             a.close()
         self.embed.stop()
+        self.image.stop()
 
 
 def _host_wait_for_master(args) -> None:
@@ -7378,6 +7632,12 @@ def _host_wait_for_master(args) -> None:
     srv.server_close()
 
 
+def hmac_eq(a: str, b: str) -> bool:
+    import hmac
+
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
 def _host_proxy_handler(node: HostNode):
     """The host's API port: passes each request to the llama-server it is for
     (streaming, like the router), so per-GPU models need no extra ports."""
@@ -7391,6 +7651,15 @@ def _host_proxy_handler(node: HostNode):
             pass
 
         def _pass(self, method: str) -> None:
+            if self.path.startswith("/image") and not hmac_eq(self.headers.get("Authorization") or "",
+                                                               f"Bearer {node.key}"):
+                body = b'{"error":{"message":"invalid api key"}}'
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             port, path = node.backend_port(self.path)
             n = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(n) if n else None
@@ -7770,6 +8039,8 @@ class Router:
         self.backends = list(backends)
         self.embedders: list[dict] = []  # hosts with an embedding model: base URL, key, where
         self.embed_next = 0
+        self.imagers: list[dict] = []  # hosts with an image model (sd-server)
+        self.image_next = 0
         self.fast_ctx = fast_ctx
         self.enabled, self.mode = enabled, mode
         self.public_name, self.key = public_name, key
@@ -7826,6 +8097,17 @@ class Router:
     def set_embedders(self, embedders: list[dict]) -> None:
         with self.lock:
             self.embedders = list(embedders)
+
+    def set_imagers(self, imagers: list[dict]) -> None:
+        with self.lock:
+            self.imagers = list(imagers)
+
+    def pick_imager(self) -> Optional[dict]:
+        with self.lock:
+            if not self.imagers:
+                return None
+            self.image_next = (self.image_next + 1) % len(self.imagers)
+            return self.imagers[self.image_next]
 
     def pick_embedder(self) -> Optional[dict]:
         with self.lock:
@@ -8499,6 +8781,9 @@ class Router:
                     pass
                 if path.rstrip("/") in ("/v1/embeddings", "/embeddings"):
                     return self._embed(raw)
+                if path.rstrip("/") in ("/v1/images/generations", "/v1/images/edits",
+                                        "/images/generations", "/images/edits"):
+                    return self._image(raw, "/v1/images/" + path.rstrip("/").rsplit("/", 1)[-1])
                 if path.rstrip("/") in ("/v1/chat/completions", "/chat/completions", "/v1/completions",
                                         "/completions", "/completion") and isinstance(body, dict):
                     t_decide = time.time()
@@ -8539,6 +8824,39 @@ class Router:
                     backend = woke
                 self.decide_ms = decide_ms
                 self._forward(backend, "POST", raw, reason)
+
+            def _image(self, raw: bytes, sub: str) -> None:
+                """/v1/images/...: to a host's image model (sd-server), round robin."""
+                tried = 0
+                while True:
+                    e = router.pick_imager()
+                    if not e:
+                        return self._json(503, {"error": {
+                            "message": "Kein Bildmodell im Cluster. Im MyrmidLM-Dashboard bei einem Host unter "
+                                       "„Bilder“ einschalten (z. B. SD 1.5).",
+                            "type": "server_error", "code": "no_image_model"}})
+                    u = urlsplit(e["base"])
+                    conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=900)
+                    try:
+                        conn.request("POST", u.path.rstrip("/") + sub, body=raw, headers={
+                            "Content-Type": self.headers.get("Content-Type") or "application/json",
+                            **({"Authorization": f"Bearer {e['key']}"} if e.get("key") else {})})
+                        resp = conn.getresponse()
+                        data = resp.read()
+                    except OSError as err:
+                        tried += 1
+                        if tried < len(router.imagers):
+                            continue
+                        return self._json(502, {"error": {"message": f"Bildmodell auf {e['where']} nicht "
+                                                                     f"erreichbar: {err}", "type": "server_error"}})
+                    finally:
+                        conn.close()
+                    self.send_response(resp.status)
+                    self.send_header("Content-Type", resp.getheader("Content-Type") or "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
 
             def _embed(self, raw: bytes) -> None:
                 """/v1/embeddings: to a host's embedding model (round robin), not to a chat model."""
@@ -9032,8 +9350,16 @@ class HostManager:
                 if em.get("state") == "ready" and not h.get("asleep") and not h.get("error") and not self.in_maint(hid):
                     embedders.append({"base": f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}/embed",
                                       "key": self.key, "where": h["name"], "model": em.get("model")})
+            imagers = []
+            for hid, h in self.hosts.items():
+                st = h.get("status") or {}
+                im = st.get("image") or {}
+                if im.get("state") == "ready" and not h.get("asleep") and not h.get("error") and not self.in_maint(hid):
+                    imagers.append({"base": f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}/image",
+                                    "key": self.key, "where": h["name"], "model": im.get("model")})
         self.router.set_hosts(backends)
         self.router.set_embedders(embedders)
+        self.router.set_imagers(imagers)
 
     # Sleep and wake ------------------------------------------------------------
 
@@ -9198,17 +9524,19 @@ class HostManager:
             self.save()
             self.rescan, self.last_scan = True, 0
             return self.info()
-        if "embed" in body:
-            h = dict(self.hosts[hid], path="")  # the PC's first host answers for the embedding model
-            em = body.get("embed") or {}
+        for kind, label in (("embed", "Embeddings"), ("image", "Bilder")):
+            if kind not in body:
+                continue
+            h = dict(self.hosts[hid], path="")  # the PC's first host answers for its side models
+            em = body.get(kind) or {}
             try:
-                res = self._call(h, "/embed", {"model": str(em.get("model") or ""),
-                                               "device": str(em.get("device") or "cpu")}, timeout=15)
+                res = self._call(h, "/" + kind, {"model": str(em.get("model") or ""),
+                                                 "device": str(em.get("device") or "cpu")}, timeout=15)
             except Exception as e:  # noqa: BLE001
-                return {**self.info(), "error": f"Embeddings: {e}"}
+                return {**self.info(), "error": f"{label}: {e}"}
             if not res.get("ok"):
-                return {**self.info(), "error": res.get("error") or "Embeddings: fehlgeschlagen"}
-            log(f"Host {h['name']}: embeddings {em.get('model') or 'aus'} ({em.get('device') or 'cpu'})")
+                return {**self.info(), "error": res.get("error") or f"{label}: fehlgeschlagen"}
+            log(f"Host {h['name']}: {label} {em.get('model') or 'aus'} ({em.get('device') or 'cpu'})")
             if res.get("reserve_changed"):
                 self.rescan, self.last_scan = True, 0
             return self.info()
@@ -9271,7 +9599,7 @@ class HostManager:
                                                        "estimate_tps", "progress", "models", "stats", "layout",
                                                        "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned", "groups", "group", "nv_index",
                                                        "note", "snapshots", "rollback", "engine", "strata", "strata_install", "spec_info",
-                                                       "embed")},
+                                                       "embed", "image")},
                               "busy": (st.get("metrics") or {}).get("requests_processing")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]

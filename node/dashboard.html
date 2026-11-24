@@ -1683,6 +1683,16 @@ function renderHosts(s) {
         <button class="btn quiet small" type="button" data-hembed>Übernehmen</button>
         <span class="note"><span class="dot ${em.state === "ready" ? "ok" : em.state === "error" ? "bad" : em.state === "off" ? "" : "busy"}"></span> ${esc(EM_STATE[em.state] || em.state)}${em.state === "ready" && em.device !== "cpu" ? ` · ${esc(em.device)} nur für Embeddings` : ""}</span></div>
       ${em.error ? `<div class="note bad">${esc(em.error)}</div>` : ""}`;
+    const im = x.image;
+    const IM_STATE = { off: "aus", idle: "wartet", building: "baut sd-server …", downloading: "lädt das Modell …", starting: "startet …", ready: "bereit", error: "Fehler" };
+    const imModel = e.image_model ?? (im ? im.model : ""), imDev = e.image_device ?? (im ? im.device : "cpu");
+    const imageRow = !im || x.asleep ? "" : `<div class="kv embed-row" title="Ein Bildmodell (stable-diffusion.cpp) für Open WebUI/Formica. Der Master bietet es als /v1/images/generations an.">
+        <label>Bilder<select name="image_model"><option value=""${!imModel ? " selected" : ""}>aus</option>${Object.entries(im.models || {}).map(([k, l]) => `<option value="${esc(k)}"${k === imModel ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
+        <label>auf<select name="image_device">${(im.devices || []).map((d) => `<option value="${esc(d.name)}"${d.name === imDev ? " selected" : ""}>${esc(d.name === "cpu" ? d.description : d.name + " " + d.description)}</option>`).join("")}</select></label>
+        <button class="btn quiet small" type="button" data-himage>Übernehmen</button>
+        <span class="note"><span class="dot ${im.state === "ready" ? "ok" : im.state === "error" ? "bad" : im.state === "off" ? "" : "busy"}"></span> ${esc(IM_STATE[im.state] || im.state)}${im.state === "ready" && im.backend ? ` · ${esc(im.backend.toUpperCase())}` : ""}${im.state === "ready" && im.device !== "cpu" ? ` · ${esc(im.device)} nur für Bilder` : ""}</span></div>
+      ${im.progress && im.state !== "ready" && im.state !== "off" ? `<div class="note">${esc(im.progress)}</div>` : ""}
+      ${im.error ? `<div class="note bad">${esc(im.error)}</div>` : ""}`;
     const roleRow = x.switchable && !x.asleep
       ? `<div class="role-row"><span class="muted">Rolle: Host</span><button class="btn quiet small" type="button" data-role-ctl="${esc(x.addr)}" data-role="worker">Zum Worker machen</button></div>`
       : "";
@@ -1698,7 +1708,7 @@ function renderHosts(s) {
     return `<article class="host" data-id="${esc(x.id)}">
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${x.gpu ? " · " + esc(x.gpu) : gpus ? " · " + gpus : ""}</div></div>
         <div class="pills">${x.online === undefined ? "" : `<div class="pill net ${x.online ? "on" : x.slow ? "slow" : "off"}" title="${x.online ? "Antwortet dem Master" : x.slow ? "Hat zuletzt nicht geantwortet (lädt oder ist ausgelastet?)" : x.asleep ? "Schläft oder ist aus: wird bei Bedarf per Wake-on-LAN geweckt" : "Antwortet nicht"}${x.seen_ago != null ? ` · zuletzt gesehen vor ${x.seen_ago < 120 ? x.seen_ago + " s" : Math.round(x.seen_ago / 60) + " min"}` : ""}">${x.online ? "online" : x.slow ? "antwortet langsam" : "offline"}</div>`}<div class="pill" title="Was das Modell gerade tut"><span class="dot ${cls}"></span><span>${txt}</span></div></div></div>
-      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${x.note ? `<div class="note">${esc(x.note)}</div>` : ""}${hostStats(x)}${layoutRow}${embedRow}${sleepRow}${maintRow}${roleRow}
+      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${x.note ? `<div class="note">${esc(x.note)}</div>` : ""}${hostStats(x)}${layoutRow}${embedRow}${imageRow}${sleepRow}${maintRow}${roleRow}
       ${x.spec_info && x.spec_info.text && x.engine !== "strata" ? `<div class="note">Vorausraten: ${esc(x.spec_info.text)}</div>` : ""}
       ${strataRow}${strataInstallRow}
       ${x.engine !== "strata" && (x.state === "ready" || x.state === "tuning" || x.tuned || x.tune_job) ? `<div class="kv"><span class="note">${esc(tuneText(x.tune_job, x.tuned) || "Autotune: misst die schnellsten Einstellungen für dieses Modell auf diesem PC.")}</span>${
@@ -1820,6 +1830,20 @@ $("hosts").addEventListener("click", (ev) => {
       : `${gpuBefore} wird wieder frei. Das große Modell dieses PCs lädt dafür neu und nutzt sie wieder.`)) return;
     if (hostEdits[id]) { delete hostEdits[id].embed_model; delete hostEdits[id].embed_device; }
     ev.target.disabled = true; hostAction({ host: id, embed: { model, device } });
+  }
+  if (ev.target.matches("[data-himage]")) {
+    const id = card.dataset.id;
+    const x = (last && ((last.hosts || {}).hosts || []).find((h) => h.id === id)) || {};
+    const model = (card.querySelector('[name="image_model"]') || {}).value || "";
+    const device = (card.querySelector('[name="image_device"]') || {}).value || "cpu";
+    const old = x.image || {};
+    const gpuBefore = old.model && old.device !== "cpu" ? old.device : "", gpuAfter = model && device !== "cpu" ? device : "";
+    if (gpuBefore !== gpuAfter && !confirm(gpuAfter
+      ? `${gpuAfter} wird nur noch für das Bildmodell genutzt. Das große Modell dieses PCs lädt dafür neu, ohne diese GPU.`
+      : `${gpuBefore} wird wieder frei. Das große Modell dieses PCs lädt dafür neu und nutzt sie wieder.`)) return;
+    if (model && !old.backend && !confirm("Beim ersten Einschalten baut dieser PC stable-diffusion.cpp (sd-server). Mit CUDA dauert das 10 bis 30 Minuten, danach wird das Modell geladen (2 bis 7 GB). Weiter?")) return;
+    if (hostEdits[id]) { delete hostEdits[id].image_model; delete hostEdits[id].image_device; }
+    ev.target.disabled = true; hostAction({ host: id, image: { model, device } });
   }
   if (ev.target.matches("[data-hmaint]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, maintenance: ev.target.dataset.hmaint === "on" }); }
   if (ev.target.matches("[data-hwake]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, wake: true }); }
