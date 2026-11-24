@@ -1794,6 +1794,7 @@ def cmd_serve(args) -> None:
         b = router.local_big
         b.label = b.group = sp_new.name
     sup.on_new_model = new_model
+    router.port = public_port
     if not router.start(public_host, public_port):
         sup.stop_server()
         die(f"Port {public_port} is busy.")
@@ -5225,19 +5226,90 @@ HOST_EMBED = CONFIG_DIR / "host-embed.json"  # the host's embedding model and it
 EMBED_PORT = HOST_INTERNAL_PORT + 90  # its llama-server on 127.0.0.1; the API port forwards /embed/... to it
 EMBED_MODELS = {"bge-m3": "gpustack/bge-m3-GGUF:Q8_0"}  # short names in the dashboard -> Hugging Face
 EMBED_CPU_THREADS = 4  # on the CPU: leave the rest to the big model (MoE experts in RAM)
-HOST_IMAGE = CONFIG_DIR / "host-image.json"  # the host's image model (stable-diffusion.cpp) and its device
-IMAGE_PORT = HOST_INTERNAL_PORT + 91  # its sd-server on 127.0.0.1; the API port forwards /image/... to it
+HOST_IMAGE = CONFIG_DIR / "host-image.json"  # the host's image engine, model and device
+IMAGE_PORT = HOST_INTERNAL_PORT + 91  # sd-server on 127.0.0.1; the API port forwards /image/... to it
+COMFY_PORT = HOST_INTERNAL_PORT + 92  # ComfyUI on 127.0.0.1; the API port forwards /comfy/... to it
 IMAGE_CPU_THREADS = 8
 SDCPP_DIR = CACHE_DIR / "sdcpp"  # sd.cpp source and build (build-sdcpp.sh)
-IMAGE_MODELS = {  # short names in the dashboard -> one checkpoint file (Hugging Face) and good defaults
-    "sd15": {"label": "SD 1.5", "steps": 20, "cfg": 7.0, "file": "v1-5-pruned-emaonly-fp16.safetensors",
-             "url": "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/"
-                    "v1-5-pruned-emaonly-fp16.safetensors"},
-    "sd-turbo": {"label": "SD Turbo", "steps": 4, "cfg": 1.0, "file": "sd_turbo.safetensors",
-                 "url": "https://huggingface.co/stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors"},
-    "sdxl-turbo": {"label": "SDXL Turbo", "steps": 4, "cfg": 1.0, "file": "sd_xl_turbo_1.0_fp16.safetensors",
-                   "url": "https://huggingface.co/stabilityai/sdxl-turbo/resolve/main/sd_xl_turbo_1.0_fp16.safetensors"},
-}  # one model over all GPUs, one per GPU, or one per group of GPUs
+COMFY_DIR = CACHE_DIR / "comfyui"  # ComfyUI source and venv (build-comfyui.sh)
+IMAGE_ENGINES = {"sdcpp": "stable-diffusion.cpp", "comfyui": "ComfyUI"}
+_HF = "https://huggingface.co/"
+# Image models: one entry, two engines. "sdcpp" lists the files sd-server
+# loads (role -> URL; GGUF where it saves VRAM), "comfy" the files ComfyUI
+# loads (its model folder -> URL) and how the built-in workflow uses them.
+IMAGE_MODELS = {
+    "sd15": {
+        "label": "SD 1.5", "size": "512x512", "hint": "klein und alt, läuft auch auf der CPU (2 GB)",
+        "sdcpp": {"files": {"model": _HF + "stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/"
+                                       "v1-5-pruned-emaonly-fp16.safetensors"},
+                  "steps": 20, "cfg": 7.0, "args": []},
+        "comfy": {"files": {"checkpoints": _HF + "stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/"
+                                               "v1-5-pruned-emaonly-fp16.safetensors"},
+                  "kind": "checkpoint", "latent": "EmptyLatentImage", "steps": 20, "cfg": 7.0,
+                  "sampler": "euler", "scheduler": "normal"}},
+    "sd-turbo": {
+        "label": "SD Turbo", "size": "512x512", "hint": "sehr schnell, einfache Qualität (3 GB); Lizenz prüfen",
+        "sdcpp": {"files": {"model": _HF + "stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors"},
+                  "steps": 4, "cfg": 1.0, "args": []},
+        "comfy": {"files": {"checkpoints": _HF + "stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors"},
+                  "kind": "checkpoint", "latent": "EmptyLatentImage", "steps": 4, "cfg": 1.0,
+                  "sampler": "euler_ancestral", "scheduler": "normal"}},
+    "sdxl-turbo": {
+        "label": "SDXL Turbo", "size": "512x512", "hint": "schnell, besser als SD Turbo (7 GB); Lizenz prüfen",
+        "sdcpp": {"files": {"model": _HF + "stabilityai/sdxl-turbo/resolve/main/sd_xl_turbo_1.0_fp16.safetensors"},
+                  "steps": 4, "cfg": 1.0, "args": []},
+        "comfy": {"files": {"checkpoints": _HF + "stabilityai/sdxl-turbo/resolve/main/"
+                                               "sd_xl_turbo_1.0_fp16.safetensors"},
+                  "kind": "checkpoint", "latent": "EmptyLatentImage", "steps": 4, "cfg": 1.0,
+                  "sampler": "euler_ancestral", "scheduler": "normal"}},
+    "z-image-turbo": {
+        "label": "Z-Image Turbo", "size": "1024x1024",
+        "hint": "aktuell, sehr gut, auch Text im Bild; GPU ab 8 GB (sd.cpp 8 GB, ComfyUI 21 GB Download); Apache 2.0",
+        "sdcpp": {"files": {"diffusion": _HF + "jayn7/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q4_K_M.gguf",
+                            "vae": _HF + "Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors",
+                            "llm": _HF + "unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/"
+                                         "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"},
+                  "steps": 8, "cfg": 1.0, "args": ["--diffusion-fa"]},
+        "comfy": {"files": {"diffusion_models": _HF + "Comfy-Org/z_image_turbo/resolve/main/split_files/"
+                                                    "diffusion_models/z_image_turbo_bf16.safetensors",
+                            "text_encoders": _HF + "Comfy-Org/z_image_turbo/resolve/main/split_files/"
+                                                 "text_encoders/qwen_3_4b.safetensors",
+                            "vae": _HF + "Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors"},
+                  "kind": "unet", "clip_type": "lumina2", "weight_dtype": "fp8_e4m3fn", "shift": 3.0,
+                  "steps": 9, "cfg": 1.0, "sampler": "res_multistep", "scheduler": "simple"}},
+    "flux-schnell": {
+        "label": "FLUX.1 schnell", "size": "1024x1024",
+        "hint": "sehr gut, 4 Schritte; GPU ab 12 GB (8 GB langsamer), 11 bis 17 GB Download; Apache 2.0",
+        "sdcpp": {"files": {"diffusion": _HF + "second-state/FLUX.1-schnell-GGUF/resolve/main/flux1-schnell-Q4_0.gguf",
+                            "vae": _HF + "second-state/FLUX.1-schnell-GGUF/resolve/main/ae.safetensors",
+                            "clip_l": _HF + "second-state/FLUX.1-schnell-GGUF/resolve/main/clip_l.safetensors",
+                            "t5xxl": _HF + "second-state/FLUX.1-schnell-GGUF/resolve/main/t5xxl-Q8_0.gguf"},
+                  "steps": 4, "cfg": 1.0, "args": ["--diffusion-fa", "--clip-on-cpu", "--sampling-method", "euler"]},
+        "comfy": {"files": {"checkpoints": _HF + "Comfy-Org/flux1-schnell/resolve/main/flux1-schnell-fp8.safetensors"},
+                  "kind": "checkpoint", "latent": "EmptySD3LatentImage", "steps": 4, "cfg": 1.0,
+                  "sampler": "euler", "scheduler": "simple"}},
+    "qwen-image": {
+        "label": "Qwen-Image", "size": "1024x1024",
+        "hint": "beste Qualität und Schrift, 20 Schritte; GPU ab 24 GB (kleiner mit Auslagerung, langsam), "
+                "18 bis 30 GB Download; Apache 2.0",
+        "sdcpp": {"files": {"diffusion": _HF + "QuantStack/Qwen-Image-GGUF/resolve/main/Qwen_Image-Q4_K_M.gguf",
+                            "vae": _HF + "Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/"
+                                         "qwen_image_vae.safetensors",
+                            "llm": _HF + "second-state/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/"
+                                         "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"},
+                  "steps": 20, "cfg": 2.5,
+                  "args": ["--diffusion-fa", "--offload-to-cpu", "--flow-shift", "3", "--sampling-method", "euler"]},
+        "comfy": {"files": {"diffusion_models": _HF + "Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/"
+                                                    "diffusion_models/qwen_image_fp8_e4m3fn.safetensors",
+                            "text_encoders": _HF + "Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/"
+                                                 "text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                            "vae": _HF + "Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/"
+                                       "qwen_image_vae.safetensors"},
+                  "kind": "unet", "clip_type": "qwen_image", "weight_dtype": "default", "shift": 3.1,
+                  "steps": 20, "cfg": 2.5, "sampler": "euler", "scheduler": "simple"}},
+}
+SDCPP_FLAGS = {"model": "-m", "diffusion": "--diffusion-model", "vae": "--vae", "llm": "--llm",
+               "clip_l": "--clip_l", "t5xxl": "--t5xxl"}
 
 
 PAIRED_KEY = CONFIG_DIR / "cluster_key"  # the key a master gave this PC (pairing)
@@ -7111,18 +7183,65 @@ class EmbedService:
             time.sleep(min(300, 10 * fails))
 
 
+def comfy_workflow(model: str, prompt: str = "", width: int = 0, height: int = 0, n: int = 1,
+                   seed: int = 0, negative: str = "") -> dict:
+    """The built-in ComfyUI workflow (API format) for one of IMAGE_MODELS.
+    Node ids are fixed, so comfy_nodes() can map them for Open WebUI:
+    2 prompt, 3 negative prompt, 4 size and count, 5 sampler, 7 save."""
+    import random
+
+    p = IMAGE_MODELS[model]
+    c = p["comfy"]
+    dw, dh = (int(x) for x in p["size"].split("x"))
+    name = lambda folder: c["files"][folder].rsplit("/", 1)[-1]  # noqa: E731
+    wf: dict = {}
+    if c["kind"] == "checkpoint":
+        wf["1"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": name("checkpoints")}}
+        model_ref, clip_ref, vae_ref = ["1", 0], ["1", 1], ["1", 2]
+    else:
+        wf["1"] = {"class_type": "UNETLoader", "inputs": {"unet_name": name("diffusion_models"),
+                                                           "weight_dtype": c.get("weight_dtype", "default")}}
+        wf["8"] = {"class_type": "CLIPLoader", "inputs": {"clip_name": name("text_encoders"),
+                                                           "type": c["clip_type"], "device": "default"}}
+        wf["9"] = {"class_type": "VAELoader", "inputs": {"vae_name": name("vae")}}
+        wf["10"] = {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": c["shift"]}}
+        model_ref, clip_ref, vae_ref = ["10", 0], ["8", 0], ["9", 0]
+    wf["2"] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": clip_ref}}
+    wf["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": clip_ref}}
+    wf["4"] = {"class_type": c.get("latent", "EmptySD3LatentImage"),
+               "inputs": {"width": width or dw, "height": height or dh, "batch_size": max(1, min(4, n or 1))}}
+    wf["5"] = {"class_type": "KSampler", "inputs": {
+        "model": model_ref, "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0],
+        "seed": seed or random.randint(1, 2**48), "steps": c["steps"], "cfg": c["cfg"],
+        "sampler_name": c["sampler"], "scheduler": c["scheduler"], "denoise": 1.0}}
+    wf["6"] = {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": vae_ref}}
+    wf["7"] = {"class_type": "SaveImage", "inputs": {"images": ["6", 0], "filename_prefix": "myrmid"}}
+    return wf
+
+
+def comfy_nodes() -> list:
+    """Open WebUI's node mapping (COMFYUI_WORKFLOW_NODES) for comfy_workflow()."""
+    # no "steps" and "negative_prompt": Open WebUI writes None into them when unset
+    return [{"type": "prompt", "key": "text", "node_ids": ["2"]},
+            {"type": "width", "key": "width", "node_ids": ["4"]},
+            {"type": "height", "key": "height", "node_ids": ["4"]},
+            {"type": "n", "key": "batch_size", "node_ids": ["4"]},
+            {"type": "seed", "key": "seed", "node_ids": ["5"]}]
+
+
 class ImageService:
-    """The host's image model: stable-diffusion.cpp's sd-server next to the
-    big model, on the CPU or on a GPU kept for it (RESERVED_GPUS), like the
-    embedding model. MyrmidLM builds sd-server once (build-sdcpp.sh, CUDA,
-    Vulkan or CPU) and loads the checkpoint once. The host's API port passes
-    /image/... to it (with the cluster key), the router /v1/images/..."""
+    """The host's image model next to the big model, on the CPU or on a GPU
+    kept for it (RESERVED_GPUS), like the embedding model. Two engines:
+    stable-diffusion.cpp (sd-server, small, OpenAI API) and ComfyUI (Python,
+    workflows, its own web interface). MyrmidLM builds or installs the engine
+    once and downloads the model's files once. The host's API port passes
+    /image/... (sd-server) and /comfy/... (ComfyUI) on, with the cluster key."""
 
     def __init__(self, args, key: str, all_gpus: list):
         import threading
 
         self.args, self.key, self.all_gpus = args, key, all_gpus
-        self.models_dir = Path(args.models_dir).expanduser() / "images"
+        self.models_root = Path(args.models_dir).expanduser()
         self.lock = threading.RLock()
         self.conf = self.load()
         if self.conf["device"] != "cpu" and self.conf["device"] not in {g.name for g in all_gpus}:
@@ -7137,9 +7256,15 @@ class ImageService:
     def load() -> dict:
         try:
             d = json.loads(HOST_IMAGE.read_text())
-            return {"model": str(d.get("model") or ""), "device": str(d.get("device") or "cpu")}
+            conf = {"engine": str(d.get("engine") or "sdcpp"), "model": str(d.get("model") or ""),
+                    "device": str(d.get("device") or "cpu")}
         except (OSError, ValueError, AttributeError):
-            return {"model": "", "device": "cpu"}
+            conf = {"engine": "sdcpp", "model": "", "device": "cpu"}
+        if conf["engine"] not in IMAGE_ENGINES:
+            conf["engine"] = "sdcpp"
+        if conf["model"] and conf["model"] not in IMAGE_MODELS:
+            conf["model"] = ""
+        return conf
 
     @staticmethod
     def reserved_for(conf: dict) -> set:
@@ -7148,45 +7273,64 @@ class ImageService:
     def reserved(self) -> set:
         return self.reserved_for(self.conf)
 
-    def binary(self) -> Path:
-        return SDCPP_DIR / "build" / "bin" / "sd-server"
+    @property
+    def port(self) -> int:
+        return COMFY_PORT if self.conf["engine"] == "comfyui" else IMAGE_PORT
 
-    def built_backend(self) -> str:
+    def engine_dir(self, engine: str = "") -> Path:
+        return COMFY_DIR if (engine or self.conf["engine"]) == "comfyui" else SDCPP_DIR
+
+    def installed(self, engine: str = "") -> bool:
+        if (engine or self.conf["engine"]) == "comfyui":
+            return (COMFY_DIR / "venv" / "bin" / "python").exists() and (COMFY_DIR / "src" / "main.py").exists() \
+                and (COMFY_DIR / "backend").exists()
+        return (SDCPP_DIR / "build" / "bin" / "sd-server").exists()
+
+    def built_backend(self, engine: str = "") -> str:
         try:
-            return (SDCPP_DIR / "backend").read_text().strip()
+            return (self.engine_dir(engine) / "backend").read_text().strip()
         except OSError:
             return ""
 
     def _set(self, state: str, error: str = "", progress: str = "") -> None:
         with self.lock:
             self.state, self.error, self.progress = state, error, progress
-        if state != "downloading" or not progress:
-            log(f"Bilder: {state}{': ' + error if error else ''}")
+        log(f"Bilder: {state}{': ' + error if error else ''}")
 
     def status(self) -> dict:
         with self.lock:
-            return {"model": self.conf["model"], "device": self.conf["device"], "state": self.state,
-                    "error": self.error, "progress": self.progress, "backend": self.built_backend() or None,
+            return {"engine": self.conf["engine"], "model": self.conf["model"], "device": self.conf["device"],
+                    "state": self.state, "error": self.error, "progress": self.progress,
+                    "backend": self.built_backend() or None,
+                    "installed": {e: (self.built_backend(e) or None) if self.installed(e) else None
+                                  for e in IMAGE_ENGINES},
+                    "engines": dict(IMAGE_ENGINES),
                     "models": {k: v["label"] for k, v in IMAGE_MODELS.items()},
+                    "hints": {k: v["hint"] for k, v in IMAGE_MODELS.items()},
                     "devices": [{"name": "cpu", "description": f"CPU ({IMAGE_CPU_THREADS} Threads)"}]
                     + [{"name": g.name, "description": g.description, "total_mb": g.total_mb} for g in self.all_gpus]}
 
     def set(self, body: dict) -> dict:
+        engine = str(body.get("engine") or self.conf["engine"] or "sdcpp").strip()
         model = str(body.get("model") or "").strip()
         device = str(body.get("device") or "cpu").strip()
+        if engine not in IMAGE_ENGINES:
+            return {"ok": False, "error": f"Engine: {', '.join(IMAGE_ENGINES)}"}
         if device != "cpu" and device not in {g.name for g in self.all_gpus}:
             return {"ok": False, "error": f"unbekanntes Gerät: {device}"}
         if model and model not in IMAGE_MODELS:
             return {"ok": False, "error": f"Modell: {', '.join(IMAGE_MODELS)}"}
+        if engine == "comfyui" and device != "cpu" and not device.upper().startswith("CUDA"):
+            return {"ok": False, "error": "ComfyUI nutzt nur NVIDIA-GPUs (CUDA) oder die CPU"}
         old = self.reserved()
         with self.lock:
-            self.conf = {"model": model, "device": device}
+            self.conf = {"engine": engine, "model": model, "device": device}
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             HOST_IMAGE.write_text(json.dumps(self.conf))
         except OSError as e:
             log(f"Bilder: could not save ({e})")
-        log(f"Bilder: {model or 'aus'}" + (f" auf {device}" if model else ""))
+        log(f"Bilder: {model or 'aus'}" + (f" mit {IMAGE_ENGINES[engine]} auf {device}" if model else ""))
         self.restart()
         return {"ok": True, "reserve_changed": old != self.reserved(), **self.status()}
 
@@ -7206,14 +7350,16 @@ class ImageService:
         if proc and proc.poll() is None:
             proc.terminate()
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 proc.kill()
 
-    def _build(self, job: int) -> bool:
-        script = PREFIX / "src" / "node" / "build-sdcpp.sh"
+    def _install(self, job: int, engine: str) -> bool:
+        """Builds sd-server or installs ComfyUI (once), with its script from the source tree."""
+        name = "build-comfyui.sh" if engine == "comfyui" else "build-sdcpp.sh"
+        script = PREFIX / "src" / "node" / name
         if not script.exists():
-            script = Path(__file__).resolve().parent / "build-sdcpp.sh"
+            script = Path(__file__).resolve().parent / name
         envp = dict(os.environ)
         try:
             cb = read_conf().get("CUDA_BIN")
@@ -7221,11 +7367,14 @@ class ImageService:
                 envp["PATH"] = f"{cb}:{envp.get('PATH', '')}"
         except Exception:  # noqa: BLE001 - not installed (dev): /usr/local/cuda as usual
             pass
-        logf = SDCPP_DIR.parent / "sdcpp-build.log"
-        SDCPP_DIR.mkdir(parents=True, exist_ok=True)
-        self._set("building", progress="stable-diffusion.cpp wird gebaut (einmalig, mit CUDA 10 bis 30 Minuten)")
+        dest = self.engine_dir(engine)
+        logf = dest.parent / f"{dest.name}-build.log"
+        dest.mkdir(parents=True, exist_ok=True)
+        self._set("building", progress="ComfyUI wird installiert (einmalig, mit PyTorch etwa 3 GB, 5 bis 15 Minuten)"
+                  if engine == "comfyui" else
+                  "stable-diffusion.cpp wird gebaut (einmalig, mit CUDA 10 bis 30 Minuten)")
         with open(logf, "w") as lf:
-            p = subprocess.Popen(["nice", "-n", "15", "bash", str(script), "--dest", str(SDCPP_DIR)],
+            p = subprocess.Popen(["nice", "-n", "15", "bash", str(script), "--dest", str(dest)],
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envp)
             with self.lock:
                 self.proc = p
@@ -7236,75 +7385,131 @@ class ImageService:
                     self.progress = line[4:].strip()
                 elif re.match(r"^\[\s*\d+%\]", line):
                     self.progress = "Baue " + line.split("]")[0].strip("[ ") + " %"
+                elif line.startswith(("Downloading ", "Collecting ")) and "torch" in line.lower():
+                    self.progress = "PyTorch: " + line.split()[1][:80]
             rc = p.wait()
         if job != self.job:
             return False
-        if rc or not self.binary().exists():
-            self._set("error", f"Bauen fehlgeschlagen (Code {rc}), Log: {logf}")
+        if rc or not self.installed(engine):
+            last = ""
+            try:
+                last = next((t for t in reversed(logf.read_text().splitlines()) if t.strip()), "")
+            except OSError:
+                pass
+            self._set("error", f"{'Installation' if engine == 'comfyui' else 'Bauen'} fehlgeschlagen (Code {rc})"
+                               f"{': ' + last[:160] if last else ''}. Log: {logf}")
             return False
         return True
 
-    def _download(self, job: int, m: dict) -> Optional[Path]:
+    def files(self, conf: Optional[dict] = None) -> list:
+        """(role, URL, local path) of every file the model needs with this engine."""
+        conf = conf or self.conf
+        m = IMAGE_MODELS[conf["model"]]
+        if conf["engine"] == "comfyui":
+            root = self.models_root / "comfyui"
+            return [(folder, url, root / folder / url.rsplit("/", 1)[-1]) for folder, url in m["comfy"]["files"].items()]
+        root = self.models_root / "images"
+        return [(role, url, root / url.rsplit("/", 1)[-1]) for role, url in m["sdcpp"]["files"].items()]
+
+    def _download(self, job: int, files: list) -> bool:
         import urllib.request
 
-        self.models_dir.mkdir(parents=True, exist_ok=True)
-        path = self.models_dir / m["file"]
-        if path.exists() and path.stat().st_size > 0:
-            return path
-        part = path.with_name(path.name + ".part")
-        self._set("downloading", progress=f"{m['file']} …")
-        try:
-            req = urllib.request.Request(m["url"], headers={"User-Agent": "MyrmidLM"})
-            with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
-                total, done, last = int(r.headers.get("Content-Length") or 0), 0, 0.0
-                while job == self.job:
-                    chunk = r.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
-                    if time.time() - last > 2:
-                        last = time.time()
-                        self.progress = (f"{m['file']}: {done / 2**30:.1f} von {total / 2**30:.1f} GB"
-                                         if total else f"{m['file']}: {done / 2**30:.1f} GB")
-            if job != self.job:
-                return None
-            part.rename(path)
-            return path
-        except Exception as e:  # noqa: BLE001 - shown on the host card
-            if job == self.job:
-                self._set("error", f"Download: {e}"[:300])
-            return None
+        todo = [f for f in files if not (f[2].exists() and f[2].stat().st_size > 0)]
+        for i, (_role, url, path) in enumerate(todo, 1):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            part = path.with_name(path.name + ".part")
+            label = f"Datei {i} von {len(todo)}: {path.name}" if len(todo) > 1 else path.name
+            self._set("downloading", progress=f"{label} …")
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "MyrmidLM"})
+                with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
+                    total, done, last = int(r.headers.get("Content-Length") or 0), 0, 0.0
+                    free = shutil.disk_usage(path.parent).free
+                    if total and total > free - (2 << 30):
+                        raise OSError(f"zu wenig Platz in {path.parent}: {total / 2**30:.1f} GB nötig, "
+                                      f"{free / 2**30:.1f} GB frei")
+                    while job == self.job:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        done += len(chunk)
+                        if time.time() - last > 2:
+                            last = time.time()
+                            self.progress = (f"{label}: {done / 2**30:.1f} von {total / 2**30:.1f} GB"
+                                             if total else f"{label}: {done / 2**30:.1f} GB")
+                if job != self.job:
+                    return False
+                if total and done != total:
+                    raise OSError(f"unvollständig ({done} von {total} Bytes)")
+                part.rename(path)
+            except Exception as e:  # noqa: BLE001 - shown on the host card
+                if job == self.job:
+                    self._set("error", f"Download {path.name}: {e} ({url})"[:400])
+                try:
+                    part.unlink()
+                except OSError:
+                    pass
+                return False
+        return True
+
+    def command(self, conf: dict) -> tuple[list, dict]:
+        """The engine's command line and environment for this model and device."""
+        envp = dict(os.environ)
+        gpu = conf["device"] != "cpu"
+        idx = re.sub(r"\D", "", conf["device"]) or "0"
+        if conf["engine"] == "comfyui":
+            root = self.models_root / "comfyui"
+            paths = COMFY_DIR / "extra_model_paths.yaml"
+            paths.write_text("myrmid:\n  base_path: " + json.dumps(str(root)) + "\n"
+                             + "".join(f"  {d}: {d}\n" for d in ("checkpoints", "diffusion_models", "text_encoders",
+                                                                  "vae", "loras", "upscale_models", "controlnet")))
+            for d in ("checkpoints", "diffusion_models", "text_encoders", "vae", "loras"):
+                (root / d).mkdir(parents=True, exist_ok=True)
+            cmd = [str(COMFY_DIR / "venv" / "bin" / "python"), str(COMFY_DIR / "src" / "main.py"),
+                   "--listen", "127.0.0.1", "--port", str(COMFY_PORT), "--disable-auto-launch",
+                   "--extra-model-paths-config", str(paths)]
+            if gpu:
+                envp["CUDA_VISIBLE_DEVICES"] = idx
+            else:
+                cmd.append("--cpu")
+                envp["CUDA_VISIBLE_DEVICES"] = ""
+            return cmd, envp
+        m = IMAGE_MODELS[conf["model"]]["sdcpp"]
+        cmd = [str(SDCPP_DIR / "build" / "bin" / "sd-server"), "--listen-ip", "127.0.0.1",
+               "--listen-port", str(IMAGE_PORT), "--model-dir", str(self.models_root / "images")]
+        for role, _url, path in self.files(conf):
+            cmd += [SDCPP_FLAGS[role], str(path)]
+        cmd += ["--steps", str(m["steps"]), "--cfg-scale", str(m["cfg"])] + list(m.get("args") or [])
+        if gpu:
+            envp.update(CUDA_VISIBLE_DEVICES=idx, SD_VK_DEVICE=idx)
+        else:
+            cmd += ["-t", str(IMAGE_CPU_THREADS)]
+            envp.update(CUDA_VISIBLE_DEVICES="", GGML_VK_VISIBLE_DEVICES="")
+        return cmd, envp
 
     def _run(self, job: int) -> None:
         import threading
         import urllib.request
 
         conf = dict(self.conf)
-        m = IMAGE_MODELS[conf["model"]]
-        if not self.binary().exists() and not self._build(job):
+        engine = conf["engine"]
+        if not self.installed(engine) and not self._install(job, engine):
             return
-        if conf["device"] != "cpu" and self.built_backend() == "cpu":
-            self._set("error", "sd-server wurde ohne GPU gebaut (kein CUDA-Toolkit/Vulkan gefunden): "
-                               "Gerät auf CPU stellen oder Toolkit installieren und neu bauen")
+        if conf["device"] != "cpu" and self.built_backend(engine) == "cpu":
+            self._set("error", f"{IMAGE_ENGINES[engine]} wurde ohne GPU-Unterstützung eingerichtet (kein CUDA-Toolkit "
+                               "oder Treiber zu alt): Gerät auf CPU stellen oder Toolkit/Treiber aktualisieren und "
+                               f"{self.engine_dir(engine)} löschen, dann neu einschalten")
             return
-        path = self._download(job, m)
-        if not path or job != self.job:
+        if not self._download(job, self.files(conf)) or job != self.job:
             return
+        health = f"http://127.0.0.1:{self.port}" + ("/system_stats" if engine == "comfyui" else "/v1/models")
         fails = 0
         while job == self.job:
-            cmd = [str(self.binary()), "--listen-ip", "127.0.0.1", "--listen-port", str(IMAGE_PORT),
-                   "--model-dir", str(self.models_dir), "-m", str(path),
-                   "--steps", str(m["steps"]), "--cfg-scale", str(m["cfg"])]
-            envp = dict(os.environ)
-            if conf["device"] == "cpu":
-                cmd += ["-t", str(IMAGE_CPU_THREADS)]
-                envp.update(CUDA_VISIBLE_DEVICES="", GGML_VK_VISIBLE_DEVICES="")
-            else:
-                idx = re.sub(r"\D", "", conf["device"]) or "0"
-                envp.update(CUDA_VISIBLE_DEVICES=idx, SD_VK_DEVICE=idx)
+            cmd, envp = self.command(conf)
             self._set("starting")
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envp)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envp,
+                                    cwd=str(self.engine_dir(engine) / ("src" if engine == "comfyui" else "")))
             with self.lock:
                 if job != self.job:
                     proc.terminate()
@@ -7315,11 +7520,11 @@ class ImageService:
                 for line in p.stdout:
                     self.tail = (self.tail + [line.rstrip()])[-40:]
             threading.Thread(target=read, daemon=True).start()
-            for _ in range(300):
+            for _ in range(600):
                 if proc.poll() is not None or job != self.job:
                     break
                 try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{IMAGE_PORT}/v1/models", timeout=2) as r:
+                    with urllib.request.urlopen(health, timeout=2) as r:
                         if r.status == 200:
                             self._set("ready")
                             fails = 0
@@ -7332,7 +7537,8 @@ class ImageService:
                 return
             fails += 1
             why = next((t for t in reversed(self.tail) if "error" in t.lower()), self.tail[-1] if self.tail else "")
-            self._set("error", f"sd-server beendet (Code {proc.returncode}){': ' + why[:200] if why else ''}")
+            self._set("error", f"{IMAGE_ENGINES[engine]} beendet (Code {proc.returncode})"
+                               f"{': ' + why[:200] if why else ''}")
             time.sleep(min(300, 10 * fails))
 
 
@@ -7578,7 +7784,12 @@ class HostNode:
         if path == "/embed" or path.startswith("/embed/"):
             return (EMBED_PORT if self.embed.state == "ready" else None), path[len("/embed"):] or "/"
         if path == "/image" or path.startswith("/image/"):
-            return (IMAGE_PORT if self.image.state == "ready" else None), path[len("/image"):] or "/"
+            ok = self.image.state == "ready" and self.image.conf["engine"] == "sdcpp"
+            return (IMAGE_PORT if ok else None), path[len("/image"):] or "/"
+        if path == "/comfy" or path.startswith(("/comfy/", "/comfy?")):
+            ok = self.image.state == "ready" and self.image.conf["engine"] == "comfyui"
+            rest = path[len("/comfy"):] or "/"
+            return (COMFY_PORT if ok else None), (rest if rest.startswith("/") else "/" + rest)
         agents = self.agents
         for a in agents:
             if a.path and (path == a.path or path.startswith(a.path + "/")):
@@ -7638,6 +7849,197 @@ def hmac_eq(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode(), b.encode())
 
 
+def _send_json(h, code: int, obj: dict, extra: Optional[dict] = None) -> None:
+    body = json.dumps(obj).encode()
+    h.send_response(code)
+    h.send_header("Content-Type", "application/json")
+    h.send_header("Content-Length", str(len(body)))
+    for k, v in (extra or {}).items():
+        h.send_header(k, v)
+    h.end_headers()
+    h.wfile.write(body)
+
+
+def _given_key(h) -> str:
+    """The key a request brings: Bearer header or (browser, ComfyUI) the myrmid_comfy cookie."""
+    auth = h.headers.get("Authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    from http.cookies import SimpleCookie
+
+    try:
+        c = SimpleCookie(h.headers.get("Cookie") or "")
+        return c["myrmid_comfy"].value if "myrmid_comfy" in c else ""
+    except Exception:  # noqa: BLE001 - a broken cookie is no key
+        return ""
+
+
+def _is_ws(h) -> bool:
+    return "websocket" in (h.headers.get("Upgrade") or "").lower()
+
+
+def _ws_tunnel(h, host: str, port: int, path: str, extra: dict) -> None:
+    """Passes a WebSocket (ComfyUI's /ws) on: sends the upgrade request on,
+    then copies bytes both ways until one side closes."""
+    import threading
+
+    try:
+        up = socket.create_connection((host, port), timeout=10)
+    except OSError as e:
+        return _send_json(h, 502, {"error": {"message": f"not reachable: {e}"}})
+    lines = [f"GET {path} HTTP/1.1", f"Host: {host}:{port}"]
+    for k in ("Upgrade", "Connection", "Sec-WebSocket-Key", "Sec-WebSocket-Version",
+              "Sec-WebSocket-Extensions", "Sec-WebSocket-Protocol"):
+        v = h.headers.get(k)
+        if v:
+            lines.append(f"{k}: {v}")
+    lines += [f"{k}: {v}" for k, v in extra.items()]
+    up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+    up.settimeout(None)
+    h.connection.settimeout(None)
+    h.close_connection = True
+
+    def down() -> None:
+        try:
+            while True:
+                d = up.recv(65536)
+                if not d:
+                    break
+                h.connection.sendall(d)
+        except OSError:
+            pass
+        finally:
+            try:
+                h.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+    t = threading.Thread(target=down, daemon=True)
+    t.start()
+    try:
+        while True:
+            d = h.rfile.read1(65536)
+            if not d:
+                break
+            up.sendall(d)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            up.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        up.close()
+    t.join(timeout=5)
+
+
+def _relay(h, host: str, port: int, method: str, path: str, headers: dict, body: Optional[bytes],
+           timeout: int = 900) -> None:
+    """Passes one HTTP request on and streams the answer back (chunked)."""
+    import http.client
+
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            resp = conn.getresponse()
+        except OSError as e:
+            return _send_json(h, 502, {"error": {"message": f"not reachable: {e}"}})
+        try:
+            h.send_response(resp.status)
+            for k, v in resp.getheaders():
+                if k.lower() not in ("transfer-encoding", "content-length", "connection"):
+                    h.send_header(k, v)
+            h.send_header("Transfer-Encoding", "chunked")
+            h.end_headers()
+            while True:
+                chunk = resp.read1(65536)
+                if not chunk:
+                    break
+                h.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                h.wfile.flush()
+            h.wfile.write(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            h.close_connection = True
+    finally:
+        conn.close()
+
+
+PASS_HEADERS = ("content-type", "accept", "range", "if-none-match", "if-modified-since")
+
+
+def comfy_generate(e: dict, body: dict) -> tuple[int, dict]:
+    """An OpenAI image request (/v1/images/generations) run on a host's
+    ComfyUI with the model's built-in workflow: queue it, wait for it, fetch
+    the pictures. Lets Open WebUI and any OpenAI client use ComfyUI."""
+    import base64
+    import urllib.error
+    import urllib.request
+
+    model = e.get("model") or ""
+    if model not in IMAGE_MODELS:
+        return 503, {"error": {"message": f"unbekanntes Bildmodell {model!r} auf {e['where']}"}}
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return 400, {"error": {"message": "prompt fehlt", "type": "invalid_request_error"}}
+    w = h = 0
+    m = re.match(r"^(\d{3,4})x(\d{3,4})$", str(body.get("size") or ""))
+    if m:
+        w, h = (max(256, min(2048, int(x) // 16 * 16)) for x in m.groups())
+    try:
+        n = int(body.get("n") or 1)
+    except (TypeError, ValueError):
+        n = 1
+    wf = comfy_workflow(model, prompt, w, h, n, int(body.get("seed") or 0) if str(body.get("seed") or "").isdigit()
+                        else 0, str(body.get("negative_prompt") or ""))
+    hdr = {"Content-Type": "application/json", **({"Authorization": f"Bearer {e['key']}"} if e.get("key") else {})}
+    base = e["base"].rstrip("/")
+
+    def call(path: str, data: Optional[dict] = None, raw: bool = False, timeout: int = 30):
+        req = urllib.request.Request(base + path, data=json.dumps(data).encode() if data is not None else None,
+                                     headers=hdr)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read() if raw else json.loads(r.read() or b"{}")
+
+    try:
+        pid = call("/prompt", {"prompt": wf, "client_id": "myrmid-" + secrets.token_hex(4)})["prompt_id"]
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode(errors="replace")[:600]
+        return 400 if err.code == 400 else 502, {"error": {"message": f"ComfyUI lehnt den Auftrag ab: {detail}"}}
+    except (OSError, ValueError, KeyError) as err:
+        return 502, {"error": {"message": f"ComfyUI auf {e['where']} nicht erreichbar: {err}"}}
+    deadline = time.time() + 900
+    entry = None
+    while time.time() < deadline:
+        try:
+            hist = call(f"/history/{pid}")
+        except (OSError, ValueError):
+            hist = {}
+        entry = hist.get(pid)
+        st = (entry or {}).get("status") or {}
+        if st.get("status_str") == "error":
+            msgs = [m[1].get("exception_message", "") for m in st.get("messages") or []
+                    if isinstance(m, list) and len(m) > 1 and m[0] == "execution_error" and isinstance(m[1], dict)]
+            return 500, {"error": {"message": "ComfyUI: " + ("; ".join(x for x in msgs if x) or "Fehler beim Erzeugen")}}
+        if entry and (st.get("completed") or entry.get("outputs")):
+            break
+        time.sleep(1)
+    else:
+        return 504, {"error": {"message": "ComfyUI: keine Antwort nach 15 Minuten"}}
+    data = []
+    for img in ((entry.get("outputs") or {}).get("7") or {}).get("images") or []:
+        from urllib.parse import urlencode
+
+        q = urlencode({"filename": img.get("filename", ""), "subfolder": img.get("subfolder", ""),
+                       "type": img.get("type", "output")})
+        try:
+            data.append({"b64_json": base64.b64encode(call(f"/view?{q}", raw=True, timeout=60)).decode()})
+        except OSError as err:
+            return 502, {"error": {"message": f"ComfyUI: Bild nicht abrufbar: {err}"}}
+    if not data:
+        return 500, {"error": {"message": "ComfyUI: kein Bild erzeugt"}}
+    return 200, {"created": int(time.time()), "data": data}
+
+
 def _host_proxy_handler(node: HostNode):
     """The host's API port: passes each request to the llama-server it is for
     (streaming, like the router), so per-GPU models need no extra ports."""
@@ -7651,16 +8053,12 @@ def _host_proxy_handler(node: HostNode):
             pass
 
         def _pass(self, method: str) -> None:
-            if self.path.startswith("/image") and not hmac_eq(self.headers.get("Authorization") or "",
-                                                               f"Bearer {node.key}"):
-                body = b'{"error":{"message":"invalid api key"}}'
-                self.send_response(401)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
+            side = self.path.startswith(("/image", "/comfy"))  # sd-server and ComfyUI have no key of their own
+            if side and not hmac_eq(_given_key(self), node.key):
+                return _send_json(self, 401, {"error": {"message": "invalid api key"}})
             port, path = node.backend_port(self.path)
+            if side and port and _is_ws(self):
+                return _ws_tunnel(self, "127.0.0.1", port, path, {})
             n = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(n) if n else None
             if port is None:
@@ -7672,7 +8070,8 @@ def _host_proxy_handler(node: HostNode):
                 self.wfile.write(body)
                 return
             headers = {k: v for k, v in self.headers.items()
-                       if k.lower() in ("content-type", "accept", "authorization")}
+                       if k.lower() in ("content-type", "accept", "authorization")
+                       or (side and k.lower() in PASS_HEADERS)}
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=900)
             try:
                 try:
@@ -7710,6 +8109,15 @@ def _host_proxy_handler(node: HostNode):
 
         def do_POST(self):
             self._pass("POST")
+
+        def do_PUT(self):
+            self._pass("PUT")
+
+        def do_DELETE(self):
+            self._pass("DELETE")
+
+        def do_PATCH(self):
+            self._pass("PATCH")
 
     return H
 
@@ -8102,6 +8510,10 @@ class Router:
         with self.lock:
             self.imagers = list(imagers)
 
+    def pick_comfy(self) -> Optional[dict]:
+        with self.lock:
+            return next((e for e in self.imagers if e.get("engine") == "comfyui"), None)
+
     def pick_imager(self) -> Optional[dict]:
         with self.lock:
             if not self.imagers:
@@ -8405,7 +8817,9 @@ class Router:
         with self.lock:
             fast = self.fast or next((b for b in self.backends if b.name == "fast"), None)
             emb = self.embedder
-            return {"available": True, "enabled": self.enabled, "mode": self.mode, "prefer_fast": self.prefer_fast,
+            return {"available": True, "port": getattr(self, "port", None), "enabled": self.enabled, "mode": self.mode,
+                    "prefer_fast": self.prefer_fast, "imagers": [{k: e.get(k) for k in ("where", "engine", "model")}
+                                                                  for e in self.imagers],
                     "examples": self.examples, "subjects": self.subjects,
                     "vision": [b.group or b.label for b in self.backends if b.vision],
                     "external": [{k: v for k, v in e.items() if k != "key"} | {"has_key": bool(e.get("key"))}
@@ -8740,10 +9154,89 @@ class Router:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _is_comfy(self) -> bool:
+                return self.path == "/comfy" or self.path.startswith(("/comfy/", "/comfy?"))
+
+            def _comfy(self, method: str) -> None:
+                """/comfy/...: ComfyUI on the host that runs it (web interface,
+                API, WebSocket), for browsers (key once in the address, then a
+                cookie) and for Open WebUI's ComfyUI engine (Bearer key)."""
+                from urllib.parse import parse_qsl, urlencode
+
+                u = urlsplit(self.path)
+                q = parse_qsl(u.query, keep_blank_values=True)
+                given = dict(q).get("key")
+                if router.key and given is not None:
+                    if not secrets.compare_digest(given.encode(), router.key.encode()):
+                        return self._json(401, {"error": {"message": "Invalid API Key"}})
+                    rest = [(k, v) for k, v in q if k != "key"]
+                    loc = (u.path if u.path != "/comfy" else "/comfy/") + ("?" + urlencode(rest) if rest else "")
+                    self.send_response(302)
+                    self.send_header("Location", loc)
+                    self.send_header("Set-Cookie", f"myrmid_comfy={router.key}; Path=/comfy; HttpOnly; "
+                                                   "SameSite=Lax; Max-Age=2592000")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if router.key and not secrets.compare_digest(_given_key(self).encode(), router.key.encode()):
+                    body = ("ComfyUI über MyrmidLM: einmal mit dem API-Key öffnen, "
+                            "z. B. /comfy/?key=DEIN-KEY\n").encode()
+                    self.send_response(401)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if u.path == "/comfy":
+                    self.send_response(302)
+                    self.send_header("Location", "/comfy/" + ("?" + u.query if u.query else ""))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                e = router.pick_comfy()
+                if not e:
+                    return self._json(503, {"error": {
+                        "message": "ComfyUI läuft auf keinem Host. Im MyrmidLM-Dashboard bei einem Host unter "
+                                   "„Bilder“ die Engine ComfyUI wählen.", "code": "no_comfyui"}})
+                t = urlsplit(e["base"])
+                path = t.path.rstrip("/") + self.path[len("/comfy"):]
+                extra = {"Authorization": f"Bearer {e['key']}"} if e.get("key") else {}
+                if _is_ws(self):
+                    return _ws_tunnel(self, t.hostname, t.port or 80, path, extra)
+                n = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(n) if n else None
+                headers = {k: v for k, v in self.headers.items() if k.lower() in PASS_HEADERS}
+                _relay(self, t.hostname, t.port or 80, method, path, {**headers, **extra}, raw)
+
+            def do_PUT(self):
+                if self._is_comfy():
+                    return self._comfy("PUT")
+                self._json(405, {"error": {"message": "method not allowed"}})
+
+            def do_DELETE(self):
+                if self._is_comfy():
+                    return self._comfy("DELETE")
+                self._json(405, {"error": {"message": "method not allowed"}})
+
+            def do_PATCH(self):
+                if self._is_comfy():
+                    return self._comfy("PATCH")
+                self._json(405, {"error": {"message": "method not allowed"}})
+
             def do_GET(self):
+                if self._is_comfy():
+                    return self._comfy("GET")
                 if not self._auth():
                     return self._json(401, {"error": {"message": "Invalid API Key", "type": "authentication_error"}})
                 path = self.path.split("?", 1)[0]
+                if path in ("/v1/images/workflow", "/images/workflow"):
+                    e = router.pick_comfy() or router.pick_imager()
+                    model = (e or {}).get("model") or ""
+                    if model not in IMAGE_MODELS:
+                        return self._json(503, {"error": {"message": "Kein Bildmodell im Cluster"}})
+                    return self._json(200, {"model": model, "label": IMAGE_MODELS[model]["label"],
+                                            "engine": e.get("engine") or "sdcpp", "size": IMAGE_MODELS[model]["size"],
+                                            "workflow": comfy_workflow(model), "nodes": comfy_nodes()})
                 if path in ("/v1/models", "/models"):
                     now = int(time.time())
                     data = [{"id": router.public_name, "object": "model", "owned_by": "myrmid", "created": now}]
@@ -8768,6 +9261,8 @@ class Router:
                 self._forward(router.big, "GET", None, "")
 
             def do_POST(self):
+                if self._is_comfy():
+                    return self._comfy("POST")
                 if not self._auth():
                     return self._json(401, {"error": {"message": "Invalid API Key", "type": "authentication_error"}})
                 decide_ms = 0  # how long the router took to choose (monitor)
@@ -8833,8 +9328,19 @@ class Router:
                     if not e:
                         return self._json(503, {"error": {
                             "message": "Kein Bildmodell im Cluster. Im MyrmidLM-Dashboard bei einem Host unter "
-                                       "„Bilder“ einschalten (z. B. SD 1.5).",
+                                       "„Bilder“ einschalten (z. B. Z-Image Turbo).",
                             "type": "server_error", "code": "no_image_model"}})
+                    if e.get("engine") == "comfyui":
+                        if sub.endswith("/edits"):
+                            return self._json(400, {"error": {
+                                "message": "Bilder bearbeiten geht mit ComfyUI über dessen eigene Schnittstelle "
+                                           "(/comfy) und einen Bearbeitungs-Workflow.", "type": "invalid_request_error"}})
+                        try:
+                            req = json.loads(raw or b"{}")
+                        except ValueError:
+                            req = {}
+                        code, obj = comfy_generate(e, req if isinstance(req, dict) else {})
+                        return self._json(code, obj)
                     u = urlsplit(e["base"])
                     conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=900)
                     try:
@@ -9355,8 +9861,11 @@ class HostManager:
                 st = h.get("status") or {}
                 im = st.get("image") or {}
                 if im.get("state") == "ready" and not h.get("asleep") and not h.get("error") and not self.in_maint(hid):
-                    imagers.append({"base": f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}/image",
-                                    "key": self.key, "where": h["name"], "model": im.get("model")})
+                    engine = im.get("engine") or "sdcpp"
+                    imagers.append({"base": f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}"
+                                            + ("/comfy" if engine == "comfyui" else "/image"),
+                                    "key": self.key, "where": h["name"], "model": im.get("model"),
+                                    "engine": engine})
         self.router.set_hosts(backends)
         self.router.set_embedders(embedders)
         self.router.set_imagers(imagers)
@@ -9531,7 +10040,9 @@ class HostManager:
             em = body.get(kind) or {}
             try:
                 res = self._call(h, "/" + kind, {"model": str(em.get("model") or ""),
-                                                 "device": str(em.get("device") or "cpu")}, timeout=15)
+                                                 "device": str(em.get("device") or "cpu"),
+                                                 **({"engine": str(em["engine"])} if em.get("engine") else {})},
+                                 timeout=15)
             except Exception as e:  # noqa: BLE001
                 return {**self.info(), "error": f"{label}: {e}"}
             if not res.get("ok"):

@@ -361,7 +361,7 @@ case "$PM" in
             srun add-apt-repository -y multiverse
             srun apt-get update
         fi
-        pkg_install build-essential cmake git python3 python3-zeroconf qrencode pciutils curl ca-certificates ethtool ;;
+        pkg_install build-essential cmake git python3 python3-venv python3-zeroconf qrencode pciutils curl ca-certificates ethtool ;;
     dnf)
         pkg_install gcc-c++ make cmake git python3 python3-zeroconf qrencode pciutils curl ethtool ;;
     pacman)

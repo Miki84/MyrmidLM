@@ -1684,13 +1684,18 @@ function renderHosts(s) {
         <span class="note"><span class="dot ${em.state === "ready" ? "ok" : em.state === "error" ? "bad" : em.state === "off" ? "" : "busy"}"></span> ${esc(EM_STATE[em.state] || em.state)}${em.state === "ready" && em.device !== "cpu" ? ` · ${esc(em.device)} nur für Embeddings` : ""}</span></div>
       ${em.error ? `<div class="note bad">${esc(em.error)}</div>` : ""}`;
     const im = x.image;
-    const IM_STATE = { off: "aus", idle: "wartet", building: "baut sd-server …", downloading: "lädt das Modell …", starting: "startet …", ready: "bereit", error: "Fehler" };
+    const IM_STATE = { off: "aus", idle: "wartet", building: "richtet die Engine ein …", downloading: "lädt das Modell …", starting: "startet …", ready: "bereit", error: "Fehler" };
     const imModel = e.image_model ?? (im ? im.model : ""), imDev = e.image_device ?? (im ? im.device : "cpu");
-    const imageRow = !im || x.asleep ? "" : `<div class="kv embed-row" title="Ein Bildmodell (stable-diffusion.cpp) für Open WebUI/Formica. Der Master bietet es als /v1/images/generations an.">
-        <label>Bilder<select name="image_model"><option value=""${!imModel ? " selected" : ""}>aus</option>${Object.entries(im.models || {}).map(([k, l]) => `<option value="${esc(k)}"${k === imModel ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
+    const imEng = e.image_engine ?? (im ? im.engine || "sdcpp" : "sdcpp");
+    const comfyUrl = `${location.protocol}//${location.hostname}:${(last && last.router && last.router.port) || 8080}/comfy/${key ? "?key=" + encodeURIComponent(key) : ""}`;
+    const imageRow = !im || x.asleep ? "" : `<div class="kv embed-row" title="Ein Bildmodell für Open WebUI/Formica. Der Master bietet es als /v1/images/generations an, ComfyUI zusätzlich mit seiner Oberfläche unter /comfy/.">
+        <label>Bilder<select name="image_engine">${Object.entries(im.engines || { sdcpp: "stable-diffusion.cpp" }).map(([k, l]) => `<option value="${esc(k)}"${k === imEng ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
+        <label>Modell<select name="image_model"><option value=""${!imModel ? " selected" : ""}>aus</option>${Object.entries(im.models || {}).map(([k, l]) => `<option value="${esc(k)}"${k === imModel ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
         <label>auf<select name="image_device">${(im.devices || []).map((d) => `<option value="${esc(d.name)}"${d.name === imDev ? " selected" : ""}>${esc(d.name === "cpu" ? d.description : d.name + " " + d.description)}</option>`).join("")}</select></label>
         <button class="btn quiet small" type="button" data-himage>Übernehmen</button>
-        <span class="note"><span class="dot ${im.state === "ready" ? "ok" : im.state === "error" ? "bad" : im.state === "off" ? "" : "busy"}"></span> ${esc(IM_STATE[im.state] || im.state)}${im.state === "ready" && im.backend ? ` · ${esc(im.backend.toUpperCase())}` : ""}${im.state === "ready" && im.device !== "cpu" ? ` · ${esc(im.device)} nur für Bilder` : ""}</span></div>
+        <span class="note"><span class="dot ${im.state === "ready" ? "ok" : im.state === "error" ? "bad" : im.state === "off" ? "" : "busy"}"></span> ${esc(IM_STATE[im.state] || im.state)}${im.state === "ready" && im.backend ? ` · ${esc(im.backend.toUpperCase())}` : ""}${im.state === "ready" && im.device !== "cpu" ? ` · ${esc(im.device)} nur für Bilder` : ""}</span>
+        ${im.state === "ready" && im.engine === "comfyui" ? `<a class="btn quiet small" href="${esc(comfyUrl)}" target="_blank" rel="noopener">ComfyUI öffnen ↗</a>` : ""}</div>
+      ${imModel && (im.hints || {})[imModel] ? `<div class="note muted">${esc(im.hints[imModel])}</div>` : ""}
       ${im.progress && im.state !== "ready" && im.state !== "off" ? `<div class="note">${esc(im.progress)}</div>` : ""}
       ${im.error ? `<div class="note bad">${esc(im.error)}</div>` : ""}`;
     const roleRow = x.switchable && !x.asleep
@@ -1836,14 +1841,17 @@ $("hosts").addEventListener("click", (ev) => {
     const x = (last && ((last.hosts || {}).hosts || []).find((h) => h.id === id)) || {};
     const model = (card.querySelector('[name="image_model"]') || {}).value || "";
     const device = (card.querySelector('[name="image_device"]') || {}).value || "cpu";
+    const engine = (card.querySelector('[name="image_engine"]') || {}).value || "sdcpp";
     const old = x.image || {};
     const gpuBefore = old.model && old.device !== "cpu" ? old.device : "", gpuAfter = model && device !== "cpu" ? device : "";
     if (gpuBefore !== gpuAfter && !confirm(gpuAfter
       ? `${gpuAfter} wird nur noch für das Bildmodell genutzt. Das große Modell dieses PCs lädt dafür neu, ohne diese GPU.`
       : `${gpuBefore} wird wieder frei. Das große Modell dieses PCs lädt dafür neu und nutzt sie wieder.`)) return;
-    if (model && !old.backend && !confirm("Beim ersten Einschalten baut dieser PC stable-diffusion.cpp (sd-server). Mit CUDA dauert das 10 bis 30 Minuten, danach wird das Modell geladen (2 bis 7 GB). Weiter?")) return;
-    if (hostEdits[id]) { delete hostEdits[id].image_model; delete hostEdits[id].image_device; }
-    ev.target.disabled = true; hostAction({ host: id, image: { model, device } });
+    if (model && !(old.installed || {})[engine] && !confirm(engine === "comfyui"
+      ? "Beim ersten Einschalten installiert dieser PC ComfyUI mit PyTorch (etwa 3 GB, 5 bis 15 Minuten), danach lädt er das Modell. Weiter?"
+      : "Beim ersten Einschalten baut dieser PC stable-diffusion.cpp (sd-server). Mit CUDA dauert das 10 bis 30 Minuten, danach lädt er das Modell. Weiter?")) return;
+    if (hostEdits[id]) { delete hostEdits[id].image_model; delete hostEdits[id].image_device; delete hostEdits[id].image_engine; }
+    ev.target.disabled = true; hostAction({ host: id, image: { engine, model, device } });
   }
   if (ev.target.matches("[data-hmaint]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, maintenance: ev.target.dataset.hmaint === "on" }); }
   if (ev.target.matches("[data-hwake]")) { ev.target.disabled = true; hostAction({ host: card.dataset.id, wake: true }); }
