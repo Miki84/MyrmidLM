@@ -426,6 +426,7 @@ table.req tr.bg-task td { opacity: .72; }
   .strata-inst .si-form { align-items: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
   .strata-inst .si-form input { width: 110px; }
   .bad-text { color: var(--bad); }
+  .warn-text { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -1655,6 +1656,10 @@ function renderHosts(s) {
           <label>KV-Cache<select data-si="kv" name="si_kv">${["int8", "q4_0", "k8v4", "fp16"].map((k) => `<option${k === (e.si_kv ?? "int8") ? " selected" : ""}>${k}</option>`).join("")}</select></label>
           <button class="btn small" type="button" data-strata-install>Installieren</button></div>`}
       </details>`;
+    const pickedSet = strataFixed ? new Set(String(x.strata.fixed_gpu || "").split(",")) : sSet;
+    const oldPicked = x.strata ? (x.strata.old_gpus || []).filter((i) => pickedSet.has(String(i))) : [];
+    const strataOldWarn = oldPicked.length && sSet0.cuda !== 12
+      ? `<div class="wide note warn-text">GPU ${oldPicked.join(", ")} ist älter als RTX 20 (z. B. Tesla V100): Strata braucht dafür seine CUDA-12-Engine, die Konfiguration ${esc(sCfgName)} nutzt aber CUDA 13 und würde nicht laden („no kernel image“). Unter „Strata-Einstellungen“ auf <b>Übernehmen</b> klicken: richtet sie mit den angehakten GPUs und CUDA 12 neu ein.</div>` : "";
     const strataRow = x.strata ? `<div class="kv"><span class="note">Strata${x.strata.version ? " " + esc(x.strata.version) : ""} · Dienst ${esc(STRATA_STATE[x.strata.state] || x.strata.state || "?")}</span><button class="btn quiet small" type="button" data-hstrata="update" title="Update im Strata-Ordner (git pull, Engine, Pakete). Läuft Strata, wird es dafür kurz gestoppt.">Strata aktualisieren</button><button class="btn quiet small" type="button" data-hstrata="refresh" title="Konfigurationen neu einlesen">↻</button></div>` : "";
     const pr = x.progress;
     const eta = pr && pr.mb_s > 0.1 ? Math.max(0, (pr.total_mb - pr.done_mb) / pr.mb_s) : 0;
@@ -1725,7 +1730,7 @@ function renderHosts(s) {
       <form>
         ${x.strata ? `<label title="llama.cpp: MyrmidLM plant und startet llama-server. Strata: die auf diesem PC installierte Strata-Engine mit ihrer eigenen Konfiguration.">Engine<select name="engine">${[["llama", "llama.cpp"], ["strata", "Strata"]].map(([v, t]) => `<option value="${v}"${v === engine ? " selected" : ""}>${t}</option>`).join("")}</select></label>` : ""}
         ${engine === "strata"
-          ? `<label class="wide">Strata-Konfiguration<select name="model">${(x.strata.configs || []).map((c) => `<option value="${esc(c)}"${c === (e.model ?? (a.engine === "strata" ? a.model : "")) ? " selected" : ""}>${esc(c.replace(/^strata-|\.json$/g, ""))}</option>`).join("") || `<option value="">keine strata-*.json gefunden</option>`}</select></label>` + strataGpuRow + strataSettings
+          ? `<label class="wide">Strata-Konfiguration<select name="model">${(x.strata.configs || []).map((c) => `<option value="${esc(c)}"${c === (e.model ?? (a.engine === "strata" ? a.model : "")) ? " selected" : ""}>${esc(c.replace(/^strata-|\.json$/g, ""))}</option>`).join("") || `<option value="">keine strata-*.json gefunden</option>`}</select></label>` + strataGpuRow + strataOldWarn + strataSettings
           : `<label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>`}
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
         <label>Rolle<select name="role">${["big", "fast", "extra"].map((r) => `<option value="${r}"${r === role ? " selected" : ""}>${ROLE_TEXT[r]}</option>`).join("")}</select></label>
@@ -1796,7 +1801,8 @@ $("hosts").addEventListener("click", (ev) => {
     const id = card.dataset.id;
     if (hostEdits[id]) { delete hostEdits[id].strata_ctx; delete hostEdits[id].strata_kv; }
     ev.target.disabled = true;
-    hostAction({ host: id, strata: "reconfigure", config: ev.target.dataset.hstrataReconf, context: ctx.replace(/[.\s]/g, ""), kv });
+    const gpus = [...card.querySelectorAll('input[name="strata_gpu"]:checked')].map((c) => c.value).join(",");
+    hostAction({ host: id, strata: "reconfigure", config: ev.target.dataset.hstrataReconf, context: ctx.replace(/[.\s]/g, ""), kv, gpus });
     return;
   }
   if (ev.target.matches("[data-hstrata]")) {

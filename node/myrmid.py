@@ -5559,6 +5559,27 @@ def strata_log_tail(n: int = 40, since: int = 0) -> list[str]:
         return []
 
 
+_OLD_NV: list = []
+
+
+def nvidia_old_gpus() -> list[int]:
+    """nvidia-smi numbers of cards older than RTX 20 (compute capability < 7.5: Pascal, Volta): Strata runs them
+    only with its CUDA 12 engine."""
+    if not _OLD_NV:
+        old = []
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=index,compute_cap", "--format=csv,noheader"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            for line in out.strip().splitlines():
+                i, cc = [x.strip() for x in line.split(",")[:2]]
+                if i.isdigit() and float(cc) < 7.5:
+                    old.append(int(i))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        _OLD_NV.append(old)
+    return _OLD_NV[0]
+
+
 def strata_failure_line(tail: list[str]) -> str:
     """The line that says why Strata stopped: the exception itself (not "Traceback ..."), Strata's own [X] or
     "not supported" lines, else the last error-like line, else the last line."""
@@ -5869,7 +5890,13 @@ def strata_apply_request() -> None:
                 raise UpdateError("ungültiger Kontext, KV-Cache oder GPU-Auswahl")
             family, model = _strata_family_model(conf, d, cfg)
             cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes", "--model", model, "--context", str(ctx),
-                   "--kv", kv] + (["--family", family] if family else []) + (["--gpus", gpus] if "," in gpus else [])
+                   "--kv", kv] + (["--family", family] if family else [])
+            if gpus:
+                cmd += ["--gpus", gpus] if "," in gpus else ["--gpu", gpus]
+                old = set(nvidia_old_gpus()) & {int(g) for g in gpus.split(",")}
+                if old:  # Pascal/Volta: only Strata's CUDA 12 engine has code for them
+                    cmd += ["--cuda", "12"]
+                    log(f"Strata: GPU {', '.join(map(str, sorted(old)))} is older than RTX 20: CUDA 12 engine")
             _strata_run_job(conf, d, cmd, "Einrichtung")
             _strata_write_info(conf)  # the new settings for the card
 
@@ -5942,13 +5969,20 @@ def _strata_config_settings(d: Path) -> dict:
         except (OSError, ValueError, AttributeError):
             continue
         st = {}
+        try:
+            cuda = json.loads((_strata_work(d) / name).read_text()).get("cuda")
+            if cuda:
+                st["cuda"] = int(cuda)
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
         for i, x in enumerate(args[:-1]):
             if x in ("--ctx", "--context", "-c", "--ctx-size", "--max-context") and args[i + 1].isdigit():
                 st["context"] = int(args[i + 1])
             elif x in ("--kv", "--kv-type", "--kv-cache") and args[i + 1] in STRATA_KVS:
                 st["kv"] = args[i + 1]
-        if st:
-            st.setdefault("kv", "int8")  # Strata writes --kv only above 8K context; its default is int8
+        if st.get("context") or st.get("kv"):
+            st.setdefault("kv", "int8")
+        if st:  # Strata writes --kv only above 8K context; its default is int8
             out[name] = st
     return out
 
@@ -6335,6 +6369,7 @@ class HostAgent:
             st["strata"] = {"configs": info.get("configs") or [], "version": info.get("version") or "",
                             "config_gpus": info.get("config_gpus") or {},
                             "config_settings": info.get("config_settings") or {},
+                            "old_gpus": nvidia_old_gpus(),
                             "state": strata_state(self.api_port)}
             if self.slot is not None:  # one GPU or a group of several: Strata gets exactly these
                 st["strata"]["fixed_gpu"] = self._strata_fixed()
@@ -6614,8 +6649,9 @@ class HostAgent:
                 cfg = str(b.get("config") or (self.assignment or {}).get("model") or "")
                 if not ctx or not STRATA_CFG_RE.match(cfg) or kv not in STRATA_KVS:
                     return {**self.status(), "error": "Strata: Konfiguration, Kontext und KV-Cache angeben"}
+                want = str(b.get("gpus") or "").replace(" ", "")
                 gpus = (self._strata_fixed() if self.slot is not None else
-                        ((self.assignment or {}).get("strata_gpus") or "")) or ""
+                        (want if STRATA_GPU_RE.match(want) else (self.assignment or {}).get("strata_gpus") or "")) or ""
                 kw = {"config": cfg, "context": ctx, "kv": kv, "gpus": gpus}
             if (self.assignment or {}).get("engine") == "strata":
                 with self.lock:
@@ -10068,7 +10104,8 @@ class HostManager:
             try:
                 res = self._call(self.hosts[hid], "/strata",
                                  {"action": str(body["strata"]),
-                                  **{k: body[k] for k in ("config", "context", "kv", "user", "model") if k in body}},
+                                  **{k: body[k] for k in ("config", "context", "kv", "user", "model", "gpus")
+                                     if k in body}},
                                  timeout=10)
             except Exception as e:  # noqa: BLE001
                 return {**self.info(), "error": f"Strata: {e}"}
