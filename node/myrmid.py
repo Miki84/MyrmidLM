@@ -8565,6 +8565,40 @@ OPENWEBUI_TASKS = (  # Open WebUI's task prompts ("### Task: ..."), what they ma
     ("emoji", "Emoji"), ("image prompt", "Bildbeschreibung"))
 
 
+_HOSTNAMES: dict = {}
+
+
+def client_ip(handler) -> str:
+    """The asking machine: the peer, or the first X-Forwarded-For address when a proxy in the LAN passes it on."""
+    ip = str(handler.client_address[0] or "")
+    fwd = (handler.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    if fwd and (ip.startswith(("127.", "10.", "192.168.", "::1", "fd", "::ffff:")) or re.match(r"172\.(1[6-9]|2\d|3[01])\.", ip)):
+        ip = fwd
+    return ip[7:] if ip.startswith("::ffff:") else ip
+
+
+def client_host(ip: str) -> str:
+    """The short host name of an address from reverse DNS (the router's names in a LAN); looked up once, in the
+    background: the first answers show the address only."""
+    if not ip:
+        return ""
+    if ip not in _HOSTNAMES:
+        import threading
+
+        _HOSTNAMES[ip] = ""
+
+        def look() -> None:
+            try:
+                name = socket.gethostbyaddr(ip)[0]
+            except (OSError, UnicodeError):
+                return
+            if name and name != ip and not re.match(r"^[\d.]+$|:", name):
+                _HOSTNAMES[ip] = name.split(".")[0]
+
+        threading.Thread(target=look, daemon=True).start()
+    return _HOSTNAMES[ip]
+
+
 def client_name(ua: str) -> str:
     """Who asked, from the User-Agent, short: what the monitor shows."""
     u = ua.lower()
@@ -9803,7 +9837,7 @@ class Router:
                         try:
                             router.note_request(backend, status, tail, raw, reason, started, alone,
                                                 decide_ms=getattr(self, "decide_ms", 0),
-                                                client=self.headers.get("User-Agent") or "")
+                                                client=self.headers.get("User-Agent") or "", ip=client_ip(self))
                         except Exception as e:  # noqa: BLE001 - the monitor must never break serving
                             log(f"Monitor: {e}")
                     found = re.findall(rb'"timings"\s*:\s*(\{[^{}]*\})', tail) if alone and tail else []
@@ -9821,7 +9855,7 @@ class Router:
         return H
 
     def note_request(self, b: Backend, status: int, tail: bytes, raw: Optional[bytes], reason: str,
-                     started: float, alone: bool, decide_ms: int = 0, client: str = "") -> None:
+                     started: float, alone: bool, decide_ms: int = 0, client: str = "", ip: str = "") -> None:
         """One line for the monitor: from llama-server's "timings" (tokens
         read, reused from the cache, written, and the speeds), else from the
         OpenAI "usage" an external server sends."""
@@ -9844,7 +9878,7 @@ class Router:
              "secs": round(time.time() - started, 1), "reason": reason, "ctx": b.ctx or 0, "alone": alone,
              "image": bool(raw and (b'"image_url"' in raw or b'"input_image"' in raw)),
              "decide_ms": decide_ms, "temp": round(b.temp) if b.temp else None,
-             "client": client_name(client),
+             "client": client_name(client), "ip": ip,
              # speculative decoding (MTP or a draft model): share of the guessed tokens the model kept
              "spec": round(int(t.get("draft_n_accepted") or 0) / int(t["draft_n"]), 2) if t.get("draft_n") else None}
         with self.lock:
@@ -9859,7 +9893,10 @@ class Router:
 
     def monitor(self) -> dict:
         with self.lock:
-            return {"requests": list(self.reqlog)[-200:][::-1], "totals": dict(self.reqtotals)}
+            reqs = list(self.reqlog)[-200:][::-1]
+        reqs = [{**r, "host": client_host(r.get("ip") or "")} if r.get("ip") else r for r in reqs]
+        with self.lock:
+            return {"requests": reqs, "totals": dict(self.reqtotals)}
 
     def start(self, host: str, port: int) -> bool:
         import threading
