@@ -5891,13 +5891,19 @@ def strata_apply_request() -> None:
             family, model = _strata_family_model(conf, d, cfg)
             cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes", "--model", model, "--context", str(ctx),
                    "--kv", kv] + (["--family", family] if family else [])
+            env = {}
             if gpus:
-                cmd += ["--gpus", gpus] if "," in gpus else ["--gpu", gpus]
-                old = set(nvidia_old_gpus()) & {int(g) for g in gpus.split(",")}
+                sel = [int(g) for g in gpus.split(",")]
+                old = set(nvidia_old_gpus()) & set(sel)
+                if old and len(sel) > 1:  # a newer card is Main, the older ones help
+                    cmd += ["--gpu-roles", strata_gpu_roles(sel, old)]
+                else:
+                    cmd += ["--gpus", gpus] if "," in gpus else ["--gpu", gpus]
                 if old:  # Pascal/Volta: only Strata's CUDA 12 engine has code for them
                     cmd += ["--cuda", "12"]
-                    log(f"Strata: GPU {', '.join(map(str, sorted(old)))} is older than RTX 20: CUDA 12 engine")
-            _strata_run_job(conf, d, cmd, "Einrichtung")
+                    _strata_log(f"GPU {', '.join(map(str, sorted(old)))} ist älter als RTX 20: CUDA-12-Engine")
+                    env = strata_cuda12_env()
+            _strata_run_job(conf, d, cmd, "Einrichtung", env)
             _strata_write_info(conf)  # the new settings for the card
 
     except (UpdateError, OSError, ValueError, KeyError) as e:
@@ -5910,18 +5916,176 @@ def strata_apply_request() -> None:
 STRATA_KVS = ("int8", "q4_0", "k8v4", "fp16")
 
 
-def _strata_run_job(conf: dict, d: Path, cmd: list[str], what: str) -> None:
+CUDA12_DIR = Path("/usr/local/cuda-12.9")
+CUDA12_RUN = "https://developer.download.nvidia.com/compute/cuda/12.9.1/local_installers/cuda_12.9.1_575.57.08_linux.run"
+CUDA12_MAX_GCC = 14  # the newest GCC that CUDA 12.9 compiles with
+
+
+def _strata_log(msg: str) -> None:
+    log(f"Strata: {msg}")
+    try:
+        STRATA_UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(STRATA_UPDATE_LOG, "a") as f:
+            f.write(f"[myrmid] {msg}\n")
+    except OSError:
+        pass
+
+
+def _cuda12_nvcc() -> Optional[Path]:
+    """An installed CUDA 12.x toolkit's nvcc (the newest), or None."""
+    for root in sorted(Path("/usr/local").glob("cuda-12.*"), key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)],
+                       reverse=True):
+        if (root / "bin" / "nvcc").is_file() and (root / "nvvm" / "bin" / "cicc").is_file():
+            return root / "bin" / "nvcc"
+    return None
+
+
+def _cuda12_install() -> Path:
+    """Fetches CUDA 12.9 and unpacks only the toolkit to /usr/local/cuda-12.9 (root only). NVIDIA's installer is
+    not run: on Ubuntu 26.04 it misses libxml2.so.2; the driver is left alone."""
+    import shutil
+    import tempfile
+    import urllib.request
+
+    cache = Path("/var/cache/myrmid")
+    cache.mkdir(parents=True, exist_ok=True)
+    free = min(shutil.disk_usage(cache).free, shutil.disk_usage("/usr/local").free) / 2**30
+    if free < 16:
+        raise UpdateError(f"für das CUDA-12-Toolkit fehlt Platz: {free:.0f} GB frei, nötig sind etwa 16 GB")
+    run = cache / CUDA12_RUN.rsplit("/", 1)[1]
+    if not run.is_file() or run.stat().st_size < 5 * 2**30:
+        _strata_log(f"lade das CUDA 12.9 Toolkit (5,5 GB) von {CUDA12_RUN}")
+        part = run.with_suffix(".part")
+        with urllib.request.urlopen(CUDA12_RUN, timeout=60) as r, open(part, "wb") as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+        part.replace(run)
+    tmp = Path(tempfile.mkdtemp(prefix="cuda12-", dir=cache))
+    try:
+        _strata_log("entpacke das Toolkit nach /usr/local/cuda-12.9 (ohne NVIDIA-Installer, der Treiber bleibt)")
+        r = subprocess.run(["sh", str(run), "--noexec", "--target", str(tmp)], capture_output=True, text=True)
+        if r.returncode or not (tmp / "builds").is_dir():
+            raise UpdateError(f"CUDA-Runfile ließ sich nicht entpacken: {(r.stderr or r.stdout).strip()[-300:]}")
+        CUDA12_DIR.mkdir(parents=True, exist_ok=True)
+        for b in sorted((tmp / "builds").iterdir()):
+            if b.is_dir():
+                subprocess.run(["cp", "-a", f"{b}/.", f"{CUDA12_DIR}/"], check=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    run.unlink(missing_ok=True)
+    nvcc = _cuda12_nvcc()
+    if not nvcc:
+        raise UpdateError("CUDA 12.9 entpackt, aber nvcc oder cicc fehlt in /usr/local/cuda-12.9")
+    return nvcc
+
+
+def _cuda12_glibc_fix(nvcc: Path) -> None:
+    """glibc 2.41 and newer (Ubuntu 26.04) declares sinpi, cospi and rsqrt noexcept; CUDA 12.x's header does not,
+    so nvcc fails ("exception specification is incompatible"). The six declarations get noexcept too (once)."""
+    sys_h = Path("/usr/include/x86_64-linux-gnu/bits/mathcalls.h")
+    try:
+        if "cospi" not in sys_h.read_text(errors="replace"):
+            return  # an older glibc: nothing to match
+    except OSError:
+        return
+    h = nvcc.resolve().parent.parent / "targets" / "x86_64-linux" / "include" / "crt" / "math_functions.h"
+    try:
+        text = h.read_text()
+    except OSError:
+        return
+    new, n = re.subn(r"\b(sinpi|cospi|rsqrt|sinpif|cospif|rsqrtf)\((double|float) x\);", r"\1(\2 x) noexcept (true);", text)
+    if n:
+        orig = h.with_name(h.name + ".orig")
+        if not orig.exists():
+            orig.write_text(text)
+        h.write_text(new)
+        _strata_log(f"CUDA-12-Header an die neue glibc angepasst ({n} Deklarationen, Sicherung {orig.name})")
+
+
+def _cuda12_host_cxx() -> Optional[str]:
+    """A g++ that CUDA 12.9 takes: None if the default one is new enough to be fine, else g++-14 (installed if
+    missing)."""
+    try:
+        major = int(subprocess.run(["gcc", "-dumpversion"], capture_output=True, text=True).stdout.split(".")[0])
+    except (OSError, ValueError):
+        major = 0
+    if major and major <= CUDA12_MAX_GCC:
+        return None
+    for v in range(CUDA12_MAX_GCC, 10, -1):
+        if Path(f"/usr/bin/g++-{v}").is_file():
+            return f"/usr/bin/g++-{v}"
+    _strata_log(f"GCC {major} ist für CUDA 12 zu neu: installiere gcc-{CUDA12_MAX_GCC}")
+    r = subprocess.run(["apt-get", "install", "-y", f"gcc-{CUDA12_MAX_GCC}", f"g++-{CUDA12_MAX_GCC}"],
+                       capture_output=True, text=True, env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
+    if r.returncode or not Path(f"/usr/bin/g++-{CUDA12_MAX_GCC}").is_file():
+        raise UpdateError(f"gcc-{CUDA12_MAX_GCC} ließ sich nicht installieren: {(r.stderr or r.stdout).strip()[-300:]}")
+    return f"/usr/bin/g++-{CUDA12_MAX_GCC}"
+
+
+def strata_cuda12_env() -> dict:
+    """What Strata's setup needs for its CUDA 12 engine (Pascal/Volta, root only): the toolkit (fetched if missing),
+    patched for a new glibc, and a host compiler it takes."""
+    nvcc = _cuda12_nvcc() or _cuda12_install()
+    _cuda12_glibc_fix(nvcc)
+    env = {"STRATA_NVCC": str(nvcc)}
+    cxx = _cuda12_host_cxx()
+    if cxx:
+        env.update(CUDAHOSTCXX=cxx, NVCC_CCBIN=cxx)
+    _strata_log(f"CUDA-12-Engine: {nvcc}" + (f", Host-Compiler {cxx}" if cxx else ""))
+    return env
+
+
+def strata_gpu_roles(gpus: list[int], old: set[int]) -> str:
+    """--gpu-roles for a selection with older cards: Main is a newer card (the biggest, else the first); older ones
+    only help, since the CUDA 12 engine is experimental and Main does the last steps of every answer."""
+    new = [g for g in gpus if g not in old] or gpus
+    vram = {}
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.total", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=15)
+        for line in r.stdout.splitlines():
+            i, m = (x.strip() for x in line.split(","))
+            vram[int(i)] = int(float(m))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    main = max(new, key=lambda g: (vram.get(g, 0), -g))
+    return ",".join(f"{g}={'main' if g == main else 'helper'}" for g in gpus)
+
+
+def _strata_kill_strays() -> None:
+    """Strata servers that the unit does not know of (started by hand): setup's update feed refuses while one runs."""
+    for _ in range(3):
+        pid = strata_pid()
+        if not pid:
+            return
+        _strata_log(f"beende einen weiteren Strata-Server (PID {pid})")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+        for _ in range(45):
+            if not Path(f"/proc/{pid}").exists():
+                break
+            time.sleep(1)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def _strata_run_job(conf: dict, d: Path, cmd: list[str], what: str, env: Optional[dict] = None) -> None:
     """Runs one of Strata's scripts as its user (root only): Strata stops meanwhile and starts again if it ran."""
     was = strata_state() in ("active", "activating")
     if was:
         _systemctl("stop", STRATA_UNIT)
+    _strata_kill_strays()
     STRATA_UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
     log(f"Strata: {' '.join(cmd)} in {d} (as {conf['user']}; log {STRATA_UPDATE_LOG})")
     with open(STRATA_UPDATE_LOG, "a") as out:
         out.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd)} ===\n")
         out.flush()
         try:
-            r = _run_as(conf["user"], cmd, cwd=d, env=_strata_user_env(conf),
+            r = _run_as(conf["user"], cmd, cwd=d, env={**_strata_user_env(conf), **(env or {})},
                         stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, timeout=3 * 3600)
             code = r.returncode
         except subprocess.TimeoutExpired:
