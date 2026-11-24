@@ -144,7 +144,9 @@ def usable_gpus(devices: list[Device], include_reserved: bool = False) -> list[D
     the first backend wins), and integrated GPUs only without a dedicated
     one. Reserved GPUs (RESERVED_GPUS) are left out unless asked for."""
     if not include_reserved and RESERVED_GPUS:
-        devices = [d for d in devices if d.name not in RESERVED_GPUS]
+        # the reserved card also under its other backend (CUDA0 and its Vulkan twin share one PCI ID)
+        ids = {d.device_id for d in devices if d.name in RESERVED_GPUS and d.device_id}
+        devices = [d for d in devices if d.name not in RESERVED_GPUS and not (d.device_id and d.device_id in ids)]
     gpus: list[Device] = []
     for d in devices:
         if d.type != "gpu":
@@ -5239,7 +5241,7 @@ _HF = "https://huggingface.co/"
 # loads (its model folder -> URL) and how the built-in workflow uses them.
 IMAGE_MODELS = {
     "sd15": {
-        "label": "SD 1.5", "size": "512x512", "hint": "klein und alt, läuft auch auf der CPU (2 GB)",
+        "vram_mb": 3000, "label": "SD 1.5", "size": "512x512", "hint": "klein und alt, läuft auch auf der CPU (2 GB)",
         "sdcpp": {"files": {"model": _HF + "stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/"
                                        "v1-5-pruned-emaonly-fp16.safetensors"},
                   "steps": 20, "cfg": 7.0, "args": []},
@@ -5248,14 +5250,14 @@ IMAGE_MODELS = {
                   "kind": "checkpoint", "latent": "EmptyLatentImage", "steps": 20, "cfg": 7.0,
                   "sampler": "euler", "scheduler": "normal"}},
     "sd-turbo": {
-        "label": "SD Turbo", "size": "512x512", "hint": "sehr schnell, einfache Qualität (3 GB); Lizenz prüfen",
+        "vram_mb": 3500, "label": "SD Turbo", "size": "512x512", "hint": "sehr schnell, einfache Qualität (3 GB); Lizenz prüfen",
         "sdcpp": {"files": {"model": _HF + "stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors"},
                   "steps": 4, "cfg": 1.0, "args": []},
         "comfy": {"files": {"checkpoints": _HF + "stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors"},
                   "kind": "checkpoint", "latent": "EmptyLatentImage", "steps": 4, "cfg": 1.0,
                   "sampler": "euler_ancestral", "scheduler": "normal"}},
     "sdxl-turbo": {
-        "label": "SDXL Turbo", "size": "512x512", "hint": "schnell, besser als SD Turbo (7 GB); Lizenz prüfen",
+        "vram_mb": 8000, "label": "SDXL Turbo", "size": "512x512", "hint": "schnell, besser als SD Turbo (7 GB); Lizenz prüfen",
         "sdcpp": {"files": {"model": _HF + "stabilityai/sdxl-turbo/resolve/main/sd_xl_turbo_1.0_fp16.safetensors"},
                   "steps": 4, "cfg": 1.0, "args": []},
         "comfy": {"files": {"checkpoints": _HF + "stabilityai/sdxl-turbo/resolve/main/"
@@ -5263,7 +5265,7 @@ IMAGE_MODELS = {
                   "kind": "checkpoint", "latent": "EmptyLatentImage", "steps": 4, "cfg": 1.0,
                   "sampler": "euler_ancestral", "scheduler": "normal"}},
     "z-image-turbo": {
-        "label": "Z-Image Turbo", "size": "1024x1024",
+        "vram_mb": 9500, "label": "Z-Image Turbo", "size": "1024x1024",
         "hint": "aktuell, sehr gut, auch Text im Bild; GPU ab 8 GB (sd.cpp 8 GB, ComfyUI 21 GB Download); Apache 2.0",
         "sdcpp": {"files": {"diffusion": _HF + "jayn7/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q4_K_M.gguf",
                             "vae": _HF + "Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors",
@@ -5278,7 +5280,7 @@ IMAGE_MODELS = {
                   "kind": "unet", "clip_type": "lumina2", "weight_dtype": "fp8_e4m3fn", "shift": 3.0,
                   "steps": 9, "cfg": 1.0, "sampler": "res_multistep", "scheduler": "simple"}},
     "flux-schnell": {
-        "label": "FLUX.1 schnell", "size": "1024x1024",
+        "vram_mb": 11000, "label": "FLUX.1 schnell", "size": "1024x1024",
         "hint": "sehr gut, 4 Schritte; GPU ab 12 GB (8 GB langsamer), 11 bis 17 GB Download; Apache 2.0",
         "sdcpp": {"files": {"diffusion": _HF + "second-state/FLUX.1-schnell-GGUF/resolve/main/flux1-schnell-Q4_0.gguf",
                             "vae": _HF + "second-state/FLUX.1-schnell-GGUF/resolve/main/ae.safetensors",
@@ -5289,7 +5291,7 @@ IMAGE_MODELS = {
                   "kind": "checkpoint", "latent": "EmptySD3LatentImage", "steps": 4, "cfg": 1.0,
                   "sampler": "euler", "scheduler": "simple"}},
     "qwen-image": {
-        "label": "Qwen-Image", "size": "1024x1024",
+        "vram_mb": 22000, "label": "Qwen-Image", "size": "1024x1024",
         "hint": "beste Qualität und Schrift, 20 Schritte; GPU ab 24 GB (kleiner mit Auslagerung, langsam), "
                 "18 bis 30 GB Download; Apache 2.0",
         "sdcpp": {"files": {"diffusion": _HF + "QuantStack/Qwen-Image-GGUF/resolve/main/Qwen_Image-Q4_K_M.gguf",
@@ -7453,6 +7455,29 @@ class ImageService:
                 return False
         return True
 
+    def sd_flags(self) -> set:
+        """The options this sd-server build knows (from --help), so a newer
+        option never stops an older build."""
+        if getattr(self, "_sd_flags", None) is None:
+            try:
+                out = subprocess.run([str(SDCPP_DIR / "build" / "bin" / "sd-server"), "--help"], capture_output=True,
+                                     text=True, timeout=20)
+                self._sd_flags = set(re.findall(r"--[a-z0-9][a-z0-9_-]*", out.stdout + out.stderr))
+            except (OSError, subprocess.SubprocessError):
+                self._sd_flags = set()
+        return self._sd_flags
+
+    @staticmethod
+    def cause(tail: list) -> str:
+        """The line that says why the engine stopped (CUDA prints the reason on the line after 'CUDA error')."""
+        for i in range(len(tail) - 1, -1, -1):
+            t = tail[i]
+            if re.search(r"out of memory|cudaMalloc|failed to allocate|not enough", t, re.I):
+                return t.strip()
+            if "CUDA error" in t and i + 1 < len(tail):
+                return (t.strip() + " " + tail[i + 1].strip()).strip()
+        return next((t for t in reversed(tail) if "error" in t.lower()), tail[-1] if tail else "").strip()
+
     def command(self, conf: dict) -> tuple[list, dict]:
         """The engine's command line and environment for this model and device."""
         envp = dict(os.environ)
@@ -7483,6 +7508,27 @@ class ImageService:
         cmd += ["--steps", str(m["steps"]), "--cfg-scale", str(m["cfg"])] + list(m.get("args") or [])
         if gpu:
             envp.update(CUDA_VISIBLE_DEVICES=idx, SD_VK_DEVICE=idx)
+            total = next((g.total_mb for g in self.all_gpus if g.name == conf["device"]), 0) or 0
+            if total:
+                # a fixed budget below the card's size: sd.cpp streams the rest from RAM
+                cmd += ["--max-vram", f"{max(1.0, (total - 900) / 1024):.1f}"]
+            if total and total < IMAGE_MODELS[conf["model"]].get("vram_mb", 0):
+                # small card: text encoder on the CPU, decode the picture in tiles
+                cmd += [a for a in ("--clip-on-cpu", "--vae-tiling") if a not in cmd]
+            known = self.sd_flags()
+            if known:
+                keep, skip = [], False
+                for a in cmd:
+                    if skip:
+                        skip = False
+                        continue
+                    if a == "--max-vram" and a not in known:
+                        skip = True
+                        continue
+                    if a in ("--vae-tiling", "--clip-on-cpu", "--diffusion-fa") and a not in known:
+                        continue
+                    keep.append(a)
+                cmd = keep
         else:
             cmd += ["-t", str(IMAGE_CPU_THREADS)]
             envp.update(CUDA_VISIBLE_DEVICES="", GGML_VK_VISIBLE_DEVICES="")
@@ -7516,9 +7562,20 @@ class ImageService:
                     return
                 self.proc, self.tail = proc, []
 
-            def read(p=proc) -> None:
+            logf = self.engine_dir(engine).parent / f"{self.engine_dir(engine).name}-server.log"
+
+            def read(p=proc, logf=logf) -> None:
+                try:
+                    lf = open(logf, "a")
+                except OSError:
+                    lf = None
                 for line in p.stdout:
-                    self.tail = (self.tail + [line.rstrip()])[-40:]
+                    self.tail = (self.tail + [line.rstrip()])[-80:]
+                    if lf:
+                        lf.write(line)
+                        lf.flush()
+                if lf:
+                    lf.close()
             threading.Thread(target=read, daemon=True).start()
             for _ in range(600):
                 if proc.poll() is not None or job != self.job:
@@ -7536,9 +7593,13 @@ class ImageService:
             if job != self.job:
                 return
             fails += 1
-            why = next((t for t in reversed(self.tail) if "error" in t.lower()), self.tail[-1] if self.tail else "")
+            time.sleep(0.3)  # the reader thread takes the last lines
+            why = self.cause(self.tail)
+            oom = re.search(r"out of memory|cudaMalloc|failed to allocate", why, re.I)
             self._set("error", f"{IMAGE_ENGINES[engine]} beendet (Code {proc.returncode})"
-                               f"{': ' + why[:200] if why else ''}")
+                               f"{': ' + why[:240] if why else ''}"
+                               + (". Zu wenig Grafikspeicher: kleineres Modell wählen (z. B. SDXL Turbo) oder "
+                                  "eine größere GPU" if oom else "") + f". Log: {logf}")
             time.sleep(min(300, 10 * fails))
 
 
