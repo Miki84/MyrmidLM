@@ -5559,6 +5559,19 @@ def strata_log_tail(n: int = 40, since: int = 0) -> list[str]:
         return []
 
 
+def strata_failure_line(tail: list[str]) -> str:
+    """The line that says why Strata stopped: the exception itself (not "Traceback ..."), Strata's own [X] or
+    "not supported" lines, else the last error-like line, else the last line."""
+    lines = [x.strip() for x in tail if x.strip()]
+    for pat in (r"^\[X\]|\[strata\].*(not supported|cannot|can't|failed|error)",
+                r"^[A-Za-z_.]*(Error|Exception)\b.*:", r"out of memory|CUDA error|no kernel image"):
+        hit = next((x for x in reversed(lines) if re.search(pat, x, re.I)), "")
+        if hit:
+            return hit
+    return next((x for x in reversed(lines) if re.search(r"error|fehler", x, re.I) and "Traceback" not in x),
+                lines[-1] if lines else "")
+
+
 def strata_request(action: str, **kw) -> float:
     """Asks root (myrmid-strata-request.service) to start, stop or update Strata. Returns the request's time."""
     import threading
@@ -6520,9 +6533,7 @@ class HostAgent:
                     return
                 if proc.poll() is not None:
                     tail = [x for x in strata_log_tail(60, getattr(proc, "log_from", 0)) if x.strip()]
-                    why = next((x for x in reversed(tail) if any(k in x.lower() for k in
-                                                                 ("error", "fehler", "traceback", "out of memory"))),
-                               tail[-1] if tail else "")
+                    why = strata_failure_line(tail)
                     self._set("error", "Strata startet nicht" + (f": {why.strip()[:300]}" if why else
                                                                   f"; siehe {STRATA_LOG}"))
                     return
