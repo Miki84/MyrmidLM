@@ -5678,6 +5678,18 @@ def has_nvidia() -> bool:
     return _HAS_NVIDIA[0]
 
 
+_NV_INDEX_CACHE: dict = {}
+
+
+def side_nv_index(device: str, gpus: list) -> Optional[int]:
+    """The nvidia-smi number of the GPU a side model (embeddings, images) runs on, for the dashboard; cached."""
+    if not device or device == "cpu":
+        return None
+    if device not in _NV_INDEX_CACHE:
+        _NV_INDEX_CACHE[device] = nvidia_index(next((g for g in gpus if g.name == device), None))
+    return _NV_INDEX_CACHE[device]
+
+
 def nvidia_index(gpu: Optional["Device"]) -> Optional[int]:
     """The nvidia-smi number of a llama.cpp device (CUDA1 ...): by its PCI address, else by its place among cards of
     the same name (CUDA puts equal cards in PCI order, like nvidia-smi). Strata numbers cards as nvidia-smi does."""
@@ -7295,6 +7307,7 @@ class EmbedService:
     def status(self) -> dict:
         with self.lock:
             return {"model": self.conf["model"], "device": self.conf["device"], "state": self.state,
+                    "nv_index": side_nv_index(self.conf["device"], self.all_gpus),
                     "error": self.error, "file": self.file.name if self.file else None,
                     "models": sorted(EMBED_MODELS),
                     "devices": [{"name": "cpu", "description": f"CPU ({EMBED_CPU_THREADS} Threads)"}]
@@ -7464,6 +7477,36 @@ class ImageService:
         self.proc: Optional[subprocess.Popen] = None
         self.tail: list = []
         self.job = 0
+        self.inflight, self.done, self.last_at = 0, 0, 0.0  # images being made / made, for the dashboard
+
+    def begin(self) -> None:
+        with self.lock:
+            self.inflight += 1
+
+    def end(self) -> None:
+        with self.lock:
+            self.inflight = max(0, self.inflight - 1)
+            self.done += 1
+            self.last_at = time.time()
+
+    def comfy_busy(self) -> int:
+        """ComfyUI answers a prompt at once and works its queue afterwards: running and waiting jobs."""
+        import http.client
+
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", COMFY_PORT, timeout=1)
+            conn.request("GET", "/queue")
+            q = json.loads(conn.getresponse().read() or b"{}")
+            conn.close()
+            n = len(q.get("queue_running") or []) + len(q.get("queue_pending") or [])
+        except (OSError, ValueError, http.client.HTTPException):
+            return 0
+        with self.lock:
+            if self.inflight and not n:
+                self.done += self.inflight
+                self.last_at = time.time()
+            self.inflight = n
+        return n
 
     @staticmethod
     def load() -> dict:
@@ -7511,9 +7554,13 @@ class ImageService:
         log(f"Bilder: {state}{': ' + error if error else ''}")
 
     def status(self) -> dict:
+        if self.state == "ready" and self.conf["engine"] == "comfyui":
+            self.comfy_busy()
         with self.lock:
             return {"engine": self.conf["engine"], "model": self.conf["model"], "device": self.conf["device"],
                     "state": self.state, "error": self.error, "progress": self.progress,
+                    "nv_index": side_nv_index(self.conf["device"], self.all_gpus),
+                    "busy": self.inflight, "done": self.done, "last_at": self.last_at or None,
                     "backend": self.built_backend() or None,
                     "installed": {e: (self.built_backend(e) or None) if self.installed(e) else None
                                   for e in IMAGE_ENGINES},
@@ -8344,6 +8391,9 @@ def _host_proxy_handler(node: HostNode):
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() in ("content-type", "accept", "authorization")
                        or (side and k.lower() in PASS_HEADERS)}
+            making = method == "POST" and self.path.startswith("/image/")  # sd-server makes the image while we wait
+            if making:
+                node.image.begin()
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=900)
             try:
                 try:
@@ -8375,6 +8425,8 @@ def _host_proxy_handler(node: HostNode):
                     self.close_connection = True  # client went away; closing the backend stops generating
             finally:
                 conn.close()
+                if making:
+                    node.image.end()
 
         def do_GET(self):
             self._pass("GET")
