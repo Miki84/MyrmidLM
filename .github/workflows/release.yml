@@ -109,4 +109,12 @@ jobs:
             "PCs aktualisieren sich selbst (Dashboard, Bereich Version). Neue Installation:" \
             '`curl -fsSL https://raw.githubusercontent.com/Miki84/MyrmidLM/main/install.sh | bash`' > notes.md
           shopt -s nullglob
-          gh release create "$GITHUB_REF_NAME" --title "MyrmidLM $(cat VERSION)" --notes-file notes.md out/*.apk
+          apks=(out/*.apk)
+          # A release made by hand (GitHub web) before this run: fill it in instead of failing
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME gibt es schon: Titel, Text und APKs werden ergänzt"
+            gh release edit "$GITHUB_REF_NAME" --title "MyrmidLM $(cat VERSION)" --notes-file notes.md
+            if [ ${#apks[@]} -gt 0 ]; then gh release upload "$GITHUB_REF_NAME" "${apks[@]}" --clobber; fi
+          else
+            gh release create "$GITHUB_REF_NAME" --title "MyrmidLM $(cat VERSION)" --notes-file notes.md "${apks[@]}"
+          fi
