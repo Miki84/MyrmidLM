@@ -4440,7 +4440,8 @@ DEFAULT_REPO = "https://github.com/Miki84/MyrmidLM.git"
 SERVICES = ("myrmid-server", "myrmid-worker", "myrmid-host")
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 RELEASE_RE = re.compile(r"^(\d+\.\d+\.\d+|main-[0-9a-f]{7,40})$")
-UPDATE_ACTIONS = ("check", "prepare", "activate", "rollback", "auto", "strata-install", "maya-install")
+UPDATE_ACTIONS = ("check", "prepare", "activate", "rollback", "auto", "strata-install", "maya-install",
+                  "polystrata-install")
 UPDATE_HEALTH_S = 30  # services must stay up this long after a switch
 UPDATE_SELF_AFTER_S = 7 * 86400  # a worker whose master never asks switches itself after a week
 MIN_BUILD_FREE_GB = 3
@@ -4874,7 +4875,7 @@ def update_apply_request() -> dict:
     if version is not None and not RELEASE_RE.match(str(version)):
         raise UpdateError(f"not a release: {version}")
     log(f"Update request: {action} {version or ''}".rstrip())
-    if action in ("strata-install", "maya-install"):
+    if action in ("strata-install", "maya-install", "polystrata-install"):
         return strata_install_start(req, EXTS[action.split("-")[0]])
     if action == "check":
         return update_check()
@@ -4896,7 +4897,7 @@ def strata_install_start(req: dict, x: Optional["Ext"] = None) -> dict:
     x = _cx(x)
     user = str(req.get("user") or "")
     model = str(req.get("model") or x.default_model)
-    model = model.upper() if x.key == "strata" else model.lower()
+    model = model.upper() if x is STRATA_X else model.lower() if x.kind == "maya" else model
     ctx, kv = int(req.get("context") or 0), str(req.get("kv") or "int8")
     try:
         if pwd.getpwnam(user).pw_uid < 1000:
@@ -5498,10 +5499,22 @@ class Ext:
     default_model: str
     has_kv: bool  # its setup takes --kv (Strata); Maya's configurations bring their own
     parallel_cli: bool  # its server.py takes --parallel; else it goes into a copy of the configuration
+    kind: str = ""  # whose setup.sh and server it has: "strata" (Strata, PolyStrata) or "maya"
+    cfg_key: str = ""  # its configurations' names: <cfg_key>-*.json (PolyStrata keeps Strata's strata-*.json)
+    size: str = ""  # what the model download takes, for the messages
+    dir_names: tuple = ()  # the clone's folder names under /home/<user>/ (setup without --dir)
 
     @property
     def env_prefix(self) -> str:
         return self.key.upper()
+
+    @property
+    def server_engine(self) -> str:  # serve/server.py --engine ...
+        return self.kind or self.key
+
+    @property
+    def api_key_env(self) -> str:  # the variable its server.py takes the key from
+        return f"{(self.kind or self.key).upper()}_API_KEY"
 
     @property
     def conf(self) -> Path:  # folder, user, python (no secrets)
@@ -5541,11 +5554,11 @@ class Ext:
 
     @property
     def cfg_prefix(self) -> str:
-        return f"{self.key}-"
+        return f"{self.cfg_key or self.key}-"
 
     @property
     def cfg_re(self):
-        return re.compile(rf"^{self.key}-[A-Za-z0-9_.-]+\.json$")
+        return re.compile(rf"^{self.cfg_key or self.key}-[A-Za-z0-9_.-]+\.json$")
 
     @property
     def exec_line(self) -> str:
@@ -5554,7 +5567,9 @@ class Ext:
         p = self.env_prefix
         cd = f"[ -f {self.subdir}/serve/server.py ] && cd {self.subdir}; " if self.subdir else ""
         par = f" $${{{p}_PARALLEL:+--parallel \"$${p}_PARALLEL\"}}" if self.parallel_cli else ""
-        return (f"ExecStart=/bin/sh -c '{cd}exec .venv/bin/python serve/server.py --engine {self.key} "
+        # the venv's python by its full path: Strata and PolyStrata run the same server.py --engine strata, and the
+        # path tells which one a process is (strata_pid)
+        return (f"ExecStart=/bin/sh -c '{cd}exec \"$$PWD\"/.venv/bin/python serve/server.py --engine {self.server_engine} "
                 f"--config \"$${p}_CONFIG\" --port \"$${p}_PORT\" --host 127.0.0.1 $${{{p}_GPU:+--gpu \"$${p}_GPU\"}}{par}'")
 
     @property
@@ -5598,12 +5613,21 @@ TimeoutStartSec=4h
 
 
 STRATA_X = Ext("strata", "Strata", "https://github.com/Niko1221/Strata.git", "terminal",
-               ("IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0", "IQ1_M", "Q8_0"), "IQ3_S", True, True)
+               ("IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0", "IQ1_M", "Q8_0"), "IQ3_S", True, True,
+               kind="strata", size="40-90 GB", dir_names=("strata", "Strata"))
 MAYA_X = Ext("maya", "Maya", "https://github.com/mw00/project-maya.git", "",
              ("glm-maya-s", "glm-maya-s24", "glm-maya-xs", "glm-maya-m", "glm-maya-l",
               "deepseek-maya-xs", "deepseek-maya-s", "deepseek-maya-m", "minimax-maya-xs", "minimax-maya-s",
-              "hy4-flash-maya-xs", "hy4-flash-maya-s", "hy4-flash-maya-m", "hy4-flash-maya-l"), "glm-maya-s", False, False)
-EXTS = {x.key: x for x in (STRATA_X, MAYA_X)}
+              "hy4-flash-maya-xs", "hy4-flash-maya-s", "hy4-flash-maya-m", "hy4-flash-maya-l"), "glm-maya-s", False, False,
+             kind="maya", size="70-520 GB je nach Modell", dir_names=("maya", "project-maya", "Maya"))
+# PolyStrata: Strata's layout, setup and server (strata-*.json, --engine strata) with an engine of its own for many
+# more models; its install takes "family:model" (setup.sh --family ... --model ...)
+POLY_X = Ext("polystrata", "PolyStrata", "https://github.com/simplexai-labs/PolyStrata.git", "terminal",
+             ("qwen36:UD-Q4_K_M", "qwen36:UD-Q3_K_M", "inkling:UD-Q4_K_XL", "inkling:UD-Q3_K_XL", "gemma4:UD-Q4_K_M",
+              "lfm25:UD-Q4_K_XL", "flint:UD-Q4_K_XL", "tiel:UD-Q4_K_XL", "ornith:APEX-I-QUALITY", "kolibri:Q4_K_M",
+              "minicpmv:Q4_K_M", "groot:Q4_K_M", "qwen:IQ3_S"), "qwen36:UD-Q4_K_M", True, True,
+             kind="strata", cfg_key="strata", size="10-180 GB je nach Modell", dir_names=("polystrata", "PolyStrata"))
+EXTS = {x.key: x for x in (STRATA_X, MAYA_X, POLY_X)}
 _EXT_CUR = [STRATA_X]  # root's commands (myrmid strata ..., myrmid maya ...) work on one engine per process
 
 
@@ -5674,7 +5698,11 @@ def strata_pid(port: int = 0, x: Optional["Ext"] = None) -> Optional[int]:
                 argv = f.read().decode(errors="replace").split("\0")
         except OSError:
             continue
-        if not any(a.endswith("serve/server.py") for a in argv) or _cx(x).key not in argv:
+        if not any(a.endswith("serve/server.py") for a in argv) or _cx(x).server_engine not in argv:
+            continue
+        # Strata and PolyStrata: the same server; the venv's full path (our unit gives it) says whose it is
+        home = (strata_conf(x).get("dir") or "").rstrip("/")
+        if home and argv[0].startswith("/") and not argv[0].startswith(home + "/"):
             continue
         if port and not any(argv[i] == "--port" and argv[i + 1] == str(port) for i in range(len(argv) - 1)):
             continue
@@ -5945,7 +5973,7 @@ def _ext_catalog(conf: dict, d: Path, x: Optional["Ext"] = None) -> dict:
     names its families and builds (read with its Python as its user); its Qwen builds are the ones the install
     offers. Maya: its own quants, by family."""
     x = _cx(x)
-    if x.key == "maya":
+    if x.kind == "maya":
         titles = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash", "minimax": "MiniMax-M3.1-Flash",
                   "hy4": "Tencent Hy4-Flash"}
         out: dict = {}
@@ -5997,7 +6025,7 @@ def _strata_write_info(conf: dict, result: Optional[dict] = None, x: Optional["E
 def _strata_env_text(config: str, port: int, key: str, gpus: str = "", parallel: int = 0,
                      x: Optional["Ext"] = None) -> str:
     p = _cx(x).env_prefix
-    return (f"{p}_CONFIG={config}\n{p}_PORT={port}\n{p}_API_KEY={key}\n{p}_GPU={gpus}\n"
+    return (f"{p}_CONFIG={config}\n{p}_PORT={port}\n{_cx(x).api_key_env}={key}\n{p}_GPU={gpus}\n"
             f"{p}_PARALLEL={parse_parallel(parallel) or ''}\n")
 
 
@@ -6149,7 +6177,7 @@ def strata_apply_request(x: Optional["Ext"] = None) -> None:
             _systemctl("stop", x.unit)
             res["running"] = None
         elif act == "update":
-            if x.key == "maya":  # Maya's way: git pull, then setup.sh (builds what changed; the model stays)
+            if x.kind == "maya":  # Maya's way: git pull, then setup.sh (builds what changed; the model stays)
                 _strata_run_job(conf, d, ["git", "pull", "--ff-only"], "git pull", x=x)
                 env = strata_cuda12_env(x) if nvidia_old_gpus() else {}
                 _strata_run_job(conf, d, ["sh", "./setup.sh", "--no-start", "--yes"] + _maya_cuda_args(env), "Update",
@@ -6178,7 +6206,7 @@ def strata_apply_request(x: Optional["Ext"] = None) -> None:
             sel = [int(g) for g in gpus.split(",")] if gpus else []
             old = set(nvidia_old_gpus()) & set(sel or nvidia_old_gpus())
             env = {}
-            if x.key == "maya":
+            if x.kind == "maya":
                 cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes"] \
                     + (["--download-model", "--model", mod] if add else ["--model", _maya_model_id(conf, d, cfg)]) \
                     + ctx_arg
@@ -6464,10 +6492,13 @@ def _strata_config_settings(d: Path, x: Optional["Ext"] = None) -> dict:
 
 
 def _strata_find_dir() -> Optional[Path]:
-    k = _cx().key
-    names = [k] + (["project-maya", "Maya"] if k == "maya" else [])
-    for p in [q for n in names for q in sorted(Path("/home").glob(f"*/{n}"))] + [Path(f"/opt/{k}"), Path(f"/root/{k}")]:
-        if _is_strata_dir(p) and (k != "maya" or (p / "maya.py").is_file()):
+    x = _cx()
+    names = list(x.dir_names or (x.key,))
+    for p in [q for n in names for q in sorted(Path("/home").glob(f"*/{n}"))] + [Path(f"/opt/{x.key}"), Path(f"/root/{x.key}")]:
+        # the right project: Maya has maya.py, PolyStrata polystrata.py, Strata neither
+        marks = {"maya": "maya.py", "polystrata": "polystrata.py"}
+        if _is_strata_dir(p) and (x.key not in marks or (p / marks[x.key]).is_file()) \
+                and (x.key != "strata" or not any((p / m).is_file() for m in marks.values())):
             return p
     return None
 
@@ -6530,7 +6561,7 @@ def strata_setup(args, x: Optional["Ext"] = None) -> None:
         die(f"{py} fehlt: {x.label} einmal mit ./setup.sh einrichten")
     old = UNIT_DIR / f"{x.key}.service"
     extra = _strata_old_unit_env(old)
-    if x.key == "strata" and not any(e.startswith("Environment=STRATA_UV=") for e in extra) and (d / "uv.lock").exists():
+    if x.kind == "strata" and not any(e.startswith("Environment=STRATA_UV=") for e in extra) and (d / "uv.lock").exists():
         extra.append("Environment=STRATA_UV=1")
     conf = {"dir": str(d), "user": user, "python": str(py),
             "env": {e.split("=", 2)[1]: e.split("=", 2)[2] for e in extra
@@ -6555,7 +6586,7 @@ def strata_setup(args, x: Optional["Ext"] = None) -> None:
     Path(RUN_DIR).mkdir(parents=True, exist_ok=True)
     _strata_write_info(conf, x=x)
     cfgs = _strata_configs(d, x)
-    print(f"Konfigurationen: {', '.join(cfgs) or f'keine {x.key}-*.json gefunden'}")
+    print(f"Konfigurationen: {', '.join(cfgs) or f'keine {x.cfg_prefix}*.json gefunden'}")
     print(f"Protokoll: {x.log}")
     print(f"Im Dashboard des Masters: Host-Karte → Engine „{x.label}“ wählen, Konfiguration wählen, Laden.")
 
@@ -6595,16 +6626,18 @@ def strata_install(args, x: Optional["Ext"] = None) -> None:
         if as_user(["git", "clone", x.repo, str(d)], d.parent):
             die("git clone ist fehlgeschlagen")
     if not args.no_setup:
-        size = "40-90 GB" if x.key == "strata" else "70-520 GB je nach Modell"
+        size = x.size
         print(f"\n{x.label}-Einrichtung (setup.sh, als {user}): Modell, Speicherort und Einstellungen wählen. "
               f"Das Modell wird heruntergeladen ({size}); {x.label} startet danach nicht, das macht MyrmidLM.\n")
         extra = list(args.setup_args or [])
         env = {}
-        if x.key == "maya" and nvidia_old_gpus():  # Volta and older: Maya builds with CUDA 12 for them
+        if x.kind == "maya" and nvidia_old_gpus():  # Volta and older: Maya builds with CUDA 12 for them
             env = strata_cuda12_env(x)
             extra = _maya_cuda_args(env) + extra
         if getattr(args, "model", None):  # from the dashboard: no questions (--yes), the choices given
-            extra = ["--yes", "--model", args.model] + (["--download-model"] if x.key == "maya" else []) \
+            fam, _, mod = args.model.rpartition(":")  # PolyStrata: family:model
+            extra = ["--yes", "--model", mod] + (["--family", fam] if fam else []) \
+                + (["--download-model"] if x.kind == "maya" else []) \
                 + (["--context", str(args.context)] if args.context else []) \
                 + (["--kv", args.kv] if args.kv and x.has_kv else []) + extra
         if not getattr(args, "model", None):
@@ -6615,7 +6648,7 @@ def strata_install(args, x: Optional["Ext"] = None) -> None:
         if code:
             die(f"setup.sh endete mit Code {code}. Danach erneut: sudo myrmid {x.key} install --user {user}")
     if not _strata_configs(d, x):
-        die(f"In {d} gibt es noch keine {x.key}-*.json (kein Modell eingerichtet): "
+        die(f"In {d} gibt es noch keine {x.cfg_prefix}*.json (kein Modell eingerichtet): "
             f"sudo myrmid {x.key} install --user {user} erneut ausführen")
     args.dir, args.user = str(d), user
     print()
@@ -6639,7 +6672,7 @@ def cmd_strata(args, x: Optional["Ext"] = None) -> None:
         print(f"Konfig.:  {', '.join(info.get('configs') or []) or '?'}")
         local = _strata_configs(Path(conf["dir"]), x)
         if local != (info.get("configs") or []):
-            print(f"Im Ordner: {', '.join(local) or f'keine {x.key}-*.json'} (Ordner {_strata_work(Path(conf['dir']))})")
+            print(f"Im Ordner: {', '.join(local) or f'keine {x.cfg_prefix}*.json'} (Ordner {_strata_work(Path(conf['dir']))})")
         r = info.get("result") or {}
         if r:
             print(f"Zuletzt:  {r.get('action')} " + ("ok" if r.get("ok") else f"Fehler: {r.get('error')}"))
@@ -6865,7 +6898,7 @@ class HostAgent:
         x = EXTS.get(str(body.get("engine") or ""))
         if x:  # model = one of the engine's <engine>-*.json; it brings its own settings
             if not x.cfg_re.match(model):
-                return {"error": f"{x.label}: Konfiguration {x.key}-<name>.json wählen"}
+                return {"error": f"{x.label}: Konfiguration {x.cfg_prefix}<name>.json wählen"}
             gpus = str(body.get("strata_gpus") or "").replace(" ", "")
             if gpus and not STRATA_GPU_RE.match(gpus):
                 return {"error": f"{x.label}: ungültige GPU-Auswahl {gpus}"}
@@ -7022,7 +7055,7 @@ class HostAgent:
                 self.proc, self.model_path, self.ctx, self.tail, self.cmd = proc, Path(a["model"]), None, [], []
                 self.estimate_tps, self.download, self.note = None, None, ""
             # the engine loads its own files (Strata about 40-90 GB, Maya up to several hundred): minutes
-            end = time.time() + (1800 if x.key == "strata" else 3600)
+            end = time.time() + (1800 if x is STRATA_X else 3600)
             while time.time() < end:
                 if not current():
                     return
@@ -7088,7 +7121,7 @@ class HostAgent:
         if not res.get("ok"):
             return {**self.status(), "error": f"{x.label}: {res.get('error')}"}
         with self.lock:
-            size = "40-90 GB" if x.key == "strata" else "70-520 GB"
+            size = x.size
             self.event = (f"{x.label} wird für {b['user']} installiert ({b['model']}). Das dauert, mit Download des "
                           f"Modells ({size}) eine Stunde und mehr; Fortschritt: {x.install_log}")
         return self.status()
@@ -10803,7 +10836,7 @@ class HostManager:
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
                                                        "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned", "groups", "group", "nv_index",
-                                                       "note", "snapshots", "rollback", "engine", "strata", "strata_install", "maya", "maya_install", "spec_info",
+                                                       "note", "snapshots", "rollback", "engine", "strata", "strata_install", "maya", "maya_install", "polystrata", "polystrata_install", "spec_info",
                                                        "embed", "image")},
                               "busy": (st.get("metrics") or {}).get("requests_processing"),
                               "waiting": (st.get("metrics") or {}).get("requests_deferred")})
@@ -11626,7 +11659,9 @@ def main() -> None:
     sc.set_defaults(fn=cmd_scan)
 
     for key, label, url, example in (("strata", "Strata", "github.com/Niko1221/Strata", "IQ3_S"),
-                                      ("maya", "Project Maya", "github.com/mw00/project-maya", "glm-maya-s")):
+                                      ("maya", "Project Maya", "github.com/mw00/project-maya", "glm-maya-s"),
+                                      ("polystrata", "PolyStrata", "github.com/simplexai-labs/PolyStrata",
+                                       "qwen36:UD-Q4_K_M")):
         st = sub.add_parser(key, help=f"{label} as a host's engine: install or setup (once, sudo), status",
                             description=f"install: clone {label} ({url}) into the user's home, run its setup.sh as "
                                         "that user (choose the model there), then do what setup does. "
