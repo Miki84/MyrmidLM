@@ -5625,7 +5625,8 @@ MAYA_X = Ext("maya", "Maya", "https://github.com/mw00/project-maya.git", "",
 POLY_X = Ext("polystrata", "PolyStrata", "https://github.com/simplexai-labs/PolyStrata.git", "terminal",
              ("qwen36:UD-Q4_K_M", "qwen36:UD-Q3_K_M", "inkling:UD-Q4_K_XL", "inkling:UD-Q3_K_XL", "gemma4:UD-Q4_K_M",
               "lfm25:UD-Q4_K_XL", "flint:UD-Q4_K_XL", "tiel:UD-Q4_K_XL", "ornith:APEX-I-QUALITY", "kolibri:Q4_K_M",
-              "minicpmv:Q4_K_M", "groot:Q4_K_M", "qwen:IQ3_S"), "qwen36:UD-Q4_K_M", True, True,
+              "minicpmv:Q4_K_M", "groot:Q4_K_M", "qwen:IQ3_S", "glm:3.0BIT", "glm:REAP50-Q3_K_M", "glm:UD-IQ2_XXS",
+              "deepseek:UD-IQ2_XXS"), "qwen36:UD-Q4_K_M", True, True,
              kind="strata", cfg_key="strata", size="10-180 GB je nach Modell", dir_names=("polystrata", "PolyStrata"))
 EXTS = {x.key: x for x in (STRATA_X, MAYA_X, POLY_X)}
 _EXT_CUR = [STRATA_X]  # root's commands (myrmid strata ..., myrmid maya ...) work on one engine per process
@@ -5982,13 +5983,18 @@ def _ext_catalog(conf: dict, d: Path, x: Optional["Ext"] = None) -> dict:
             out.setdefault(fam, {"title": titles.get(fam, fam), "models": {}})["models"][m] = ""
         return out
     out = {"qwen": {"title": "Qwen3.8-Flash-Next", "models": {m: "" for m in x.models}}}
-    code = ("import json, setup\nout = {}\n"
+    # A family's sizes: its own "models", else the shared MODELS whose "families" name it (none named: Qwen's), as
+    # Strata's and PolyStrata's setup choose them (e.g. PolyStrata's GLM 5.3 Flash: 3.0BIT, UD-IQ2_XXS, REAP50-Q3_K_M)
+    code = ("import json, setup\nout = {}\nshared = getattr(setup, 'MODELS', {}) or {}\n"
+            "about = lambda d: (str(d.get('about') or '') if isinstance(d, dict) else '')[:160]\n"
             "for tab in ('FAMILIES', 'PREVIEW_FAMILIES', 'HY4_FAMILIES', 'INKLING_FAMILIES'):\n"
             "    for k, v in getattr(setup, tab, {}).items():\n"
-            "        ms = v.get('models') or {}\n"
+            "        ms = {str(m): about(d) for m, d in (v.get('models') or {}).items()}\n"
+            "        if not ms:\n"
+            "            ms = {str(m): about(d) for m, d in shared.items() if k in (d.get('families') if isinstance(d, dict)"
+            " and d.get('families') else ('qwen',))}\n"
             "        if ms:\n"
-            "            out[k] = {'title': str(v.get('title') or k), 'models': {str(m): (str(ms[m].get('about') or '')"
-            " if isinstance(ms[m], dict) else '')[:160] for m in ms}}\n"
+            "            out[k] = {'title': str(v.get('title') or k), 'models': ms}\n"
             "print(json.dumps(out))")
     try:
         r = _run_as(conf["user"], [str(_strata_work(d) / ".venv" / "bin" / "python"), "-c", code],
