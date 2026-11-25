@@ -1759,6 +1759,7 @@ function renderHosts(s) {
     const sleepRow = x.maintenance ? "" : x.asleep
       ? `<div class="kv"><span>${x.waking ? "Wird geweckt, lädt danach sein Modell …" : "Schläft. Eine Anfrage an sein Modell weckt ihn."}</span>${x.wakeable && !x.waking ? `<button class="btn quiet small" type="button" data-hwake>Aufwecken</button>` : ""}</div>`
       : `<div class="kv"><label class="inline">Schlafen nach <input name="sleep_min" class="mini" inputmode="numeric" value="${esc(String(e.sleep_min ?? x.sleep_min ?? 0))}"> Min. ohne Anfrage (0 = nie)</label>${x.can_sleep && x.state === "ready" ? `<button class="btn quiet small" type="button" data-hsleep>${x.slot != null ? "PC jetzt schlafen legen" : "Jetzt schlafen"}</button>` : ""}</div>
+         <div class="kv"><label class="inline" title="Für Anfragen, die selbst keine Stufe nennen (Open WebUI ohne „Reasoning Effort“, die meisten Clients): der Router trägt diese ein. Eine Stufe im Client oder in Open WebUIs Modell-Einstellungen gilt weiter. Wirkt sofort, ohne Neuladen. Strata und Maya kennen keine/niedrig/mittel/hoch; llama.cpp-Modelle meist nur aus oder an (dann zählt „keine“ = Denken aus).">Denkstufe <select name="effort" class="mini-sel">${[["", "Modell-Standard"], ["none", "keine (nicht denken)"], ["low", "niedrig"], ["medium", "mittel"], ["high", "hoch"], ["xhigh", "sehr hoch"]].map(([v, t]) => `<option value="${v}"${v === (x.effort || "") ? " selected" : ""}>${t}</option>`).join("")}</select></label></div>
          ${x.slot != null && x.sleep_min ? `<div class="note">Der PC schläft erst, wenn alle seine GPUs so lange keine Anfrage hatten.</div>` : ""}
          ${x.sleep_min && !x.can_sleep ? `<div class="note">Schlafen braucht den Helfer des Installationsskripts (Rolle Host) auf diesem PC.</div>` : ""}
          ${x.sleep_min && !x.wakeable ? `<div class="note">Keine MAC-Adresse bekannt (WLAN?): Aufwecken per Wake-on-LAN geht nur über Kabel.</div>` : ""}`;
@@ -1957,6 +1958,13 @@ $("hosts-removed").addEventListener("click", (ev) => {
   ev.target.disabled = true; hostAction({ restore: pc });
 });
 $("hosts").addEventListener("change", (ev) => {
+  if (ev.target.name === "effort") {
+    const card = ev.target.closest(".host");
+    if (hostEdits[card.dataset.id]) delete hostEdits[card.dataset.id].effort;
+    hostAction({ host: card.dataset.id, effort: ev.target.value });
+    ev.target.blur();
+    return;
+  }
   if (ev.target.name !== "sleep_min") return;
   const card = ev.target.closest(".host");
   if (hostEdits[card.dataset.id]) delete hostEdits[card.dataset.id].sleep_min;

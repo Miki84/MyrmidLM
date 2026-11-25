@@ -1223,6 +1223,36 @@ def effort_instead(sent: str, error: str) -> str:
     return min(ok, key=lambda w: (abs(EFFORTS.index(w) - i), EFFORTS.index(w)))
 
 
+HOST_EFFORTS = ("none", "low", "medium", "high", "xhigh")  # what the dashboard offers as a model's default
+
+
+def default_effort(raw: Optional[bytes], path: str, level: str) -> Optional[bytes]:
+    """A request that names no thinking level gets the model's default from the dashboard: reasoning_effort
+    (chat completions) or reasoning.effort (responses); "none" also turns thinking off in the chat template
+    (llama.cpp's Qwen templates know only on and off). Anthropic's /v1/messages and requests that say anything
+    about thinking stay as they are."""
+    if not raw or not level or not path.split("?", 1)[0].rstrip("/").endswith(("chat/completions", "responses")):
+        return raw
+    try:
+        body = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+    if not isinstance(body, dict):
+        return raw
+    kw = body.get("chat_template_kwargs") if isinstance(body.get("chat_template_kwargs"), dict) else {}
+    if body.get("reasoning_effort") or (isinstance(body.get("reasoning"), dict) and body["reasoning"].get("effort")) \
+            or "enable_thinking" in kw or "thinking" in body:
+        return raw
+    if path.split("?", 1)[0].rstrip("/").endswith("responses"):
+        body["reasoning"] = {**(body.get("reasoning") if isinstance(body.get("reasoning"), dict) else {}),
+                             "effort": level}
+    else:
+        body["reasoning_effort"] = level
+    if level == "none":
+        body["chat_template_kwargs"] = {**kw, "enable_thinking": False}
+    return json.dumps(body).encode()
+
+
 def fix_effort(raw: Optional[bytes], efforts: dict) -> Optional[bytes]:
     """The request with reasoning_effort replaced as learned for this backend."""
     if not raw or not efforts or b"reasoning_effort" not in raw:
@@ -8937,6 +8967,7 @@ class Backend:
     upstream_model: str = ""  # external server: the model name it wants in requests
     vision: Optional[bool] = None  # reads images (from the server's /props; None: not known yet)
     efforts: dict = field(default_factory=dict)  # reasoning_effort a client sends -> one its template takes
+    effort: str = ""  # the thinking level for requests that name none (dashboard)
     temp: float = 0.0  # its hottest GPU (°C; 0: not known): of equally busy ones, the cooler one answers
 
     @property
@@ -9177,7 +9208,7 @@ class Router:
                 prev = old.get((h.source, h.base))
                 if prev:
                     prev.name, prev.label, prev.group, prev.where, prev.ctx = h.name, h.label, h.group, h.where, h.ctx
-                    prev.temp = h.temp
+                    prev.temp, prev.effort = h.temp, h.effort
                     if prev.label != h.label or prev.est_tps != h.est_tps:
                         prev.est_tps = h.est_tps
                     if prev.asleep != h.asleep:
@@ -10037,7 +10068,7 @@ class Router:
                     return
 
             def _forward(self, backend: Backend, method: str, raw: Optional[bytes], reason: str) -> None:
-                raw = fix_effort(raw, backend.efforts)
+                raw = fix_effort(default_effort(raw, self.path, backend.effort), backend.efforts)
                 u = urlsplit(backend.base)
                 conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
                 conn = conn_cls(u.hostname, u.port or (443 if u.scheme == "https" else 80), timeout=900)
@@ -10207,6 +10238,7 @@ class HostManager:
         self.args, self.router, self.key = args, router, key
         self.known = known or Known()
         self.sleep_min: dict[str, int] = {}  # host id -> minutes without requests before it sleeps
+        self.efforts: dict[str, str] = {}  # host id -> thinking level for requests that name none
         self.last_active: dict[str, float] = {}
         self.last_served: dict[str, int] = {}
         self.lock = threading.RLock()
@@ -10224,6 +10256,7 @@ class HostManager:
         try:
             saved = json.loads(HOSTS_STATE.read_text())
             self.assign, self.sleep_min = saved.get("assign", {}), saved.get("sleep", {})
+            self.efforts = {k: v for k, v in (saved.get("effort") or {}).items() if v in HOST_EFFORTS}
             self.maint = set(saved.get("maint") or [])
             self.removed = dict(saved.get("removed") or {})
         except (OSError, ValueError):
@@ -10262,7 +10295,7 @@ class HostManager:
     def save(self) -> None:
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            HOSTS_STATE.write_text(json.dumps({"assign": self.assign, "sleep": self.sleep_min,
+            HOSTS_STATE.write_text(json.dumps({"assign": self.assign, "sleep": self.sleep_min, "effort": self.efforts,
                                                "maint": sorted(getattr(self, "maint", set())),
                                                "removed": getattr(self, "removed", {})}))
         except OSError as e:
@@ -10439,6 +10472,7 @@ class HostManager:
                 self.hosts.pop(x, None)
                 self.assign.pop(x, None)
                 self.sleep_min.pop(x, None)
+                self.efforts.pop(x, None)
                 self.pushed.pop(x, None)
                 self.known.forget(x)
             self.maint.discard(pc)
@@ -10482,7 +10516,8 @@ class HostManager:
                                             f"http://{h['addr']}:{st.get('api_port') or rec.get('api_port') or HOST_API_PORT}"
                                             f"{h.get('path') or ''}",
                                             self.key, label, group=a.get("name") or label, where=h["name"],
-                                            source=hid, ctx=st.get("ctx") or 0, asleep=True, status="asleep"))
+                                            source=hid, ctx=st.get("ctx") or 0, asleep=True, status="asleep",
+                                            effort=self.efforts.get(hid, "")))
                     continue
                 a = st.get("assignment") or {}
                 if st.get("state") != "ready" or not st.get("model") or h.get("error"):
@@ -10491,7 +10526,8 @@ class HostManager:
                                         f"http://{h['addr']}:{st.get('api_port', HOST_API_PORT)}{h.get('path') or ''}",
                                         self.key, st["model"], group=a.get("name") or st["model"],
                                         where=h["name"], source=hid, ctx=st.get("ctx") or 0,
-                                        est_tps=float(st.get("estimate_tps") or 0), temp=host_gpu_temp(st)))
+                                        est_tps=float(st.get("estimate_tps") or 0), temp=host_gpu_temp(st),
+                                        effort=self.efforts.get(hid, "")))
             embedders = []
             for hid, h in self.hosts.items():
                 st = h.get("status") or {}
@@ -10698,6 +10734,17 @@ class HostManager:
         if body.get("sleep"):
             threading.Thread(target=self.sleep, args=(hid, "from the dashboard"), daemon=True).start()
             return self.info()
+        if "effort" in body:  # the router's default for this model: no reload
+            v = str(body.get("effort") or "")
+            if v and v not in HOST_EFFORTS:
+                return {**self.info(), "error": f"Denkstufe: {', '.join(HOST_EFFORTS)} oder leer"}
+            if v:
+                self.efforts[hid] = v
+            else:
+                self.efforts.pop(hid, None)
+            self.save()
+            self.update_router()
+            return self.info()
         if "sleep_min" in body:
             v = str(body.get("sleep_min") or "0")
             self.sleep_min[hid] = int(v) if v.isdigit() else 0
@@ -10743,6 +10790,7 @@ class HostManager:
                               "asleep": bool(h.get("asleep")), "wakeable": hid in self.known.machines,
                               "waking": self.known.recently_woken(hid),
                               "sleep_min": int(self.sleep_min.get(hid, self.args.host_sleep or 0) or 0),
+                              "effort": self.efforts.get(hid, ""),
                               "maintenance": self.in_maint(hid),
                               "can_sleep": bool((h.get("status") or {}).get("can_sleep")),
                               "switchable": bool((h.get("status") or {}).get("switchable")),
