@@ -9948,12 +9948,20 @@ class Router:
                                             "workflow": comfy_workflow(model), "nodes": comfy_nodes()})
                 if path in ("/v1/models", "/models"):
                     now = int(time.time())
-                    data = [{"id": router.public_name, "object": "model", "owned_by": "myrmid", "created": now}]
+
+                    def ctx_of(bs: list) -> dict:
+                        # the context a client can count on (the smallest of the servers that may answer): agents
+                        # such as Hermes read it here (context_length, as OpenRouter and vLLM name it)
+                        n = min((b.ctx for b in bs if b.ctx), default=0)
+                        return {"context_length": n, "max_model_len": n} if n else {}
+
+                    data = [{"id": router.public_name, "object": "model", "owned_by": "myrmid", "created": now,
+                             **ctx_of(router.role("big"))}]
                     for role in ("fast", "big"):
                         bs = router.role(role)
                         if bs:
                             data.append({"id": role, "object": "model", "owned_by": "myrmid", "created": now,
-                                         "meta": {"models": sorted({b.label for b in bs})}})
+                                         **ctx_of(bs), "meta": {"models": sorted({b.label for b in bs})}})
                     seen = set()
                     for b in router.backends:
                         g = b.group or b.label
@@ -9962,6 +9970,7 @@ class Router:
                         seen.add(g.lower())
                         where = sorted({x.where for x in router.backends if (x.group or x.label) == g})
                         data.append({"id": g, "object": "model", "owned_by": "myrmid", "created": now,
+                                     **ctx_of([x for x in router.backends if (x.group or x.label) == g]),
                                      "meta": {"model": b.label, "hosts": where}})
                     return self._json(200, {"object": "list", "data": data})
                 if path == "/health":
