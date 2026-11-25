@@ -150,6 +150,10 @@
   .host h3 { margin: 0; font-size: 1rem; }
   .host .sub { color: var(--muted); font-size: 0.84rem; }
   .host-top { display: flex; justify-content: space-between; gap: 10px; align-items: start; }
+  details.host-more { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 6px; }
+  details.host-more > summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+  details.host-more > summary .note { font-weight: normal; margin-left: 6px; }
+  details.host-more[open] > summary { margin-bottom: 6px; }
   .host form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .host form .wide { grid-column: 1 / -1; }
   .host label { display: grid; gap: 3px; font-size: 0.8rem; color: var(--muted); }
@@ -1764,9 +1768,17 @@ function renderHosts(s) {
       ${imModel && (im.hints || {})[imModel] ? `<div class="note muted">${esc(im.hints[imModel])}</div>` : ""}
       ${im.progress && im.state !== "ready" && im.state !== "off" ? `<div class="note">${esc(im.progress)}</div>` : ""}
       ${im.error ? `<div class="note bad">${esc(im.error)}</div>` : ""}`;
-    const roleRow = x.switchable && !x.asleep
-      ? `<div class="role-row"><span class="muted">Rolle: Host</span><button class="btn quiet small" type="button" data-role-ctl="${esc(x.addr)}" data-role="worker">Zum Worker machen</button></div>`
+    const roleBtn = x.switchable && !x.asleep
+      ? `<button class="btn quiet small" type="button" data-role-ctl="${esc(x.addr)}" data-role="worker" title="Rolle jetzt: Host. Als Worker leiht der PC seine GPUs einem anderen Host.">Zum Worker machen</button>`
       : "";
+    // what the folded part holds, in a few words: the model and what is set beside it
+    const moreSummary = `Modell und Einstellungen <span class="note">${[
+      a.model ? `${EXT_META[a.engine] ? EXT_META[a.engine].label + ": " : ""}${esc(String(a.model).replace(/\.json$/, ""))}` : "kein Modell zugewiesen",
+      x.effort ? "Denkstufe " + esc(x.effort) : "",
+      x.sleep_min ? `schläft nach ${x.sleep_min} Min.` : "",
+      (x.embed || {}).model ? "Embeddings" : "", (x.image || {}).model ? "Bilder" : "",
+      exts.length ? "Engines: llama.cpp, " + exts.map((k) => EXT_META[k].label).join(", ") : "", ...Object.keys(EXT_META).filter((k) => !x[k] && (x[k + "_install"] || {}).running).map((k) => EXT_META[k].label + " wird installiert"),
+    ].filter(Boolean).join(" · ")}</span>`;
     const maintRow = `<div class="kv">${x.maintenance
         ? `<span class="note">Wartung: nicht im Routing, wird weder geweckt noch schlafen gelegt.</span><button class="btn quiet small" type="button" data-hmaint="off">Wartung beenden</button>`
         : `<button class="btn quiet small" type="button" data-hmaint="on" title="Aus dem Routing nehmen, z. B. wenn der PC aus ist">Wartungsmodus</button>`}<button class="btn quiet small" type="button" data-hremove="${esc(x.name)}" title="Den PC aus MyrmidLM entfernen, z. B. wenn es ihn nicht mehr gibt">Entfernen</button></div>`;
@@ -1780,7 +1792,10 @@ function renderHosts(s) {
     return `<article class="host" data-id="${esc(x.id)}">
       <div class="host-top"><div><h3>${esc(x.name)}</h3><div class="sub">${esc(x.addr)}${x.gpu ? " · " + esc(x.gpu) : gpus ? " · " + gpus : ""}</div></div>
         <div class="pills">${x.online === undefined ? "" : `<div class="pill net ${x.online ? "on" : x.slow ? "slow" : "off"}" title="${x.online ? "Antwortet dem Master" : x.slow ? "Hat zuletzt nicht geantwortet (lädt oder ist ausgelastet?)" : x.asleep ? "Schläft oder ist aus: wird bei Bedarf per Wake-on-LAN geweckt" : "Antwortet nicht"}${x.seen_ago != null ? ` · zuletzt gesehen vor ${x.seen_ago < 120 ? x.seen_ago + " s" : Math.round(x.seen_ago / 60) + " min"}` : ""}">${x.online ? "online" : x.slow ? "antwortet langsam" : "offline"}</div>`}<div class="pill" title="Was das Modell gerade tut"><span class="dot ${cls}"></span><span>${txt}</span></div></div></div>
-      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${x.note ? `<div class="note">${esc(x.note)}</div>` : ""}${hostStats(x)}${layoutRow}${embedRow}${imageRow}${sleepRow}${maintRow}${roleRow}
+      ${now}${prog}${x.error ? `<div class="note bad">${esc(x.error)}</div>` : ""}${x.note ? `<div class="note">${esc(x.note)}</div>` : ""}${hostStats(x)}${layoutRow}
+      ${maintRow.replace(/<\/div>$/, "")}${roleBtn}</div>${x.asleep ? sleepRow : ""}
+      <details class="host-more"${hostOpen[x.id + ":more"] ?? Object.keys(hostEdits[x.id] || {}).length > 0 ? " open" : ""}><summary>${moreSummary}</summary>
+      ${embedRow}${imageRow}${x.asleep ? "" : sleepRow}
       ${x.spec_info && x.spec_info.text && !EXT_META[x.engine] ? `<div class="note">Vorausraten: ${esc(x.spec_info.text)}</div>` : ""}
       ${strataRow}${strataInstallRow}
       ${!EXT_META[x.engine] && (x.state === "ready" || x.state === "tuning" || x.tuned || x.tune_job) ? `<div class="kv"><span class="note">${esc(tuneText(x.tune_job, x.tuned) || "Autotune: misst die schnellsten Einstellungen für dieses Modell auf diesem PC.")}</span>${
@@ -1802,7 +1817,7 @@ function renderHosts(s) {
         <label title="Bild-Teil des Modells (mmproj), wenn es einen hat. Aus: mehr VRAM für Text.">Bilder<select name="vision">${[["auto", "an (GPU, wenn Platz)"], ["cpu", "an, im RAM"], ["off", "aus"]].map(([v, t]) => `<option value="${v}"${v === (e.vision ?? a.vision ?? "auto") ? " selected" : ""}>${t}</option>`).join("")}</select></label>
         <label title="Speculative Decoding: etwas rät mehrere Tokens voraus, das Modell prüft sie in einem Durchgang. MTP nutzt eingebaute Zusatzschichten des Modells (nicht jedes hat sie), ein Entwurfsmodell ist ein kleines Modell derselben Familie (wird bei Bedarf einmal geladen). Bringt vor allem bei Code und festen Formaten Tempo; die Trefferquote zeigt der Monitor.">Vorausraten<select name="spec">${[["off", "aus"], ["mtp", "MTP (eingebaute Schichten)"], ["draft", "Entwurfsmodell (automatisch)"]].map(([v, t]) => `<option value="${v}"${v === (e.spec ?? a.spec ?? "off") ? " selected" : ""}>${t}</option>`).join("")}</select></label>`}
         <div class="acts"><button class="btn" type="submit">Laden</button>${x.assignment ? `<button class="btn quiet" type="button" data-unload>Entladen</button>` : ""}</div>
-      </form></article>`;
+      </form></details></article>`;
   }).join("");
 }
 
@@ -1844,6 +1859,7 @@ $("hosts").addEventListener("toggle", (ev) => {
   if (!ev.target.matches) return;
   const id = (ev.target.closest(".host") || {}).dataset?.id;
   if (ev.target.matches("details.snaps")) hostOpen[id] = ev.target.open;
+  if (ev.target.matches("details.host-more")) hostOpen[id + ":more"] = ev.target.open;
   if (ev.target.matches("details.strata-inst[data-ext]")) hostOpen[id + ":si:" + ev.target.dataset.ext] = ev.target.open;
   if (ev.target.matches("details.strata-inst[data-am]")) hostOpen[id + ":am:" + ev.target.dataset.am] = ev.target.open;
   if (ev.target.matches("details.strata-set")) hostOpen[id + ":ss"] = ev.target.open;
