@@ -5982,7 +5982,7 @@ def _ext_catalog(conf: dict, d: Path, x: Optional["Ext"] = None) -> dict:
             fam = m.split("-")[0]
             out.setdefault(fam, {"title": titles.get(fam, fam), "models": {}})["models"][m] = ""
         return out
-    out = {"qwen": {"title": "Qwen3.8-Flash-Next", "models": {m: "" for m in x.models}}}
+    out = {"qwen": {"title": "Qwen3.8-Flash-Next", "models": {m: "" for m in STRATA_X.models}}}
     # A family's sizes: its own "models", else the shared MODELS whose "families" name it (none named: Qwen's), as
     # Strata's and PolyStrata's setup choose them (e.g. PolyStrata's GLM 5.3 Flash: 3.0BIT, UD-IQ2_XXS, REAP50-Q3_K_M)
     code = ("import json, setup\nout = {}\nshared = getattr(setup, 'MODELS', {}) or {}\n"

@@ -1716,11 +1716,9 @@ function renderHosts(s) {
       const mod = models.some(([m]) => m === e[`am_${k}_model`]) ? e[`am_${k}_model`] : (models[0] || [""])[0];
       const about = ((cat[fam] || {}).models || {})[mod] || "";
       return `<details class="strata-inst" data-am="${k}"${hostOpen[x.id + ":am:" + k] ? " open" : ""}><summary>Weiteres ${lb}-Modell einrichten <span class="note">(als zusätzliche Konfiguration, lädt das Modell herunter)</span></summary>
-        <div class="note">Das Setup von ${lb} richtet das Modell neben den vorhandenen ein; danach steht es unter „${lb}-Konfiguration“ zur Wahl. Läuft ${lb} gerade, stoppt es dafür und startet danach wieder. Es laufen die angehakten GPUs (keine: wie ${lb} empfiehlt). Fortschritt: <code>/var/log/myrmid/${k}-update.log</code></div>
+        <div class="note">Das Setup von ${lb} richtet das Modell neben den vorhandenen ein (mit dessen Standard-Kontext); danach steht es unter „${lb}-Konfiguration“ zur Wahl, und Kontext${x[k].kv ? " und KV-Cache" : ""} stellen Sie dort unter „${lb}-Einstellungen“ ein. Läuft ${lb} gerade, stoppt es dafür und startet danach wieder. Es laufen die angehakten GPUs (keine: wie ${lb} empfiehlt). Fortschritt: <code>/var/log/myrmid/${k}-update.log</code></div>
         <div class="kv si-form">${fams.length > 1 || k === "strata" ? `<label>Familie<select name="am_${k}_family">${fams.map((f) => `<option value="${esc(f)}"${f === fam ? " selected" : ""}>${esc(cat[f].title || f)}</option>`).join("")}</select></label>` : ""}
           <label>Modell<select name="am_${k}_model">${models.map(([m]) => `<option value="${esc(m)}"${m === mod ? " selected" : ""}>${esc(EXT_META[k].modelText(m))}</option>`).join("")}</select></label>
-          <label>Kontext<input name="am_${k}_context" inputmode="numeric" value="${esc(e[`am_${k}_context`] ?? "")}" placeholder="Standard"></label>
-          ${x[k].kv ? `<label>KV-Cache<select name="am_${k}_kv">${["int8", "q4_0", "k8v4", "fp16"].map((v) => `<option${v === (e[`am_${k}_kv`] ?? "int8") ? " selected" : ""}>${v}</option>`).join("")}</select></label>` : ""}
           <button class="btn small" type="button" data-add-model="${k}">Einrichten</button></div>
         ${about ? `<div class="note">${esc(about)}</div>` : ""}
       </details>`;
@@ -1878,8 +1876,7 @@ $("hosts").addEventListener("click", (ev) => {
   if (ev.target.matches("[data-add-model]")) {
     const k = ev.target.dataset.addModel, lb = EXT_META[k].label, id = card.dataset.id;
     const v = (f) => (card.querySelector(`[name="am_${k}_${f}"]`) || {}).value || "";
-    const ctx = v("context").replace(/[.\s]/g, "");
-    if (ctx && !/^\d+k?$/i.test(ctx)) { alert("Kontext als Zahl angeben, z. B. 131072 oder 128k, oder leer lassen."); return; }
+    const ctx = "";
     if (!confirm(`${lb}: ${v("family") ? v("family") + " " : ""}${v("model")} einrichten?\n\nDas lädt das Modell herunter und kann dauern. Läuft ${lb} gerade, ist es währenddessen nicht erreichbar.`)) return;
     const gpus = [...card.querySelectorAll('input[name="strata_gpu"]:checked')].map((c) => c.value).join(",");
     ev.target.disabled = true;
