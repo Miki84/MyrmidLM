@@ -4410,10 +4410,7 @@ DEFAULT_REPO = "https://github.com/Miki84/MyrmidLM.git"
 SERVICES = ("myrmid-server", "myrmid-worker", "myrmid-host")
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 RELEASE_RE = re.compile(r"^(\d+\.\d+\.\d+|main-[0-9a-f]{7,40})$")
-UPDATE_ACTIONS = ("check", "prepare", "activate", "rollback", "auto", "strata-install")
-STRATA_INSTALL_UNIT = "myrmid-strata-install"
-STRATA_INSTALL_LOG = Path("/var/log/myrmid/strata-install.log")
-STRATA_MODELS = ("IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0", "IQ1_M", "Q8_0")
+UPDATE_ACTIONS = ("check", "prepare", "activate", "rollback", "auto", "strata-install", "maya-install")
 UPDATE_HEALTH_S = 30  # services must stay up this long after a switch
 UPDATE_SELF_AFTER_S = 7 * 86400  # a worker whose master never asks switches itself after a week
 MIN_BUILD_FREE_GB = 3
@@ -4847,8 +4844,8 @@ def update_apply_request() -> dict:
     if version is not None and not RELEASE_RE.match(str(version)):
         raise UpdateError(f"not a release: {version}")
     log(f"Update request: {action} {version or ''}".rstrip())
-    if action == "strata-install":
-        return strata_install_start(req)
+    if action in ("strata-install", "maya-install"):
+        return strata_install_start(req, EXTS[action.split("-")[0]])
     if action == "check":
         return update_check()
     if action == "prepare":
@@ -4861,37 +4858,39 @@ def update_apply_request() -> dict:
     return write_update_state()
 
 
-def strata_install_start(req: dict) -> dict:
-    """The dashboard's "Strata installieren" (root): myrmid strata install as its own unit, so the update helper is
-    free again at once; its output goes to strata-install.log, which the host shows."""
+def strata_install_start(req: dict, x: Optional["Ext"] = None) -> dict:
+    """The dashboard's "Strata installieren" / "Maya installieren" (root): myrmid <engine> install as its own unit,
+    so the update helper is free again at once; its output goes to <engine>-install.log, which the host shows."""
     import pwd
 
+    x = _cx(x)
     user = str(req.get("user") or "")
-    model = str(req.get("model") or "IQ3_S").upper()
+    model = str(req.get("model") or x.default_model)
+    model = model.upper() if x.key == "strata" else model.lower()
     ctx, kv = int(req.get("context") or 0), str(req.get("kv") or "int8")
     try:
         if pwd.getpwnam(user).pw_uid < 1000:
             raise KeyError(user)
     except KeyError:
-        raise UpdateError(f"no such user for Strata: {user!r}")
-    if model not in STRATA_MODELS or kv not in STRATA_KVS or (ctx and not 4096 <= ctx <= 1048576):
-        raise UpdateError("Strata: unknown model, KV cache or context")
-    if strata_conf():
-        raise UpdateError("Strata is already set up on this PC")
-    STRATA_INSTALL_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(STRATA_INSTALL_LOG, "a") as f:
-        f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} Strata installieren: {user}, {model}, "
-                f"Kontext {ctx or 'Standard'}, KV {kv} ===\n")
-    os.chmod(STRATA_INSTALL_LOG, 0o644)
-    cmd = ["systemd-run", f"--unit={STRATA_INSTALL_UNIT}", "--collect", "--quiet",
-           "-p", f"StandardOutput=append:{STRATA_INSTALL_LOG}", "-p", "StandardError=inherit",
-           "-p", "TimeoutStartSec=6h", "-E", "PYTHONUNBUFFERED=1",
-           str(PREFIX / "current" / "bin" / "myrmid"), "strata", "install", "--user", user, "--model", model,
-           "--kv", kv] + (["--context", str(ctx)] if ctx else [])
+        raise UpdateError(f"no such user for {x.label}: {user!r}")
+    if model not in x.models or (x.has_kv and kv not in STRATA_KVS) or (ctx and not 4096 <= ctx <= 1048576):
+        raise UpdateError(f"{x.label}: unknown model, KV cache or context")
+    if strata_conf(x):
+        raise UpdateError(f"{x.label} is already set up on this PC")
+    x.install_log.parent.mkdir(parents=True, exist_ok=True)
+    with open(x.install_log, "a") as f:
+        f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {x.label} installieren: {user}, {model}, "
+                f"Kontext {ctx or 'Standard'}" + (f", KV {kv}" if x.has_kv else "") + " ===\n")
+    os.chmod(x.install_log, 0o644)
+    cmd = ["systemd-run", f"--unit={x.install_unit}", "--collect", "--quiet",
+           "-p", f"StandardOutput=append:{x.install_log}", "-p", "StandardError=inherit",
+           "-p", "TimeoutStartSec=8h", "-E", "PYTHONUNBUFFERED=1",
+           str(PREFIX / "current" / "bin" / "myrmid"), x.key, "install", "--user", user, "--model", model] \
+        + (["--kv", kv] if x.has_kv else []) + (["--context", str(ctx)] if ctx else [])
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if r.returncode:
         raise UpdateError(f"systemd-run: {(r.stderr or r.stdout).strip()[:300]}")
-    log(f"Strata: installing for {user} ({model}); log {STRATA_INSTALL_LOG}")
+    log(f"{x.label}: installing for {user} ({model}); log {x.install_log}")
     return {"ok": True}
 
 
@@ -5450,34 +5449,158 @@ def host_id(port: int) -> str:
 # The host runs without root and Strata as the user who installed it: "sudo myrmid strata setup" writes
 # myrmid-strata.service for that user; the host asks for start, stop and update through a file that
 # myrmid-strata-request.service (root) carries out, as for updates and sleep.
-STRATA_CONF = Path(env("STRATA_CONF", "/etc/myrmid/strata.json"))  # folder, user, python (no secrets)
-STRATA_REQ = Path(f"{RUN_DIR}/strata-request.json")  # the host's request (with the key: 0600)
-STRATA_INFO = Path(f"{RUN_DIR}/strata-info.json")  # root's answer: configurations, last result
-STRATA_ENV = Path(f"{RUN_DIR}/strata.env")  # root only: what myrmid-strata.service starts with
-STRATA_UNIT = "myrmid-strata.service"
-STRATA_LOG = Path("/var/log/myrmid/strata.log")
-STRATA_UPDATE_LOG = Path("/var/log/myrmid/strata-update.log")
-STRATA_CFG_RE = re.compile(r"^strata-[A-Za-z0-9_.-]+\.json$")
 STRATA_KEY_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{8,200}$")
 STRATA_GPU_RE = re.compile(r"^\d{1,2}(,\d{1,2}){0,15}$")  # nvidia-smi numbers: "1" or "0,2"
-# Strata's server takes the cards as --gpu (nvidia-smi numbers, several = a layer split); without STRATA_GPU the
-# configuration's own "gpu" counts. The clone itself or its terminal/ folder (Strata 0.2.16): both work.
-STRATA_EXEC = ("ExecStart=/bin/sh -c '[ -f terminal/serve/server.py ] && cd terminal; exec .venv/bin/python "
-               "serve/server.py --engine strata --config \"$$STRATA_CONFIG\" --port \"$$STRATA_PORT\" --host 127.0.0.1"
-               " $${STRATA_GPU:+--gpu \"$$STRATA_GPU\"} $${STRATA_PARALLEL:+--parallel \"$$STRATA_PARALLEL\"}'")
 
 
-def strata_conf() -> dict:
+@dataclass(frozen=True)
+class Ext:
+    """An engine of its own beside llama.cpp, from a clone in a user's home that serves llama-server's API on a port:
+    Strata (Qwen3.8-Flash-Next) and Project Maya (GLM-5.3-Flash, DeepSeek-V4.1-Flash, ...), which grew out of
+    Strata and works the same way (setup.sh, <key>-*.json configurations, serve/server.py). One service per engine,
+    started and stopped by root on the host's request."""
+
+    key: str  # strata, maya: the assignment's engine, the file names
+    label: str
+    repo: str
+    subdir: str  # where server.py, .venv and the configurations are, if not in the clone itself
+    models: tuple  # what the dashboard's install offers (setup.sh --model)
+    default_model: str
+    has_kv: bool  # its setup takes --kv (Strata); Maya's configurations bring their own
+    parallel_cli: bool  # its server.py takes --parallel; else it goes into a copy of the configuration
+
+    @property
+    def env_prefix(self) -> str:
+        return self.key.upper()
+
+    @property
+    def conf(self) -> Path:  # folder, user, python (no secrets)
+        return Path(env(f"{self.env_prefix}_CONF", f"/etc/myrmid/{self.key}.json"))
+
+    @property
+    def req(self) -> Path:  # the host's request (with the key: 0600)
+        return Path(f"{RUN_DIR}/{self.key}-request.json")
+
+    @property
+    def info(self) -> Path:  # root's answer: configurations, last result
+        return Path(f"{RUN_DIR}/{self.key}-info.json")
+
+    @property
+    def env(self) -> Path:  # root only: what the service starts with
+        return Path(f"{RUN_DIR}/{self.key}.env")
+
+    @property
+    def unit(self) -> str:
+        return f"myrmid-{self.key}.service"
+
+    @property
+    def log(self) -> Path:
+        return Path(f"/var/log/myrmid/{self.key}.log")
+
+    @property
+    def update_log(self) -> Path:
+        return Path(f"/var/log/myrmid/{self.key}-update.log")
+
+    @property
+    def install_unit(self) -> str:
+        return f"myrmid-{self.key}-install"
+
+    @property
+    def install_log(self) -> Path:
+        return Path(f"/var/log/myrmid/{self.key}-install.log")
+
+    @property
+    def cfg_prefix(self) -> str:
+        return f"{self.key}-"
+
+    @property
+    def cfg_re(self):
+        return re.compile(rf"^{self.key}-[A-Za-z0-9_.-]+\.json$")
+
+    @property
+    def exec_line(self) -> str:
+        # The server takes the cards as --gpu (nvidia-smi numbers, several = a layer split); without <P>_GPU the
+        # configuration's own "gpu" counts. Strata: the clone itself or its terminal/ folder (0.2.16): both work.
+        p = self.env_prefix
+        cd = f"[ -f {self.subdir}/serve/server.py ] && cd {self.subdir}; " if self.subdir else ""
+        par = f" $${{{p}_PARALLEL:+--parallel \"$${p}_PARALLEL\"}}" if self.parallel_cli else ""
+        return (f"ExecStart=/bin/sh -c '{cd}exec .venv/bin/python serve/server.py --engine {self.key} "
+                f"--config \"$${p}_CONFIG\" --port \"$${p}_PORT\" --host 127.0.0.1 $${{{p}_GPU:+--gpu \"$${p}_GPU\"}}{par}'")
+
+    @property
+    def request_path_text(self) -> str:
+        return f"""[Unit]
+Description=MyrmidLM: {self.label} requests from the host service (start, stop, update)
+# The host runs without root; it asks by creating this file, and
+# myrmid-{self.key}-request.service (root) starts or stops {self.unit}.
+
+[Path]
+PathExists={RUN_DIR}/{self.key}-request.json
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    @property
+    def request_service_text(self) -> str:
+        return f"""[Unit]
+Description=MyrmidLM: carry out a {self.label} request (start, stop, update)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/myrmid/current/bin/myrmid {self.key} apply-request
+TimeoutStartSec=4h
+"""
+
+    @property
+    def logrotate_text(self) -> str:
+        return f"""{self.log} {self.update_log} {{
+    weekly
+    rotate 4
+    maxsize 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}}
+"""
+
+
+STRATA_X = Ext("strata", "Strata", "https://github.com/Niko1221/Strata.git", "terminal",
+               ("IQ3_S", "IQ3_XXS", "IQ2_XS", "Q2_0", "IQ1_M", "Q8_0"), "IQ3_S", True, True)
+MAYA_X = Ext("maya", "Maya", "https://github.com/mw00/project-maya.git", "",
+             ("glm-maya-s", "glm-maya-s24", "glm-maya-xs", "glm-maya-m", "glm-maya-l",
+              "deepseek-maya-xs", "deepseek-maya-s", "deepseek-maya-m", "minimax-maya-xs", "minimax-maya-s",
+              "hy4-flash-maya-xs", "hy4-flash-maya-s", "hy4-flash-maya-m", "hy4-flash-maya-l"), "glm-maya-s", False, False)
+EXTS = {x.key: x for x in (STRATA_X, MAYA_X)}
+_EXT_CUR = [STRATA_X]  # root's commands (myrmid strata ..., myrmid maya ...) work on one engine per process
+
+
+def _cx(x: Optional[Ext] = None) -> Ext:
+    return x or _EXT_CUR[0]
+
+
+def ext_of(a: Optional[dict]) -> Optional[Ext]:
+    """The own engine an assignment runs on (None: llama.cpp)."""
+    return EXTS.get((a or {}).get("engine") or "")
+
+
+# kept for the code that is about Strata only
+STRATA_CONF, STRATA_UNIT, STRATA_LOG = STRATA_X.conf, STRATA_X.unit, STRATA_X.log
+
+
+def strata_conf(x: Optional["Ext"] = None) -> dict:
     try:
-        d = json.loads(STRATA_CONF.read_text())
+        d = json.loads(_cx(x).conf.read_text())
         return d if isinstance(d, dict) and d.get("dir") and d.get("user") else {}
     except (OSError, ValueError):
         return {}
 
 
-def strata_info() -> dict:
+def strata_info(x: Optional["Ext"] = None) -> dict:
     try:
-        d = json.loads(STRATA_INFO.read_text())
+        d = json.loads(_cx(x).info.read_text())
         return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
@@ -5486,29 +5609,29 @@ def strata_info() -> dict:
 _STRATA_SYSTEMCTL_WARNED = [""]
 
 
-def strata_state(port: int = 0) -> str:
+def strata_state(port: int = 0, x: Optional["Ext"] = None) -> str:
     """active, activating, deactivating, inactive, failed (systemctl is-active needs no root). If systemctl gives no
     answer, Strata's port tells: it answers -> active."""
     try:
-        r = subprocess.run(["systemctl", "is-active", STRATA_UNIT], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["systemctl", "is-active", _cx(x).unit], capture_output=True, text=True, timeout=10)
         st = r.stdout.strip()
         why = "" if st else f"{(r.stderr or '').strip()[:200] or r.returncode}"
     except (OSError, subprocess.TimeoutExpired) as e:
         st, why = "", str(e)
     if why and why != _STRATA_SYSTEMCTL_WARNED[0]:
         _STRATA_SYSTEMCTL_WARNED[0] = why  # once per kind of failure, not every poll
-        log(f"Strata: systemctl is-active {STRATA_UNIT} gave no answer ({why}); using the port instead")
+        log(f"{_cx(x).label}: systemctl is-active {_cx(x).unit} gave no answer ({why}); using the port instead")
     if st and st != "unknown":
         return st
-    # Without systemctl: Strata's process (also while it loads, before its port answers), then its port
-    if strata_pid(port):
+    # Without systemctl: the engine's process (also while it loads, before its port answers), then its port
+    if strata_pid(port, x):
         return "active"
     if port:
         return "active" if strata_health(port) is not None else "inactive"
     return "unknown"
 
 
-def strata_pid(port: int = 0) -> Optional[int]:
+def strata_pid(port: int = 0, x: Optional["Ext"] = None) -> Optional[int]:
     """Strata's server process (serve/server.py --engine strata, on this port if given), from /proc: readable
     without root, and there from the start, while the port only answers once the model is loaded."""
     try:
@@ -5521,7 +5644,7 @@ def strata_pid(port: int = 0) -> Optional[int]:
                 argv = f.read().decode(errors="replace").split("\0")
         except OSError:
             continue
-        if not any(x.endswith("serve/server.py") for x in argv) or "strata" not in argv:
+        if not any(a.endswith("serve/server.py") for a in argv) or _cx(x).key not in argv:
             continue
         if port and not any(argv[i] == "--port" and argv[i + 1] == str(port) for i in range(len(argv) - 1)):
             continue
@@ -5540,17 +5663,17 @@ def strata_health(port: int) -> Optional[dict]:
         return None
 
 
-def strata_log_size() -> int:
+def strata_log_size(x: Optional["Ext"] = None) -> int:
     try:
-        return STRATA_LOG.stat().st_size
+        return _cx(x).log.stat().st_size
     except OSError:
         return 0
 
 
-def strata_log_tail(n: int = 40, since: int = 0) -> list[str]:
+def strata_log_tail(n: int = 40, since: int = 0, x: Optional["Ext"] = None) -> list[str]:
     """The log's last lines; since: only what came after that size (this start, not an older run's error)."""
     try:
-        with open(STRATA_LOG, "rb") as f:
+        with open(_cx(x).log, "rb") as f:
             f.seek(0, os.SEEK_END)
             end = f.tell()
             f.seek(max(0, end - 64 * 1024, since if since <= end else 0))
@@ -5593,22 +5716,22 @@ def strata_failure_line(tail: list[str]) -> str:
                 lines[-1] if lines else "")
 
 
-def strata_request(action: str, **kw) -> float:
+def strata_request(action: str, x: Optional["Ext"] = None, **kw) -> float:
     """Asks root (myrmid-strata-request.service) to start, stop or update Strata. Returns the request's time."""
     import threading
 
     at = time.time()
-    tmp = STRATA_REQ.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")  # two threads may ask at once
+    tmp = _cx(x).req.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")  # two threads may ask at once
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump({"action": action, "at": at, **kw}, f)
-    os.replace(tmp, STRATA_REQ)
+    os.replace(tmp, _cx(x).req)
     return at
 
 
-def strata_result(after: float) -> Optional[dict]:
+def strata_result(after: float, x: Optional["Ext"] = None) -> Optional[dict]:
     """Root's answer to a request made at `after`, once it is there."""
-    r = strata_info().get("result") or {}
+    r = strata_info(x).get("result") or {}
     return r if r.get("req_at") and r["req_at"] >= after - 0.001 else None
 
 
@@ -5618,23 +5741,24 @@ class StrataProc:
 
     GRACE_S = 45  # after the request: root starts it within seconds; until then "inactive" is not "ended"
 
-    def __init__(self, port: int, adopted: bool = False):
-        self.port = port
+    def __init__(self, port: int, adopted: bool = False, x: Optional["Ext"] = None):
+        self.port, self.x = port, x or STRATA_X
         self.asked = 0.0 if adopted else time.time()
         self.stopped = False
 
     def start(self, config: str, key: str, gpus: str = "", parallel: int = 0) -> None:
-        self.log_from = strata_log_size()
-        self.asked = strata_request("start", config=config, port=self.port, key=key, gpus=gpus, parallel=parallel)
+        self.log_from = strata_log_size(self.x)
+        self.asked = strata_request("start", config=config, port=self.port, key=key, gpus=gpus, parallel=parallel,
+                                    x=self.x)
 
     def poll(self) -> Optional[int]:
         if self.stopped:
             return 0
-        st = strata_state(self.port)
+        st = strata_state(self.port, self.x)
         if st in ("active", "activating", "reloading"):
             return None
         if time.time() - self.asked < self.GRACE_S:
-            r = strata_result(self.asked)
+            r = strata_result(self.asked, self.x)
             if not (r and r.get("action") == "start" and not r.get("ok")):
                 return None
         return 1
@@ -5643,9 +5767,9 @@ class StrataProc:
         if not self.stopped:
             self.stopped = True
             try:
-                strata_request("stop")
+                strata_request("stop", x=self.x)
             except OSError as e:
-                log(f"Strata: could not ask for the stop ({e})")
+                log(f"{self.x.label}: could not ask for the stop ({e})")
 
     kill = terminate
 
@@ -5653,12 +5777,12 @@ class StrataProc:
         end = time.time() + (timeout if timeout is not None else 120)
         while time.time() < end:
             # stopped means: the service says so AND the port is free (then the GPUs are free too)
-            if strata_state(self.port) in ("inactive", "failed", "unknown") and \
+            if strata_state(self.port, self.x) in ("inactive", "failed", "unknown") and \
                     (not self.port or strata_health(self.port) is None):
                 return 0
             time.sleep(1)
         if timeout is not None:
-            raise subprocess.TimeoutExpired(STRATA_UNIT, timeout)
+            raise subprocess.TimeoutExpired(self.x.unit, timeout)
         return 0
 
 
@@ -5732,44 +5856,46 @@ def nvidia_index(gpu: Optional["Device"]) -> Optional[int]:
     return named[rank] if rank < len(named) else None
 
 
-def strata_running_port() -> Optional[int]:
-    """The port Strata was last started on (root notes it), if it runs."""
-    r = (strata_info().get("running") or {})
+def strata_running_port(x: Optional["Ext"] = None) -> Optional[int]:
+    """The port the engine was last started on (root notes it), if it runs."""
+    r = (strata_info(x).get("running") or {})
     return int(r["port"]) if r.get("port") else None
 
 
-def strata_stop_running(why: str = "", port: int = 0, only_own: bool = False) -> None:
-    """Stops Strata if it runs (llama-server takes the GPUs next). only_own (one GPU of several): only if it runs on
-    this slot's port; on another GPU it stays."""
-    if not strata_conf() or strata_state(port) not in ("active", "activating", "reloading"):
+def strata_stop_running(why: str = "", port: int = 0, only_own: bool = False, x: Optional["Ext"] = None) -> None:
+    """Stops the engine if it runs (llama-server or the other engine takes the GPUs next). only_own (one GPU of
+    several): only if it runs on this slot's port; on another GPU it stays."""
+    x = _cx(x)
+    if not strata_conf(x) or strata_state(port, x) not in ("active", "activating", "reloading"):
         return
-    if only_own and strata_running_port() not in (None, port):
+    if only_own and strata_running_port(x) not in (None, port):
         return
-    log(f"Strata: stopping it{' (' + why + ')' if why else ''}")
-    p = StrataProc(port, adopted=True)
+    log(f"{x.label}: stopping it{' (' + why + ')' if why else ''}")
+    p = StrataProc(port, adopted=True, x=x)
     p.terminate()
     try:
         p.wait(timeout=90)
     except subprocess.TimeoutExpired:
-        log("Strata: still running after 90 s")
+        log(f"{x.label}: still running after 90 s")
 
 
 # Root's side -------------------------------------------------------------------------------------------------------
 
 def _strata_work(d: Path) -> Path:
-    """Where Strata's server, .venv and strata-*.json are: the clone itself, or
-    its terminal/ folder (layout of Strata 0.2.16; setup.sh moves an older clone there)."""
-    return d / "terminal" if (d / "terminal" / "serve" / "server.py").is_file() else d
+    """Where the engine's server, .venv and <engine>-*.json are: the clone itself, or (Strata 0.2.16; setup.sh moves
+    an older clone there) its terminal/ folder."""
+    sub = _cx().subdir
+    return d / sub if sub and (d / sub / "serve" / "server.py").is_file() else d
 
 
 def _is_strata_dir(d: Path) -> bool:
     return (_strata_work(d) / "serve" / "server.py").is_file()
 
 
-def _strata_configs(d: Path) -> list[str]:
+def _strata_configs(d: Path, x: Optional["Ext"] = None) -> list[str]:
     try:
-        return sorted(p.name for p in _strata_work(d).glob("strata-*.json")
-                      if STRATA_CFG_RE.match(p.name) and p.is_file() and not p.name.endswith(".shared-settings.json"))
+        return sorted(p.name for p in _strata_work(d).glob(f"{_cx(x).cfg_prefix}*.json")
+                      if _cx(x).cfg_re.match(p.name) and p.is_file() and not p.name.endswith(".shared-settings.json"))
     except OSError:
         return []
 
@@ -5784,9 +5910,9 @@ def _strata_version(d: Path) -> str:
         return ""
 
 
-def _strata_write_info(conf: dict, result: Optional[dict] = None) -> None:
+def _strata_write_info(conf: dict, result: Optional[dict] = None, x: Optional["Ext"] = None) -> None:
     d = Path(conf["dir"]) if conf else None
-    old = strata_info()
+    old = strata_info(x)
     running = (result or {}).get("running", old.get("running")) if (result or {}).get("ok", True) else old.get("running")
     info = {"configs": _strata_configs(d) if d else [], "version": _strata_version(d) if d else "",
             "running": running,
@@ -5794,16 +5920,61 @@ def _strata_write_info(conf: dict, result: Optional[dict] = None) -> None:
             "config_settings": _strata_config_settings(d) if d else {},
             "result": result if result is not None else old.get("result"), "at": time.time()}
     if not conf:
-        info["error"] = "Strata ist auf diesem PC nicht eingerichtet: sudo myrmid strata setup"
-    tmp = STRATA_INFO.with_suffix(".tmp")
+        info["error"] = f"{_cx(x).label} ist auf diesem PC nicht eingerichtet: sudo myrmid {_cx(x).key} setup"
+    tmp = _cx(x).info.with_suffix(".tmp")
     tmp.write_text(json.dumps(info))
     os.chmod(tmp, 0o644)
-    os.replace(tmp, STRATA_INFO)
+    os.replace(tmp, _cx(x).info)
 
 
-def _strata_env_text(config: str, port: int, key: str, gpus: str = "", parallel: int = 0) -> str:
-    return (f"STRATA_CONFIG={config}\nSTRATA_PORT={port}\nSTRATA_API_KEY={key}\nSTRATA_GPU={gpus}\n"
-            f"STRATA_PARALLEL={parse_parallel(parallel) or ''}\n")
+def _strata_env_text(config: str, port: int, key: str, gpus: str = "", parallel: int = 0,
+                     x: Optional["Ext"] = None) -> str:
+    p = _cx(x).env_prefix
+    return (f"{p}_CONFIG={config}\n{p}_PORT={port}\n{p}_API_KEY={key}\n{p}_GPU={gpus}\n"
+            f"{p}_PARALLEL={parse_parallel(parallel) or ''}\n")
+
+
+def _maya_run_config(conf: dict, d: Path, cfg: str, parallel: int) -> str:
+    """Maya's server takes "parallel" from its configuration only: a copy beside it with that number (owned by the
+    engine's user; the dot keeps it out of the list of configurations). Without a number: the configuration itself."""
+    import pwd
+
+    if not parallel:
+        return cfg
+    try:
+        data = json.loads((_strata_work(d) / cfg).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:
+        raise UpdateError(f"{cfg} nicht lesbar: {e}")
+    data["parallel"] = parallel
+    out = _strata_work(d) / f".myrmid-{cfg}"
+    out.write_text(json.dumps(data, indent=1))
+    pw = pwd.getpwnam(conf["user"])
+    os.chown(out, pw.pw_uid, pw.pw_gid)
+    os.chmod(out, 0o644)
+    return out.name
+
+
+def _maya_model_id(conf: dict, d: Path, cfg: str) -> str:
+    """setup.sh --model of an installed Maya configuration: its installer record (family and quant), named the way
+    Maya's own list (tools/maya_quants.py) names it."""
+    try:
+        inst = json.loads((_strata_work(d) / cfg).read_text(encoding="utf-8-sig")).get("installer") or {}
+    except (OSError, ValueError, AttributeError):
+        inst = {}
+    fam = str(inst.get("family") or "glm")
+    key = inst.get({"deepseek": "ds4_quant", "minimax": "mm3_quant", "hy4": "hy4_quant"}.get(fam, "quant")) \
+        or inst.get("quant")
+    try:
+        r = _run_as(conf["user"], [str(_strata_work(d) / ".venv" / "bin" / "python"), "-c",
+                                   "import sys, json; sys.path.insert(0, 'tools'); import maya_quants as Q; "
+                                   f"print(Q.setup_id({fam!r}, {str(key)!r}) or '')"],
+                    cwd=_strata_work(d), env=_strata_user_env(conf), capture_output=True, text=True, timeout=60)
+        got = r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else ""
+    except (OSError, IndexError, subprocess.TimeoutExpired):
+        got = ""
+    if not got:
+        raise UpdateError(f"Modell von {cfg} unbekannt ({fam}, {key}): im Terminal mit ./setup.sh --setup einrichten")
+    return got
 
 
 def _strata_config_gpus(d: Path) -> dict:
@@ -5821,18 +5992,18 @@ def _strata_config_gpus(d: Path) -> dict:
     return out
 
 
-def _strata_unit_current() -> None:
+def _strata_unit_current(x: Optional["Ext"] = None) -> None:
     """A unit from an older MyrmidLM: its ExecStart gets today's (e.g. --gpu), the rest stays."""
-    unit = UNIT_DIR / STRATA_UNIT
+    unit = UNIT_DIR / _cx(x).unit
     try:
         lines = unit.read_text().splitlines()
     except OSError:
         return
-    new = [STRATA_EXEC if ln.startswith("ExecStart=") else ln for ln in lines]
+    new = [_cx(x).exec_line if ln.startswith("ExecStart=") else ln for ln in lines]
     if new != lines:
         unit.write_text("\n".join(new) + "\n")
         _systemctl("daemon-reload")
-        log(f"Strata: {unit} brought up to date")
+        log(f"{_cx(x).label}: {unit} brought up to date")
 
 
 def _strata_user_env(conf: dict) -> dict:
@@ -5854,90 +6025,119 @@ def _run_as(user: str, cmd: list[str], **kw) -> subprocess.CompletedProcess:
                           extra_groups=os.getgrouplist(user, pw.pw_gid), **kw)
 
 
-def strata_apply_request() -> None:
-    """myrmid-strata-request.service (root): carries out the host's request."""
-    work = STRATA_REQ.with_suffix(".work")  # taken away first: a newer request can't get lost meanwhile
+def strata_apply_request(x: Optional["Ext"] = None) -> None:
+    """myrmid-<engine>-request.service (root): carries out the host's request."""
+    x = _cx(x)
+    work = x.req.with_suffix(".work")  # taken away first: a newer request can't get lost meanwhile
     try:
-        os.replace(STRATA_REQ, work)
+        os.replace(x.req, work)
         req = json.loads(work.read_text())
     except (OSError, ValueError):
         req = {}
     work.unlink(missing_ok=True)
-    conf = strata_conf()
+    conf = strata_conf(x)
     act = str(req.get("action") or "info")
     res = {"action": act, "req_at": float(req.get("at") or time.time()), "ok": True, "error": ""}
     try:
         if not conf:
-            raise UpdateError("Strata ist auf diesem PC nicht eingerichtet: sudo myrmid strata setup")
+            raise UpdateError(f"{x.label} ist auf diesem PC nicht eingerichtet: sudo myrmid {x.key} setup")
         d = Path(conf["dir"])
         if act == "start":
             cfg, port, key = str(req.get("config") or ""), int(req.get("port") or 0), str(req.get("key") or "")
-            if not STRATA_CFG_RE.match(cfg) or not (_strata_work(d) / cfg).is_file():
-                raise UpdateError(f"Strata-Konfiguration {cfg or '?'} gibt es in {d} nicht")
+            if not x.cfg_re.match(cfg) or not (_strata_work(d) / cfg).is_file():
+                raise UpdateError(f"{x.label}-Konfiguration {cfg or '?'} gibt es in {d} nicht")
             if not 1024 <= port <= 65535 or not STRATA_KEY_RE.match(key):
                 raise UpdateError("ungültiger Port oder Schlüssel")
             gpus = str(req.get("gpus") or "")
             if gpus and not STRATA_GPU_RE.match(gpus):
                 raise UpdateError(f"ungültige GPU-Auswahl {gpus!r}")
-            _strata_unit_current()
+            for other in EXTS.values():  # one engine of its own at a time: both want (nearly) all of the VRAM
+                if other is not x and strata_conf(other) and strata_state(0, other) in ("active", "activating"):
+                    log(f"{other.label}: stopping it ({x.label} starts)")
+                    _systemctl("stop", other.unit)
+            _strata_unit_current(x)
             par = parse_parallel(req.get("parallel"))
-            want = _strata_env_text(cfg, port, key, gpus, par)
+            run_cfg = cfg if x.parallel_cli else _maya_run_config(conf, d, cfg, par)
+            want = _strata_env_text(run_cfg, port, key, gpus, par if x.parallel_cli else 0, x)
             try:
-                same = STRATA_ENV.read_text() == want
+                same = x.env.read_text() == want
             except OSError:
                 same = False
-            if same and strata_state() in ("active", "activating"):
-                log(f"Strata: already running with {cfg}")
+            if same and strata_state(0, x) in ("active", "activating"):
+                log(f"{x.label}: already running with {cfg}")
                 res["running"] = {"port": port, "gpus": gpus, "config": cfg}
             else:
-                fd = os.open(STRATA_ENV, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                fd = os.open(x.env, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w") as f:
                     f.write(want)
-                STRATA_LOG.parent.mkdir(parents=True, exist_ok=True)
-                log(f"Strata: starting with {cfg} on 127.0.0.1:{port}" + (f", GPUs {gpus}" if gpus else "")
+                x.log.parent.mkdir(parents=True, exist_ok=True)
+                log(f"{x.label}: starting with {cfg} on 127.0.0.1:{port}" + (f", GPUs {gpus}" if gpus else "")
                     + (f", {par} requests at once" if par else ""))
-                r = _systemctl("restart", STRATA_UNIT)
+                r = _systemctl("restart", x.unit)
                 res["running"] = {"port": port, "gpus": gpus, "config": cfg}
                 if r.returncode:
-                    raise UpdateError(f"systemctl restart {STRATA_UNIT}: {(r.stderr or r.stdout).strip()}")
+                    raise UpdateError(f"systemctl restart {x.unit}: {(r.stderr or r.stdout).strip()}")
         elif act == "stop":
-            log("Strata: stopping")
-            _systemctl("stop", STRATA_UNIT)
+            log(f"{x.label}: stopping")
+            _systemctl("stop", x.unit)
             res["running"] = None
         elif act == "update":
-            cmd = ["sh", "./update.sh"] if (d / "update.sh").is_file() else ["sh", "./setup.sh", "--update"]
-            _strata_run_job(conf, d, cmd, "Update")
+            if x.key == "maya":  # Maya's way: git pull, then setup.sh (builds what changed; the model stays)
+                _strata_run_job(conf, d, ["git", "pull", "--ff-only"], "git pull", x=x)
+                env = strata_cuda12_env(x) if nvidia_old_gpus() else {}
+                _strata_run_job(conf, d, ["sh", "./setup.sh", "--no-start", "--yes"] + _maya_cuda_args(env), "Update",
+                                env, x=x)
+            else:
+                cmd = ["sh", "./update.sh"] if (d / "update.sh").is_file() else ["sh", "./setup.sh", "--update"]
+                _strata_run_job(conf, d, cmd, "Update", x=x)
             res["version"] = _strata_version(d)
-        elif act == "reconfigure":  # context and KV cache live in the configuration: setup writes it anew
+        elif act == "reconfigure":  # context (and Strata's KV cache) live in the configuration: setup writes it anew
             cfg = str(req.get("config") or "")
-            if not STRATA_CFG_RE.match(cfg) or not (_strata_work(d) / cfg).is_file():
-                raise UpdateError(f"Strata-Konfiguration {cfg or '?'} gibt es nicht")
-            ctx, kv, gpus = int(req.get("context") or 0), str(req.get("kv") or ""), str(req.get("gpus") or "")
+            if not x.cfg_re.match(cfg) or not (_strata_work(d) / cfg).is_file():
+                raise UpdateError(f"{x.label}-Konfiguration {cfg or '?'} gibt es nicht")
+            ctx, kv, gpus = int(req.get("context") or 0), str(req.get("kv") or "int8"), str(req.get("gpus") or "")
             if not 4096 <= ctx <= 1048576 or kv not in STRATA_KVS or (gpus and not STRATA_GPU_RE.match(gpus)):
                 raise UpdateError("ungültiger Kontext, KV-Cache oder GPU-Auswahl")
-            family, model = _strata_family_model(conf, d, cfg)
-            cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes", "--model", model, "--context", str(ctx),
-                   "--kv", kv] + (["--family", family] if family else [])
+            sel = [int(g) for g in gpus.split(",")] if gpus else []
+            old = set(nvidia_old_gpus()) & set(sel or nvidia_old_gpus())
             env = {}
-            if gpus:
-                sel = [int(g) for g in gpus.split(",")]
-                old = set(nvidia_old_gpus()) & set(sel)
-                if old and len(sel) > 1:  # a newer card is Main, the older ones help
-                    cmd += ["--gpu-roles", strata_gpu_roles(sel, old)]
-                else:
-                    cmd += ["--gpus", gpus] if "," in gpus else ["--gpu", gpus]
-                if old:  # Pascal/Volta: only Strata's CUDA 12 engine has code for them
-                    cmd += ["--cuda", "12"]
-                    _strata_log(f"GPU {', '.join(map(str, sorted(old)))} ist älter als RTX 20: CUDA-12-Engine")
-                    env = strata_cuda12_env()
-            _strata_run_job(conf, d, cmd, "Einrichtung", env)
-            _strata_write_info(conf)  # the new settings for the card
+            if x.key == "maya":
+                cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes", "--model", _maya_model_id(conf, d, cfg),
+                       "--context", str(ctx)]
+                if sel:
+                    cmd += ["--gpus", gpus] if len(sel) > 1 else ["--gpu", gpus]
+                if old:  # Volta and older: Maya builds with CUDA 12 for them
+                    _strata_log(f"GPU {', '.join(map(str, sorted(old)))} ist älter als RTX 20: CUDA 12", x)
+                    env = strata_cuda12_env(x)
+                    cmd += _maya_cuda_args(env)
+            else:
+                family, model = _strata_family_model(conf, d, cfg)
+                cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes", "--model", model, "--context", str(ctx),
+                       "--kv", kv] + (["--family", family] if family else [])
+                if sel:
+                    old = old & set(sel)
+                    if old and len(sel) > 1:  # a newer card is Main, the older ones help
+                        cmd += ["--gpu-roles", strata_gpu_roles(sel, old)]
+                    else:
+                        cmd += ["--gpus", gpus] if "," in gpus else ["--gpu", gpus]
+                    if old:  # Pascal/Volta: only Strata's CUDA 12 engine has code for them
+                        cmd += ["--cuda", "12"]
+                        _strata_log(f"GPU {', '.join(map(str, sorted(old)))} ist älter als RTX 20: CUDA-12-Engine", x)
+                        env = strata_cuda12_env(x)
+            _strata_run_job(conf, d, cmd, "Einrichtung", env, x=x)
+            _strata_write_info(conf, x=x)  # the new settings for the card
 
     except (UpdateError, OSError, ValueError, KeyError) as e:
         res.update(ok=False, error=str(e))
-        log(f"Strata: {act} failed: {e}")
+        log(f"{x.label}: {act} failed: {e}")
     res["done_at"] = time.time()
-    _strata_write_info(conf, res)
+    _strata_write_info(conf, res, x=x)
+
+
+def _maya_cuda_args(env: dict) -> list:
+    """Maya's own flags for the toolkit and host compiler that strata_cuda12_env found."""
+    return (["--nvcc", env["STRATA_NVCC"]] if env.get("STRATA_NVCC") else []) \
+        + (["--host-compiler", env["CUDAHOSTCXX"]] if env.get("CUDAHOSTCXX") else [])
 
 
 STRATA_KVS = ("int8", "q4_0", "k8v4", "fp16")
@@ -5948,11 +6148,11 @@ CUDA12_RUN = "https://developer.download.nvidia.com/compute/cuda/12.9.1/local_in
 CUDA12_MAX_GCC = 14  # the newest GCC that CUDA 12.9 compiles with
 
 
-def _strata_log(msg: str) -> None:
-    log(f"Strata: {msg}")
+def _strata_log(msg: str, x: Optional["Ext"] = None) -> None:
+    log(f"{_cx(x).label}: {msg}")
     try:
-        STRATA_UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(STRATA_UPDATE_LOG, "a") as f:
+        _cx(x).update_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(_cx(x).update_log, "a") as f:
             f.write(f"[myrmid] {msg}\n")
     except OSError:
         pass
@@ -6078,13 +6278,14 @@ def strata_gpu_roles(gpus: list[int], old: set[int]) -> str:
     return ",".join(f"{g}={'main' if g == main else 'helper'}" for g in gpus)
 
 
-def _strata_kill_strays() -> None:
-    """Strata servers that the unit does not know of (started by hand): setup's update feed refuses while one runs."""
+def _strata_kill_strays(x: Optional["Ext"] = None) -> None:
+    """Servers of the engine that the unit does not know of (started by hand): Strata's setup refuses its update feed
+    while one runs."""
     for _ in range(3):
-        pid = strata_pid()
+        pid = strata_pid(0, x)
         if not pid:
             return
-        _strata_log(f"beende einen weiteren Strata-Server (PID {pid})")
+        _strata_log(f"beende einen weiteren {_cx(x).label}-Server (PID {pid})", x)
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
@@ -6100,15 +6301,16 @@ def _strata_kill_strays() -> None:
                 pass
 
 
-def _strata_run_job(conf: dict, d: Path, cmd: list[str], what: str, env: Optional[dict] = None) -> None:
-    """Runs one of Strata's scripts as its user (root only): Strata stops meanwhile and starts again if it ran."""
-    was = strata_state() in ("active", "activating")
+def _strata_run_job(conf: dict, d: Path, cmd: list[str], what: str, env: Optional[dict] = None, x: Optional["Ext"] = None) -> None:
+    """Runs one of the engine's scripts as its user (root only): the engine stops meanwhile and starts again if it ran."""
+    x = _cx(x)
+    was = strata_state(0, x) in ("active", "activating")
     if was:
-        _systemctl("stop", STRATA_UNIT)
-    _strata_kill_strays()
-    STRATA_UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-    log(f"Strata: {' '.join(cmd)} in {d} (as {conf['user']}; log {STRATA_UPDATE_LOG})")
-    with open(STRATA_UPDATE_LOG, "a") as out:
+        _systemctl("stop", x.unit)
+    _strata_kill_strays(x)
+    x.update_log.parent.mkdir(parents=True, exist_ok=True)
+    log(f"{x.label}: {' '.join(cmd)} in {d} (as {conf['user']}; log {x.update_log})")
+    with open(_cx(x).update_log, "a") as out:
         out.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd)} ===\n")
         out.flush()
         try:
@@ -6118,13 +6320,13 @@ def _strata_run_job(conf: dict, d: Path, cmd: list[str], what: str, env: Optiona
         except subprocess.TimeoutExpired:
             code = -1
     if was:
-        _systemctl("start", STRATA_UNIT)
+        _systemctl("start", _cx(x).unit)
     if code:
         try:
-            last = [x for x in STRATA_UPDATE_LOG.read_text(errors="replace").strip().splitlines() if x.strip()][-3:]
+            last = [ln for ln in x.update_log.read_text(errors="replace").strip().splitlines() if ln.strip()][-3:]
         except OSError:
             last = []
-        raise UpdateError(f"{what} endete mit Code {code}" + (": " + " / ".join(x.strip() for x in last) if last else ""))
+        raise UpdateError(f"{what} endete mit Code {code}" + (": " + " / ".join(ln.strip() for ln in last) if last else ""))
 
 
 def _strata_family_model(conf: dict, d: Path, cfg: str) -> tuple[str, str]:
@@ -6151,7 +6353,7 @@ def _strata_family_model(conf: dict, d: Path, cfg: str) -> tuple[str, str]:
     return "", cfg[len("strata-"):-len(".json")].upper()
 
 
-def _strata_config_settings(d: Path) -> dict:
+def _strata_config_settings(d: Path, x: Optional["Ext"] = None) -> dict:
     """{config: {"context": n, "kv": ...}} as far as the configuration's engine arguments say."""
     out = {}
     for name in _strata_configs(d):
@@ -6178,43 +6380,15 @@ def _strata_config_settings(d: Path) -> dict:
     return out
 
 
-STRATA_REQUEST_PATH = """[Unit]
-Description=MyrmidLM: Strata requests from the host service (start, stop, update)
-# The host runs without root; it asks by creating this file, and
-# myrmid-strata-request.service (root) starts or stops myrmid-strata.service.
 
-[Path]
-PathExists=/run/myrmid/strata-request.json
 
-[Install]
-WantedBy=multi-user.target
-"""
-
-STRATA_REQUEST_SERVICE = """[Unit]
-Description=MyrmidLM: carry out a Strata request (start, stop, update)
-
-[Service]
-Type=oneshot
-ExecStart=/opt/myrmid/current/bin/myrmid strata apply-request
-TimeoutStartSec=4h
-"""
-
-STRATA_LOGROTATE = """/var/log/myrmid/strata.log /var/log/myrmid/strata-update.log {
-    weekly
-    rotate 4
-    maxsize 50M
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-"""
 
 
 def _strata_find_dir() -> Optional[Path]:
-    for p in sorted(Path("/home").glob("*/strata")) + [Path("/opt/strata"), Path("/root/strata")]:
-        if _is_strata_dir(p):
+    k = _cx().key
+    names = [k] + (["project-maya", "Maya"] if k == "maya" else [])
+    for p in [q for n in names for q in sorted(Path("/home").glob(f"*/{n}"))] + [Path(f"/opt/{k}"), Path(f"/root/{k}")]:
+        if _is_strata_dir(p) and (k != "maya" or (p / "maya.py").is_file()):
             return p
     return None
 
@@ -6235,13 +6409,13 @@ def _strata_old_unit_env(unit: Path) -> list[str]:
     return out
 
 
-def strata_unit_text(conf: dict, extra_env: list[str]) -> str:
+def strata_unit_text(conf: dict, extra_env: list[str], x: Optional["Ext"] = None) -> str:
     import pwd
 
     home = pwd.getpwnam(conf["user"]).pw_dir
     env_lines = "\n".join(extra_env)
     return f"""[Unit]
-Description=MyrmidLM: Strata engine (started and stopped by myrmid-host, not at boot)
+Description=MyrmidLM: {_cx(x).label} engine (started and stopped by myrmid-host, not at boot)
 After=network-online.target
 
 [Service]
@@ -6250,146 +6424,155 @@ User={conf['user']}
 WorkingDirectory={conf['dir']}
 Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin
 {env_lines + chr(10) if env_lines else ''}# Written per start by the host (config, port, key): it comes last, so it wins
-EnvironmentFile=/run/myrmid/strata.env
-# The clone itself or its terminal/ folder (Strata 0.2.16 moved everything there): both work, also after an update
-{STRATA_EXEC}
+EnvironmentFile={_cx(x).env}
+{_cx(x).exec_line}
 Restart=on-failure
 RestartSec=30
 TimeoutStartSec=300
 TimeoutStopSec=90
 LimitMEMLOCK=infinity
-StandardOutput=append:{STRATA_LOG}
+StandardOutput=append:{_cx(x).log}
 StandardError=inherit
 """
 
 
-def strata_setup(args) -> None:
+def strata_setup(args, x: Optional["Ext"] = None) -> None:
     import pwd
 
+    x = _cx(x)
     d = Path(args.dir).expanduser().resolve() if args.dir else _strata_find_dir()
     if not d or not _is_strata_dir(d):
-        die("Strata-Ordner nicht gefunden (mit serve/server.py): --dir /home/<user>/strata angeben")
+        die(f"{x.label}-Ordner nicht gefunden (mit serve/server.py): --dir /home/<user>/{x.key} angeben")
     user = args.user or pwd.getpwuid(d.stat().st_uid).pw_name
     if user == "root":
-        die("Strata soll nicht als root laufen: --user <name> angeben")
+        die(f"{x.label} soll nicht als root laufen: --user <name> angeben")
     py = _strata_work(d) / ".venv" / "bin" / "python"
     if not py.exists() and not (d / ".venv" / "bin" / "python").exists():
-        die(f"{py} fehlt: Strata einmal mit ./setup.sh einrichten")
-    old = UNIT_DIR / "strata.service"
+        die(f"{py} fehlt: {x.label} einmal mit ./setup.sh einrichten")
+    old = UNIT_DIR / f"{x.key}.service"
     extra = _strata_old_unit_env(old)
-    if not any(x.startswith("Environment=STRATA_UV=") for x in extra) and (d / "uv.lock").exists():
+    if x.key == "strata" and not any(e.startswith("Environment=STRATA_UV=") for e in extra) and (d / "uv.lock").exists():
         extra.append("Environment=STRATA_UV=1")
     conf = {"dir": str(d), "user": user, "python": str(py),
-            "env": {x.split("=", 2)[1]: x.split("=", 2)[2] for x in extra
-                    if x.startswith("Environment=") and x.count("=") >= 2}}
-    STRATA_CONF.parent.mkdir(parents=True, exist_ok=True)
-    STRATA_CONF.write_text(json.dumps(conf, indent=1) + "\n")
-    os.chmod(STRATA_CONF, 0o644)
-    (UNIT_DIR / STRATA_UNIT).write_text(strata_unit_text(conf, extra))
-    (UNIT_DIR / "myrmid-strata-request.path").write_text(STRATA_REQUEST_PATH)
-    (UNIT_DIR / "myrmid-strata-request.service").write_text(STRATA_REQUEST_SERVICE)
-    STRATA_LOG.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(STRATA_LOG.parent, 0o755)
+            "env": {e.split("=", 2)[1]: e.split("=", 2)[2] for e in extra
+                    if e.startswith("Environment=") and e.count("=") >= 2}}
+    x.conf.parent.mkdir(parents=True, exist_ok=True)
+    x.conf.write_text(json.dumps(conf, indent=1) + "\n")
+    os.chmod(x.conf, 0o644)
+    (UNIT_DIR / x.unit).write_text(strata_unit_text(conf, extra, x))
+    (UNIT_DIR / f"myrmid-{x.key}-request.path").write_text(x.request_path_text)
+    (UNIT_DIR / f"myrmid-{x.key}-request.service").write_text(x.request_service_text)
+    x.log.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(x.log.parent, 0o755)
     if Path("/etc/logrotate.d").is_dir():
-        Path("/etc/logrotate.d/myrmid-strata").write_text(STRATA_LOGROTATE)
+        Path(f"/etc/logrotate.d/myrmid-{x.key}").write_text(x.logrotate_text)
     _systemctl("daemon-reload")
-    _systemctl("enable", "--now", "myrmid-strata-request.path")
-    print(f"Strata eingebunden: {d} (läuft als {user})")
+    _systemctl("enable", "--now", f"myrmid-{x.key}-request.path")
+    print(f"{x.label} eingebunden: {d} (läuft als {user})")
     if old.exists() and not args.keep_old:
-        _systemctl("disable", "--now", "strata.service")
-        print("Der alte strata.service ist gestoppt und startet nicht mehr beim Booten "
-              "(Datei bleibt; löschen mit: sudo rm -r /etc/systemd/system/strata.service*)")
+        _systemctl("disable", "--now", old.name)
+        print(f"Der alte {old.name} ist gestoppt und startet nicht mehr beim Booten "
+              f"(Datei bleibt; löschen mit: sudo rm -r /etc/systemd/system/{old.name}*)")
     Path(RUN_DIR).mkdir(parents=True, exist_ok=True)
-    _strata_write_info(conf)
-    cfgs = _strata_configs(d)
-    print(f"Konfigurationen: {', '.join(cfgs) or 'keine strata-*.json gefunden'}")
-    print(f"Protokoll: {STRATA_LOG}")
-    print("Im Dashboard des Masters: Host-Karte → Engine „Strata“ wählen, Konfiguration wählen, Laden.")
+    _strata_write_info(conf, x=x)
+    cfgs = _strata_configs(d, x)
+    print(f"Konfigurationen: {', '.join(cfgs) or f'keine {x.key}-*.json gefunden'}")
+    print(f"Protokoll: {x.log}")
+    print(f"Im Dashboard des Masters: Host-Karte → Engine „{x.label}“ wählen, Konfiguration wählen, Laden.")
 
 
-STRATA_REPO = "https://github.com/Niko1221/Strata.git"
-
-
-def strata_install(args) -> None:
-    """Clones Strata into the user's home, runs its setup.sh as that user
+def strata_install(args, x: Optional["Ext"] = None) -> None:
+    """Clones the engine into the user's home, runs its setup.sh as that user
     (model, storage, engine: its questions are answered in the terminal)
     without starting it, then takes it into MyrmidLM (strata_setup)."""
     import pwd
     import shutil
 
+    x = _cx(x)
     user = args.user or os.environ.get("SUDO_USER") or ""
     if not user or user == "root":
-        die("Für welchen Benutzer? sudo myrmid strata install --user <name> (Strata läuft nicht als root)")
+        die(f"Für welchen Benutzer? sudo myrmid {x.key} install --user <name> ({x.label} läuft nicht als root)")
     try:
         pw = pwd.getpwnam(user)
     except KeyError:
         die(f"Benutzer {user} gibt es nicht")
-    d = Path(args.dir).expanduser() if args.dir else Path(pw.pw_dir) / "strata"
+    d = Path(args.dir).expanduser() if args.dir else Path(pw.pw_dir) / x.key
     uenv = _strata_user_env({"user": user})
 
     def as_user(cmd: list[str], cwd: Path) -> int:
         return _run_as(user, cmd, cwd=cwd, env=uenv).returncode
 
     if _is_strata_dir(d):
-        print(f"Strata ist schon in {d}: Klonen übersprungen")
+        print(f"{x.label} ist schon in {d}: Klonen übersprungen")
     else:
         if d.exists() and any(d.iterdir()):
-            die(f"{d} gibt es schon und ist kein Strata-Ordner: anderen Ordner mit --dir angeben")
+            die(f"{d} gibt es schon und ist kein {x.label}-Ordner: anderen Ordner mit --dir angeben")
         if not shutil.which("git"):
             print("git fehlt, wird installiert ...")
             if not shutil.which("apt-get") or subprocess.run(["apt-get", "install", "-y", "git"]).returncode:
                 die("git konnte nicht installiert werden: bitte von Hand installieren")
         d.parent.mkdir(parents=True, exist_ok=True)
-        print(f"Hole Strata nach {d} ...")
-        if as_user(["git", "clone", STRATA_REPO, str(d)], d.parent):
+        print(f"Hole {x.label} nach {d} ...")
+        if as_user(["git", "clone", x.repo, str(d)], d.parent):
             die("git clone ist fehlgeschlagen")
     if not args.no_setup:
-        print("\nStrata-Einrichtung (setup.sh, als " + user + "): Modell, Speicherort und Einstellungen wählen. "
-              "Das Modell wird heruntergeladen (40-90 GB); Strata startet danach nicht, das macht MyrmidLM.\n")
+        size = "40-90 GB" if x.key == "strata" else "70-520 GB je nach Modell"
+        print(f"\n{x.label}-Einrichtung (setup.sh, als {user}): Modell, Speicherort und Einstellungen wählen. "
+              f"Das Modell wird heruntergeladen ({size}); {x.label} startet danach nicht, das macht MyrmidLM.\n")
         extra = list(args.setup_args or [])
+        env = {}
+        if x.key == "maya" and nvidia_old_gpus():  # Volta and older: Maya builds with CUDA 12 for them
+            env = strata_cuda12_env(x)
+            extra = _maya_cuda_args(env) + extra
         if getattr(args, "model", None):  # from the dashboard: no questions (--yes), the choices given
-            extra = ["--yes", "--model", args.model] + (["--context", str(args.context)] if args.context else []) \
-                + (["--kv", args.kv] if args.kv else []) + extra
-        code = as_user(["sh", "./setup.sh", "--no-start", *extra], d) if not getattr(args, "model", None) else \
-            _run_as(user, ["sh", "./setup.sh", "--no-start", *extra], cwd=d, env=uenv, stdin=subprocess.DEVNULL).returncode
+            extra = ["--yes", "--model", args.model] + (["--download-model"] if x.key == "maya" else []) \
+                + (["--context", str(args.context)] if args.context else []) \
+                + (["--kv", args.kv] if args.kv and x.has_kv else []) + extra
+        if not getattr(args, "model", None):
+            code = _run_as(user, ["sh", "./setup.sh", "--no-start", *extra], cwd=d, env={**uenv, **env}).returncode
+        else:
+            code = _run_as(user, ["sh", "./setup.sh", "--no-start", *extra], cwd=d, env={**uenv, **env},
+                           stdin=subprocess.DEVNULL).returncode
         if code:
-            die(f"setup.sh endete mit Code {code}. Danach erneut: sudo myrmid strata install --user {user}")
-    if not _strata_configs(d):
-        die(f"In {d} gibt es noch keine strata-*.json (kein Modell eingerichtet): "
-            f"sudo myrmid strata install --user {user} erneut ausführen")
+            die(f"setup.sh endete mit Code {code}. Danach erneut: sudo myrmid {x.key} install --user {user}")
+    if not _strata_configs(d, x):
+        die(f"In {d} gibt es noch keine {x.key}-*.json (kein Modell eingerichtet): "
+            f"sudo myrmid {x.key} install --user {user} erneut ausführen")
     args.dir, args.user = str(d), user
     print()
-    strata_setup(args)
+    strata_setup(args, x)
 
 
-def cmd_strata(args) -> None:
+def cmd_strata(args, x: Optional["Ext"] = None) -> None:
+    x = EXTS.get(getattr(args, "engine_key", "") or "") or _cx(x)
+    _EXT_CUR[0] = x  # root's helpers below work on this engine
     if args.what == "status":
-        conf, info = strata_conf(), strata_info()
+        conf, info = strata_conf(x), strata_info(x)
         if not conf:
-            print("Strata ist nicht eingerichtet (sudo myrmid strata setup)")
+            print(f"{x.label} ist nicht eingerichtet (sudo myrmid {x.key} setup)")
             return
         print(f"Ordner:   {conf['dir']} (Benutzer {conf['user']})")
-        print(f"Dienst:   {STRATA_UNIT}: {strata_state()}")
+        print(f"Dienst:   {x.unit}: {strata_state(0, x)}")
         if not info:
-            print(f"Antwort:  {STRATA_INFO} fehlt (der Host fragt sie an; prüfen: "
-                  f"systemctl status myrmid-strata-request.path)")
+            print(f"Antwort:  {x.info} fehlt (der Host fragt sie an; prüfen: "
+                  f"systemctl status myrmid-{x.key}-request.path)")
         print(f"Version:  {info.get('version') or '?'}")
         print(f"Konfig.:  {', '.join(info.get('configs') or []) or '?'}")
-        local = _strata_configs(Path(conf["dir"]))
+        local = _strata_configs(Path(conf["dir"]), x)
         if local != (info.get("configs") or []):
-            print(f"Im Ordner: {', '.join(local) or 'keine strata-*.json'} (Ordner {_strata_work(Path(conf['dir']))})")
+            print(f"Im Ordner: {', '.join(local) or f'keine {x.key}-*.json'} (Ordner {_strata_work(Path(conf['dir']))})")
         r = info.get("result") or {}
         if r:
             print(f"Zuletzt:  {r.get('action')} " + ("ok" if r.get("ok") else f"Fehler: {r.get('error')}"))
         return
     if os.geteuid() != 0:
-        die("Das braucht root: sudo myrmid strata " + args.what)
+        die(f"Das braucht root: sudo myrmid {x.key} " + args.what)
     if args.what == "setup":
-        strata_setup(args)
+        strata_setup(args, x)
     elif args.what == "install":
-        strata_install(args)
+        strata_install(args, x)
     elif args.what == "apply-request":
-        strata_apply_request()
+        strata_apply_request(x)
 
 
 class HostAgent:
@@ -6545,28 +6728,32 @@ class HostAgent:
                   "spec_info": getattr(self, "spec_info", {}) or {}}
             if self.event:
                 st["note"] = (st["note"] + " " if st["note"] else "") + self.event
-        st["metrics"] = self._metrics() if st["engine"] != "strata" else {}
+        # Strata and Maya serve llama.cpp's /metrics too (running and waiting requests)
+        st["metrics"] = self._metrics()
         st["stats"] = self.stats.sample()
-        if not strata_conf() and self.slot in (None, 0) and has_nvidia():
-            st["strata_install"] = self._strata_install_info()
-        if strata_conf() and (self.slot is None or self.group):
-            info = strata_info()
-            if not info and time.time() - getattr(self, "strata_asked", 0) > 60:
-                self.strata_asked = time.time()  # after a reboot /run is empty: root lists the configurations
-                try:
-                    strata_request("info")
-                except OSError:
-                    pass
-            st["strata"] = {"configs": info.get("configs") or [], "version": info.get("version") or "",
-                            "config_gpus": info.get("config_gpus") or {},
-                            "config_settings": info.get("config_settings") or {},
-                            "old_gpus": nvidia_old_gpus(),
-                            "state": strata_state(self.api_port)}
-            if self.slot is not None:  # one GPU or a group of several: Strata gets exactly these
-                st["strata"]["fixed_gpu"] = self._strata_fixed()
-                other = strata_running_port()
-                if other and other != self.api_port and strata_state() in ("active", "activating"):
-                    st["strata"]["elsewhere"] = True
+        for x in EXTS.values():
+            if not strata_conf(x) and self.slot in (None, 0) and has_nvidia():
+                st[f"{x.key}_install"] = self._strata_install_info(x)
+            if strata_conf(x) and (self.slot is None or self.group):
+                info = strata_info(x)
+                asked = getattr(self, "ext_asked", {})
+                if not info and time.time() - asked.get(x.key, 0) > 60:
+                    asked[x.key] = time.time()  # after a reboot /run is empty: root lists the configurations
+                    self.ext_asked = asked
+                    try:
+                        strata_request("info", x)
+                    except OSError:
+                        pass
+                st[x.key] = {"configs": info.get("configs") or [], "version": info.get("version") or "",
+                             "config_gpus": info.get("config_gpus") or {},
+                             "config_settings": info.get("config_settings") or {},
+                             "old_gpus": nvidia_old_gpus(), "kv": x.has_kv,
+                             "state": strata_state(self.api_port, x)}
+                if self.slot is not None:  # one GPU or a group of several: the engine gets exactly these
+                    st[x.key]["fixed_gpu"] = self._strata_fixed()
+                    other = strata_running_port(x)
+                    if other and other != self.api_port and strata_state(0, x) in ("active", "activating"):
+                        st[x.key]["elsewhere"] = True
         st["models"] = sorted({p.stem.split("-00001-of-")[0] for p in self.models_dir.glob("*.gguf")}) \
             if self.models_dir.is_dir() else []
         if node:  # the PC's layout: the master lists every slot and can switch it
@@ -6595,13 +6782,14 @@ class HostAgent:
             a["spec"] = body["spec"]
         if parse_parallel(body.get("parallel")):
             a["parallel"] = parse_parallel(body.get("parallel"))
-        if body.get("engine") == "strata":  # model = one of Strata's strata-*.json; it brings its own settings
-            if not STRATA_CFG_RE.match(model):
-                return {"error": "Strata: Konfiguration strata-<name>.json wählen"}
+        x = EXTS.get(str(body.get("engine") or ""))
+        if x:  # model = one of the engine's <engine>-*.json; it brings its own settings
+            if not x.cfg_re.match(model):
+                return {"error": f"{x.label}: Konfiguration {x.key}-<name>.json wählen"}
             gpus = str(body.get("strata_gpus") or "").replace(" ", "")
             if gpus and not STRATA_GPU_RE.match(gpus):
-                return {"error": f"Strata: ungültige GPU-Auswahl {gpus}"}
-            a.update(engine="strata", ctx=None, kv="f16", vision="auto", strata_gpus=gpus)
+                return {"error": f"{x.label}: ungültige GPU-Auswahl {gpus}"}
+            a.update(engine=x.key, ctx=None, kv="f16", vision="auto", strata_gpus=gpus)
         with self.lock:
             self.job += 1
             if a != self.assignment:
@@ -6685,13 +6873,14 @@ class HostAgent:
         def current() -> bool:
             return job == self.job
 
-        if a.get("engine") == "strata":
+        if ext_of(a):
             self._run_strata(a, current)
             return
         try:
             self._set("preparing")
             self.stop_server()
-            strata_stop_running("llama.cpp takes the GPUs", self.api_port, only_own=self.slot is not None)
+            for x in EXTS.values():
+                strata_stop_running("llama.cpp takes the GPUs", self.api_port, only_own=self.slot is not None, x=x)
             path = self._local(a["model"])
             if path is None:
                 self._set("downloading")
@@ -6724,99 +6913,104 @@ class HostAgent:
                 self._set("error", f"{type(e).__name__}: {e}")
 
     def _run_strata(self, a: dict, current) -> None:
-        """Strata instead of llama-server, on the same port with the same key."""
+        """Strata or Maya instead of llama-server, on the same port with the same key."""
+        x = ext_of(a) or STRATA_X
         try:
             self._set("preparing")
             self.stop_server()
             gpus = a.get("strata_gpus") or ""
-            if self.slot is not None:  # one GPU of several: exactly this one, and one Strata per PC
+            if self.slot is not None:  # one GPU of several: exactly this one, and one such engine per PC
                 idx = self._strata_fixed()
                 if idx is None:
-                    self._set("error", "Strata: die Nummer dieser GPU (nvidia-smi) ist nicht zu ermitteln")
+                    self._set("error", f"{x.label}: die Nummer dieser GPU (nvidia-smi) ist nicht zu ermitteln")
                     return
                 gpus = idx
-                other = strata_running_port()
-                if other and other != self.api_port and strata_state() in ("active", "activating", "reloading"):
-                    self._set("error", "Strata läuft schon auf einer anderen GPU dieses PCs: "
-                                       "je PC geht nur eine Strata-Instanz (dort erst entladen)")
+                other = strata_running_port(x)
+                if other and other != self.api_port and strata_state(0, x) in ("active", "activating", "reloading"):
+                    self._set("error", f"{x.label} läuft schon auf einer anderen GPU dieses PCs: "
+                                       f"je PC geht nur eine {x.label}-Instanz (dort erst entladen)")
                     return
-            if not strata_conf():
-                self._set("error", "Strata ist auf diesem PC nicht eingerichtet: sudo myrmid strata setup")
+            if not strata_conf(x):
+                self._set("error", f"{x.label} ist auf diesem PC nicht eingerichtet: sudo myrmid {x.key} setup")
                 return
             if not current():
                 return
             self._set("loading")
-            proc = StrataProc(self.api_port)
+            proc = StrataProc(self.api_port, x=x)
             proc.start(a["model"], self.key, gpus, a.get("parallel") or 0)
             with self.lock:
                 self.proc, self.model_path, self.ctx, self.tail, self.cmd = proc, Path(a["model"]), None, [], []
                 self.estimate_tps, self.download, self.note = None, None, ""
-            end = time.time() + 1800  # Strata loads its own files (about 40-90 GB): minutes
+            # the engine loads its own files (Strata about 40-90 GB, Maya up to several hundred): minutes
+            end = time.time() + (1800 if x.key == "strata" else 3600)
             while time.time() < end:
                 if not current():
                     return
-                r = strata_result(proc.asked)
+                r = strata_result(proc.asked, x)
                 if r and not r.get("ok"):
-                    self._set("error", f"Strata: {r.get('error')}")
+                    self._set("error", f"{x.label}: {r.get('error')}")
                     return
                 if proc.poll() is not None:
-                    tail = [x for x in strata_log_tail(60, getattr(proc, "log_from", 0)) if x.strip()]
+                    tail = [ln for ln in strata_log_tail(60, getattr(proc, "log_from", 0), x) if ln.strip()]
                     why = strata_failure_line(tail)
-                    self._set("error", "Strata startet nicht" + (f": {why.strip()[:300]}" if why else
-                                                                  f"; siehe {STRATA_LOG}"))
+                    self._set("error", f"{x.label} startet nicht" + (f": {why.strip()[:300]}" if why else
+                                                                     f"; siehe {x.log}"))
                     return
                 h = strata_health(self.api_port)
                 if h and h.get("status") == "ok" and h.get("loaded", True):
                     with self.lock:
-                        self.ctx = int(h.get("max_context") or 0) or None
+                        self.ctx = int(h.get("max_context") or h.get("n_ctx") or 0) or None
                         if h.get("model"):
-                            self.note = f"Strata: {h['model']}" + (" · Bilder" if h.get("images") else "")
-                    log(f"{self.label}: Strata ready ({h.get('model')}, context {h.get('max_context')})")
+                            self.note = f"{x.label}: {h['model']}" + (" · Bilder" if h.get("images") else "")
+                    log(f"{self.label}: {x.label} ready ({h.get('model')}, context {h.get('max_context')})")
                     self._set("ready")
                     return
                 time.sleep(3)
-            self._set("error", f"Strata ist nach 30 Minuten nicht bereit; siehe {STRATA_LOG}")
+            self._set("error", f"{x.label} ist nach {(end - time.time() + 1) // 60:.0f} Minuten nicht bereit; siehe {x.log}")
         except Exception as e:  # noqa: BLE001 - report it to the master instead of dying
             if current():
-                self._set("error", f"Strata: {type(e).__name__}: {e}")
+                self._set("error", f"{x.label}: {type(e).__name__}: {e}")
 
-    def _strata_install_info(self) -> dict:
-        """For the card's "Strata installieren": who may run it, whether it runs, the log's last lines."""
+    def _strata_install_info(self, x: Optional[Ext] = None) -> dict:
+        """For the card's "<engine> installieren": who may run it, whether it runs, the log's last lines."""
         import pwd
 
+        x = x or STRATA_X
         users = sorted(p.pw_name for p in pwd.getpwall()
                        if 1000 <= p.pw_uid < 60000 and p.pw_dir.startswith("/home/")
                        and not p.pw_shell.endswith(("nologin", "false")))
         try:
-            st = subprocess.run(["systemctl", "is-active", STRATA_INSTALL_UNIT], capture_output=True, text=True,
+            st = subprocess.run(["systemctl", "is-active", x.install_unit], capture_output=True, text=True,
                                 timeout=10).stdout.strip()
         except (OSError, subprocess.TimeoutExpired):
             st = ""
         tail = []
         try:
-            with open(STRATA_INSTALL_LOG, "rb") as f:
+            with open(x.install_log, "rb") as f:
                 f.seek(0, os.SEEK_END)
                 f.seek(max(0, f.tell() - 16384))
-                tail = [x for x in f.read().decode(errors="replace").replace("\r", "\n").splitlines() if x.strip()]
+                tail = [ln for ln in f.read().decode(errors="replace").replace("\r", "\n").splitlines() if ln.strip()]
         except OSError:
             pass
         last = tail[-1].strip() if tail else ""
         return {"users": users, "running": st in ("active", "activating"), "possible": UPDATE_HELPER.exists(),
-                "models": list(STRATA_MODELS), "last": last[:240],
+                "models": list(x.models), "kv": x.has_kv, "last": last[:240],
                 "failed": bool(tail) and st not in ("active", "activating") and any(
                     k in " ".join(tail[-6:]).lower() for k in ("error", "fehler", "endete mit code", "[x]"))}
 
-    def strata_install(self, body: dict) -> dict:
-        """The card: install Strata for a user (the root helper runs myrmid strata install)."""
-        b = {"action": "strata-install", "user": str(body.get("user") or ""),
-             "model": str(body.get("model") or "IQ3_S"), "kv": str(body.get("kv") or "int8"),
+    def strata_install(self, body: dict, x: Optional[Ext] = None) -> dict:
+        """The card: install the engine for a user (the root helper runs myrmid <engine> install)."""
+        x = x or STRATA_X
+        b = {"action": f"{x.key}-install", "user": str(body.get("user") or ""),
+             "model": str(body.get("model") or x.default_model), "kv": str(body.get("kv") or "int8"),
              "context": parse_ctx(body.get("context")) or 0}
         res = request_update(b)
         if not res.get("ok"):
-            return {**self.status(), "error": f"Strata: {res.get('error')}"}
+            return {**self.status(), "error": f"{x.label}: {res.get('error')}"}
         with self.lock:
-            self.event = (f"Strata wird für {b['user']} installiert ({b['model']}). Das dauert, mit Download des "
-                          "Modells, eine Weile; der Fortschritt steht in der Karte.")
+            size = "40-90 GB" if x.key == "strata" else "70-520 GB"
+            self.event = (f"{x.label} wird für {b['user']} installiert ({b['model']}). Das dauert, mit Download des "
+                          f"Modells ({size}) eine Stunde und mehr; Fortschritt: {x.install_log}")
         return self.status()
 
     def _strata_fixed(self) -> Optional[str]:
@@ -6827,57 +7021,62 @@ class HostAgent:
         return self.strata_gpu
 
     def strata(self, body: Optional[dict] = None) -> dict:
-        """The dashboard: update Strata (it stops and starts again if it runs)."""
-        action = str((body or {}).get("action") or "")
+        """The dashboard: install, update or set up Strata or Maya again (body "engine"; it stops and starts again
+        if it runs)."""
+        import threading
+
+        body = body or {}
+        x = EXTS.get(str(body.get("engine") or "")) or STRATA_X
+        action = str(body.get("action") or "")
         if action == "install":
-            return self.strata_install(body or {})
-        if not strata_conf():
-            return {**self.status(), "error": "Strata ist auf diesem PC nicht eingerichtet: sudo myrmid strata setup"}
+            return self.strata_install(body, x)
+        if not strata_conf(x):
+            return {**self.status(), "error": f"{x.label} ist auf diesem PC nicht eingerichtet: sudo myrmid {x.key} setup"}
         if action in ("update", "reconfigure"):
+            if getattr(self, "ext_job", None):
+                return {**self.status(), "error": f"{self.ext_job[0].label}: ein Auftrag läuft noch"}
             kw = {}
             if action == "reconfigure":
-                b = body or {}
-                ctx = parse_ctx(b.get("context"))
-                kv = str(b.get("kv") or "int8")
-                cfg = str(b.get("config") or (self.assignment or {}).get("model") or "")
-                if not ctx or not STRATA_CFG_RE.match(cfg) or kv not in STRATA_KVS:
-                    return {**self.status(), "error": "Strata: Konfiguration, Kontext und KV-Cache angeben"}
-                want = str(b.get("gpus") or "").replace(" ", "")
+                ctx = parse_ctx(body.get("context"))
+                kv = str(body.get("kv") or "int8")
+                cfg = str(body.get("config") or (self.assignment or {}).get("model") or "")
+                if not ctx or not x.cfg_re.match(cfg) or kv not in STRATA_KVS:
+                    return {**self.status(), "error": f"{x.label}: Konfiguration, Kontext und KV-Cache angeben"}
+                want = str(body.get("gpus") or "").replace(" ", "")
                 gpus = (self._strata_fixed() if self.slot is not None else
                         (want if STRATA_GPU_RE.match(want) else (self.assignment or {}).get("strata_gpus") or "")) or ""
                 kw = {"config": cfg, "context": ctx, "kv": kv, "gpus": gpus}
-            if (self.assignment or {}).get("engine") == "strata":
+            if (self.assignment or {}).get("engine") == x.key:
                 with self.lock:
                     self.job += 1  # watch() must not restart it meanwhile; the job does
                     self.state = "loading"
-            self.strata_update_at = strata_request(action, **kw)
-            self.strata_job = action
+            self.ext_job = (x, action, strata_request(action, x, **kw))
             with self.lock:
-                self.event = ("Strata wird aktualisiert …" if action == "update" else
-                              f"Strata wird neu eingerichtet (Kontext {kw['context']:,}, KV {kw['kv']}) …"
-                              .replace(",", "."))
-            import threading
+                self.event = (f"{x.label} wird aktualisiert …" if action == "update" else
+                              f"{x.label} wird neu eingerichtet (Kontext {kw['context']:,}"
+                              .replace(",", ".") + (f", KV {kw['kv']}" if x.has_kv else "") + ") …")
             threading.Thread(target=self._after_strata_update, daemon=True).start()
         elif action == "refresh":
-            strata_request("info")
+            strata_request("info", x)
         return self.status()
 
     def _after_strata_update(self) -> None:
-        at = self.strata_update_at
+        x, job, at = self.ext_job
         end = time.time() + 4 * 3600
-        while time.time() < end and strata_result(at) is None:
+        while time.time() < end and strata_result(at, x) is None:
             time.sleep(5)
-        r = strata_result(at) or {}
-        upd = getattr(self, "strata_job", "update") == "update"
+        r = strata_result(at, x) or {}
+        upd = job == "update"
         with self.lock:
+            self.ext_job = None
             if r.get("ok"):
-                self.event = ("Strata aktualisiert" + (f" ({r.get('version')})" if r.get("version") else "") + "."
-                              if upd else "Strata neu eingerichtet.")
+                self.event = (f"{x.label} aktualisiert" + (f" ({r.get('version')})" if r.get("version") else "") + "."
+                              if upd else f"{x.label} neu eingerichtet.")
             else:
-                self.event = (f"Strata-{'Update' if upd else 'Einrichtung'} fehlgeschlagen: "
+                self.event = (f"{x.label}-{'Update' if upd else 'Einrichtung'} fehlgeschlagen: "
                               f"{r.get('error') or 'keine Antwort'}")
             a = self.assignment
-        if a and a.get("engine") == "strata":
+        if a and a.get("engine") == x.key:
             self.assign(a)  # waits for it to be ready again
 
     def _start_fitting(self, path: Path, a: dict, current) -> None:
@@ -7076,8 +7275,8 @@ class HostAgent:
             {"cpu": "Bilder im RAM", "off": "ohne Bilder"}.get(a.get("vision") or "", ""),
             (tuned or {}).get("label") or "ohne Autotune",
             f"{sc['tg']:.1f} Token/s".replace(".", ",") if sc.get("tg") else "") if x)
-        if a.get("engine") == "strata":
-            summary = f"Strata {a.get('model')}"
+        if ext_of(a):
+            summary = f"{ext_of(a).label} {a.get('model')}"
         snap = {"id": f"{int(time.time() * 1000):x}", "at": int(time.time()), "auto": auto,
                 "name": name.strip()[:60] or time.strftime("%d.%m. %H:%M"), "summary": summary,
                 "assignment": a, "model_path": str(path) if path else "", "tune": tuned or None, "moe": moe or None,
@@ -7163,8 +7362,8 @@ class HostAgent:
             else:
                 if self.state != "ready" or not self.model_path or not self.assignment:
                     return {**self.status(), "error": "no model running"}
-                if self.assignment.get("engine") == "strata":
-                    return {**self.status(), "error": "Autotune gibt es nur für llama.cpp; Strata stimmt sich selbst ab"}
+                if ext_of(self.assignment):
+                    return {**self.status(), "error": f"Autotune gibt es nur für llama.cpp; {ext_of(self.assignment).label} stimmt sich selbst ab"}
                 self.job += 1  # no restart from watch() meanwhile
                 self.tune_job = {"state": "running", "text": "startet …", "step": 0, "total": 0,
                                  "started": int(time.time()), "model": self.model_path.stem}
@@ -7247,7 +7446,8 @@ class HostAgent:
         follows it; if the service is gone for good, the host starts it again."""
         with self.lock:
             state, proc = self.state, self.proc
-        if not a or a.get("engine") != "strata" or state not in ("ready", "loading") or proc is None:
+        x = ext_of(a)
+        if not x or state not in ("ready", "loading") or proc is None:
             return
         if self.busy() and state == "loading" and getattr(self, "strata_down", 0) == 0:
             return  # _run_strata is waiting for it
@@ -7261,15 +7461,15 @@ class HostAgent:
         if state == "ready":
             self.strata_down = time.time()
             self._set("loading", "")
-            log(f"{self.label}: Strata answers no more ({strata_state()}); waiting for systemd to restart it")
+            log(f"{self.label}: {x.label} answers no more ({strata_state(0, x)}); waiting for systemd to restart it")
             return
         if getattr(self, "strata_down", 0) and proc.poll() is not None and time.time() - self.strata_down > 120:
             self.strata_down = 0
             self.restarts += 1
             if self.restarts > 3:
-                self._set("error", f"Strata endet immer wieder; siehe {STRATA_LOG}")
+                self._set("error", f"{x.label} endet immer wieder; siehe {x.log}")
                 return
-            log(f"{self.label}: Strata is not running: starting it again")
+            log(f"{self.label}: {x.label} is not running: starting it again")
             self.assign(a)
 
     def close(self) -> None:
@@ -10377,11 +10577,11 @@ class HostManager:
             try:
                 res = self._call(self.hosts[hid], "/strata",
                                  {"action": str(body["strata"]),
-                                  **{k: body[k] for k in ("config", "context", "kv", "user", "model", "gpus")
+                                  **{k: body[k] for k in ("config", "context", "kv", "user", "model", "gpus", "engine")
                                      if k in body}},
                                  timeout=10)
             except Exception as e:  # noqa: BLE001
-                return {**self.info(), "error": f"Strata: {e}"}
+                return {**self.info(), "error": f"{EXTS.get(str(body.get('engine') or ''), STRATA_X).label}: {e}"}
             if res.get("error"):
                 return {**self.info(), "error": res["error"]}
             with self.lock:
@@ -10454,13 +10654,13 @@ class HostManager:
                                 "ctx": parse_ctx(ctx),
                                 "kv": body.get("kv") if body.get("kv") in KV_BYTES else "f16",
                                 "vision": body.get("vision") if body.get("vision") in ("auto", "cpu", "off") else "auto"}
-            if body.get("spec") in ("mtp", "draft") and body.get("engine") != "strata":
+            if body.get("spec") in ("mtp", "draft") and body.get("engine") not in EXTS:
                 self.assign[hid]["spec"] = body["spec"]
             if parse_parallel(body.get("parallel")):
                 self.assign[hid]["parallel"] = parse_parallel(body.get("parallel"))
-            if body.get("engine") == "strata":  # Strata's strata-*.json brings context and the rest
+            if body.get("engine") in EXTS:  # Strata's or Maya's <engine>-*.json brings context and the rest
                 gpus = str(body.get("strata_gpus") or "").replace(" ", "")
-                self.assign[hid].update(engine="strata", ctx=None, kv="f16", vision="auto",
+                self.assign[hid].update(engine=body["engine"], ctx=None, kv="f16", vision="auto",
                                         strata_gpus=gpus if STRATA_GPU_RE.match(gpus) else "")
         self.save()
         self.pushed.pop(hid, None)
@@ -10493,7 +10693,7 @@ class HostManager:
                               **{k: st.get(k) for k in ("state", "error", "assignment", "model", "ctx",
                                                        "estimate_tps", "progress", "models", "stats", "layout",
                                                        "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned", "groups", "group", "nv_index",
-                                                       "note", "snapshots", "rollback", "engine", "strata", "strata_install", "spec_info",
+                                                       "note", "snapshots", "rollback", "engine", "strata", "strata_install", "maya", "maya_install", "spec_info",
                                                        "embed", "image")},
                               "busy": (st.get("metrics") or {}).get("requests_processing"),
                               "waiting": (st.get("metrics") or {}).get("requests_deferred")})
@@ -11315,24 +11515,24 @@ def main() -> None:
     sc.add_argument("--json", action="store_true")
     sc.set_defaults(fn=cmd_scan)
 
-    st = sub.add_parser("strata", help="Strata as a host's engine: install or setup (once, sudo), status",
-                        description="install: clone Strata into the user's home, run its setup.sh as that user "
-                                    "(choose the model there), then do what setup does. "
-                                    "setup: take an installed Strata (github.com/Niko1221/Strata) into MyrmidLM: "
-                                    "writes myrmid-strata.service for the user who installed it, the request helper and "
-                                    "log rotation, and stops an old strata.service. The master's dashboard then "
-                                    "switches the host's engine between llama.cpp and Strata.")
-    st.add_argument("what", nargs="?", default="status", choices=("status", "install", "setup", "apply-request"))
-    st.add_argument("--no-setup", action="store_true", help="install: don't run setup.sh (already done)")
-    st.add_argument("setup_args", nargs="*", help="install: passed on to setup.sh, after --, "
-                                                  "e.g. -- --family qwen --model Q2_0")
-    st.add_argument("--dir", help="Strata's folder (default: /home/*/strata)")
-    st.add_argument("--user", help="the user Strata runs as (default: the folder's owner)")
-    st.add_argument("--keep-old", action="store_true", help="leave an existing strata.service running and enabled")
-    st.add_argument("--model", help="install: Strata's model (e.g. IQ3_S) without questions (--yes)")
-    st.add_argument("--context", type=int, help="install with --model: context length")
-    st.add_argument("--kv", choices=("int8", "q4_0", "k8v4", "fp16"), help="install with --model: KV cache")
-    st.set_defaults(fn=cmd_strata)
+    for key, label, url, example in (("strata", "Strata", "github.com/Niko1221/Strata", "IQ3_S"),
+                                      ("maya", "Project Maya", "github.com/mw00/project-maya", "glm-maya-s")):
+        st = sub.add_parser(key, help=f"{label} as a host's engine: install or setup (once, sudo), status",
+                            description=f"install: clone {label} ({url}) into the user's home, run its setup.sh as "
+                                        "that user (choose the model there), then do what setup does. "
+                                        f"setup: take an installed {label} into MyrmidLM: writes myrmid-{key}.service "
+                                        "for the user who installed it, the request helper and log rotation. The "
+                                        "master's dashboard then switches the host's engine.")
+        st.add_argument("what", nargs="?", default="status", choices=("status", "install", "setup", "apply-request"))
+        st.add_argument("--no-setup", action="store_true", help="install: don't run setup.sh (already done)")
+        st.add_argument("setup_args", nargs="*", help="install: passed on to setup.sh, after --")
+        st.add_argument("--dir", help=f"{label}'s folder (default: /home/*/{key})")
+        st.add_argument("--user", help=f"the user {label} runs as (default: the folder's owner)")
+        st.add_argument("--keep-old", action="store_true", help=f"leave an existing {key}.service running and enabled")
+        st.add_argument("--model", help=f"install: the model (e.g. {example}) without questions (--yes)")
+        st.add_argument("--context", type=int, help="install with --model: context length")
+        st.add_argument("--kv", choices=("int8", "q4_0", "k8v4", "fp16"), help="install with --model: KV cache (Strata)")
+        st.set_defaults(fn=cmd_strata, engine_key=key)
 
     up = sub.add_parser("update", help="versions and updates (check, prepare, activate need sudo)",
                         description="status: this PC's release and the newest one. check: ask the repo. "
