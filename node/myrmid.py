@@ -6326,7 +6326,7 @@ def _cuda12_host_cxx() -> Optional[str]:
     return f"/usr/bin/g++-{CUDA12_MAX_GCC}"
 
 
-def strata_cuda12_env() -> dict:
+def strata_cuda12_env(x: Optional["Ext"] = None) -> dict:
     """What Strata's setup needs for its CUDA 12 engine (Pascal/Volta, root only): the toolkit (fetched if missing),
     patched for a new glibc, and a host compiler it takes."""
     nvcc = _cuda12_nvcc() or _cuda12_install()
