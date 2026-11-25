@@ -5910,14 +5910,51 @@ def _strata_version(d: Path) -> str:
         return ""
 
 
-def _strata_write_info(conf: dict, result: Optional[dict] = None, x: Optional["Ext"] = None) -> None:
+def _ext_catalog(conf: dict, d: Path, x: Optional["Ext"] = None) -> dict:
+    """{family: {"title", "models": {model: about}}}: what "Weiteres Modell einrichten" offers. Strata's own setup
+    names its families and builds (read with its Python as its user); its Qwen builds are the ones the install
+    offers. Maya: its own quants, by family."""
+    x = _cx(x)
+    if x.key == "maya":
+        titles = {"glm": "GLM-5.3-Flash", "deepseek": "DeepSeek-V4.1-Flash", "minimax": "MiniMax-M3.1-Flash",
+                  "hy4": "Tencent Hy4-Flash"}
+        out: dict = {}
+        for m in x.models:
+            fam = m.split("-")[0]
+            out.setdefault(fam, {"title": titles.get(fam, fam), "models": {}})["models"][m] = ""
+        return out
+    out = {"qwen": {"title": "Qwen3.8-Flash-Next", "models": {m: "" for m in x.models}}}
+    code = ("import json, setup\nout = {}\n"
+            "for tab in ('FAMILIES', 'PREVIEW_FAMILIES', 'HY4_FAMILIES', 'INKLING_FAMILIES'):\n"
+            "    for k, v in getattr(setup, tab, {}).items():\n"
+            "        ms = v.get('models') or {}\n"
+            "        if ms:\n"
+            "            out[k] = {'title': str(v.get('title') or k), 'models': {str(m): (str(ms[m].get('about') or '')"
+            " if isinstance(ms[m], dict) else '')[:160] for m in ms}}\n"
+            "print(json.dumps(out))")
+    try:
+        r = _run_as(conf["user"], [str(_strata_work(d) / ".venv" / "bin" / "python"), "-c", code],
+                    cwd=_strata_work(d), env=_strata_user_env(conf), capture_output=True, text=True, timeout=90)
+        got = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else {}
+        out.update({k: v for k, v in got.items() if isinstance(v, dict) and v.get("models")})
+    except (OSError, ValueError, IndexError, KeyError, subprocess.TimeoutExpired):
+        pass
+    return out
+
+
+def _strata_write_info(conf: dict, result: Optional[dict] = None, x: Optional["Ext"] = None,
+                       catalog: bool = False) -> None:
     d = Path(conf["dir"]) if conf else None
     old = strata_info(x)
+    act = (result or {}).get("action")
+    # the catalog takes Strata's setup a moment to list: not on every start and stop
+    cat = _ext_catalog(conf, d, x) if d and (catalog or not old.get("catalog") or act in ("info", "update")) \
+        else old.get("catalog") or {}
     running = (result or {}).get("running", old.get("running")) if (result or {}).get("ok", True) else old.get("running")
     info = {"configs": _strata_configs(d) if d else [], "version": _strata_version(d) if d else "",
             "running": running,
             "config_gpus": _strata_config_gpus(d) if d else {},
-            "config_settings": _strata_config_settings(d) if d else {},
+            "config_settings": _strata_config_settings(d) if d else {}, "catalog": cat,
             "result": result if result is not None else old.get("result"), "at": time.time()}
     if not conf:
         info["error"] = f"{_cx(x).label} ist auf diesem PC nicht eingerichtet: sudo myrmid {_cx(x).key} setup"
@@ -6091,19 +6128,30 @@ def strata_apply_request(x: Optional["Ext"] = None) -> None:
                 cmd = ["sh", "./update.sh"] if (d / "update.sh").is_file() else ["sh", "./setup.sh", "--update"]
                 _strata_run_job(conf, d, cmd, "Update", x=x)
             res["version"] = _strata_version(d)
-        elif act == "reconfigure":  # context (and Strata's KV cache) live in the configuration: setup writes it anew
+        elif act in ("reconfigure", "add-model"):
+            # reconfigure: context (and Strata's KV cache) live in the configuration: setup writes it anew.
+            # add-model: setup sets up another model (downloads it) as one more configuration beside the others.
+            add = act == "add-model"
             cfg = str(req.get("config") or "")
-            if not x.cfg_re.match(cfg) or not (_strata_work(d) / cfg).is_file():
+            if not add and (not x.cfg_re.match(cfg) or not (_strata_work(d) / cfg).is_file()):
                 raise UpdateError(f"{x.label}-Konfiguration {cfg or '?'} gibt es nicht")
             ctx, kv, gpus = int(req.get("context") or 0), str(req.get("kv") or "int8"), str(req.get("gpus") or "")
-            if not 4096 <= ctx <= 1048576 or kv not in STRATA_KVS or (gpus and not STRATA_GPU_RE.match(gpus)):
+            if not (4096 <= ctx <= 1048576 or (add and not ctx)) or kv not in STRATA_KVS \
+                    or (gpus and not STRATA_GPU_RE.match(gpus)):
                 raise UpdateError("ungültiger Kontext, KV-Cache oder GPU-Auswahl")
+            if add:
+                fam, mod = str(req.get("family") or ""), str(req.get("model") or "")
+                if not re.match(r"^[A-Za-z0-9_.-]{1,48}$", mod) or (fam and not re.match(r"^[a-z0-9_.-]{1,40}$", fam)):
+                    raise UpdateError("ungültiges Modell oder ungültige Familie")
+                _strata_log(f"richte ein weiteres Modell ein: {fam + ' ' if fam else ''}{mod}", x)
+            ctx_arg = ["--context", str(ctx)] if ctx else []
             sel = [int(g) for g in gpus.split(",")] if gpus else []
             old = set(nvidia_old_gpus()) & set(sel or nvidia_old_gpus())
             env = {}
             if x.key == "maya":
-                cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes", "--model", _maya_model_id(conf, d, cfg),
-                       "--context", str(ctx)]
+                cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes"] \
+                    + (["--download-model", "--model", mod] if add else ["--model", _maya_model_id(conf, d, cfg)]) \
+                    + ctx_arg
                 if sel:
                     cmd += ["--gpus", gpus] if len(sel) > 1 else ["--gpu", gpus]
                 if old:  # Volta and older: Maya builds with CUDA 12 for them
@@ -6111,9 +6159,9 @@ def strata_apply_request(x: Optional["Ext"] = None) -> None:
                     env = strata_cuda12_env(x)
                     cmd += _maya_cuda_args(env)
             else:
-                family, model = _strata_family_model(conf, d, cfg)
-                cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes", "--model", model, "--context", str(ctx),
-                       "--kv", kv] + (["--family", family] if family else [])
+                family, model = (fam, mod) if add else _strata_family_model(conf, d, cfg)
+                cmd = ["sh", "./setup.sh", "--setup", "--no-start", "--yes", "--model", model] + ctx_arg \
+                    + (["--kv", kv] if ctx else []) + (["--family", family] if family else [])
                 if sel:
                     old = old & set(sel)
                     if old and len(sel) > 1:  # a newer card is Main, the older ones help
@@ -6124,8 +6172,8 @@ def strata_apply_request(x: Optional["Ext"] = None) -> None:
                         cmd += ["--cuda", "12"]
                         _strata_log(f"GPU {', '.join(map(str, sorted(old)))} ist älter als RTX 20: CUDA-12-Engine", x)
                         env = strata_cuda12_env(x)
-            _strata_run_job(conf, d, cmd, "Einrichtung", env, x=x)
-            _strata_write_info(conf, x=x)  # the new settings for the card
+            _strata_run_job(conf, d, cmd, "Einrichtung", env, x=x, hours=10 if add else 3)
+            _strata_write_info(conf, x=x, catalog=True)  # the new settings (and configuration) for the card
 
     except (UpdateError, OSError, ValueError, KeyError) as e:
         res.update(ok=False, error=str(e))
@@ -6301,7 +6349,8 @@ def _strata_kill_strays(x: Optional["Ext"] = None) -> None:
                 pass
 
 
-def _strata_run_job(conf: dict, d: Path, cmd: list[str], what: str, env: Optional[dict] = None, x: Optional["Ext"] = None) -> None:
+def _strata_run_job(conf: dict, d: Path, cmd: list[str], what: str, env: Optional[dict] = None, x: Optional["Ext"] = None,
+                    hours: float = 3) -> None:
     """Runs one of the engine's scripts as its user (root only): the engine stops meanwhile and starts again if it ran."""
     x = _cx(x)
     was = strata_state(0, x) in ("active", "activating")
@@ -6315,7 +6364,7 @@ def _strata_run_job(conf: dict, d: Path, cmd: list[str], what: str, env: Optiona
         out.flush()
         try:
             r = _run_as(conf["user"], cmd, cwd=d, env={**_strata_user_env(conf), **(env or {})},
-                        stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, timeout=3 * 3600)
+                        stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, timeout=hours * 3600)
             code = r.returncode
         except subprocess.TimeoutExpired:
             code = -1
@@ -6747,6 +6796,7 @@ class HostAgent:
                 st[x.key] = {"configs": info.get("configs") or [], "version": info.get("version") or "",
                              "config_gpus": info.get("config_gpus") or {},
                              "config_settings": info.get("config_settings") or {},
+                             "catalog": info.get("catalog") or {},
                              "old_gpus": nvidia_old_gpus(), "kv": x.has_kv,
                              "state": strata_state(self.api_port, x)}
                 if self.slot is not None:  # one GPU or a group of several: the engine gets exactly these
@@ -7032,7 +7082,7 @@ class HostAgent:
             return self.strata_install(body, x)
         if not strata_conf(x):
             return {**self.status(), "error": f"{x.label} ist auf diesem PC nicht eingerichtet: sudo myrmid {x.key} setup"}
-        if action in ("update", "reconfigure"):
+        if action in ("update", "reconfigure", "add-model"):
             if getattr(self, "ext_job", None):
                 return {**self.status(), "error": f"{self.ext_job[0].label}: ein Auftrag läuft noch"}
             kw = {}
@@ -7046,6 +7096,15 @@ class HostAgent:
                 gpus = (self._strata_fixed() if self.slot is not None else
                         (want if STRATA_GPU_RE.match(want) else (self.assignment or {}).get("strata_gpus") or "")) or ""
                 kw = {"config": cfg, "context": ctx, "kv": kv, "gpus": gpus}
+            if action == "add-model":
+                mod, fam = str(body.get("model") or "").strip(), str(body.get("family") or "").strip()
+                if not re.match(r"^[A-Za-z0-9_.-]{1,48}$", mod) or (fam and not re.match(r"^[a-z0-9_.-]{1,40}$", fam)):
+                    return {**self.status(), "error": f"{x.label}: Modell (und Familie) angeben"}
+                want = str(body.get("gpus") or "").replace(" ", "")
+                gpus = (self._strata_fixed() if self.slot is not None else
+                        (want if STRATA_GPU_RE.match(want) else "")) or ""
+                kw = {"model": mod, "family": fam, "context": parse_ctx(body.get("context")) or 0,
+                      "kv": str(body.get("kv") or "int8"), "gpus": gpus}
             if (self.assignment or {}).get("engine") == x.key:
                 with self.lock:
                     self.job += 1  # watch() must not restart it meanwhile; the job does
@@ -7053,6 +7112,8 @@ class HostAgent:
             self.ext_job = (x, action, strata_request(action, x, **kw))
             with self.lock:
                 self.event = (f"{x.label} wird aktualisiert …" if action == "update" else
+                              f"{x.label} richtet {kw['family'] + ' ' if kw.get('family') else ''}{kw['model']} ein "
+                              f"(lädt das Modell, das dauert; Protokoll {x.update_log}) …" if action == "add-model" else
                               f"{x.label} wird neu eingerichtet (Kontext {kw['context']:,}"
                               .replace(",", ".") + (f", KV {kw['kv']}" if x.has_kv else "") + ") …")
             threading.Thread(target=self._after_strata_update, daemon=True).start()
@@ -7071,7 +7132,8 @@ class HostAgent:
             self.ext_job = None
             if r.get("ok"):
                 self.event = (f"{x.label} aktualisiert" + (f" ({r.get('version')})" if r.get("version") else "") + "."
-                              if upd else f"{x.label} neu eingerichtet.")
+                              if upd else "Neues Modell eingerichtet: in der Konfigurationsauswahl wählen und laden."
+                              if job == "add-model" else f"{x.label} neu eingerichtet.")
             else:
                 self.event = (f"{x.label}-{'Update' if upd else 'Einrichtung'} fehlgeschlagen: "
                               f"{r.get('error') or 'keine Antwort'}")
@@ -10577,7 +10639,7 @@ class HostManager:
             try:
                 res = self._call(self.hosts[hid], "/strata",
                                  {"action": str(body["strata"]),
-                                  **{k: body[k] for k in ("config", "context", "kv", "user", "model", "gpus", "engine")
+                                  **{k: body[k] for k in ("config", "context", "kv", "user", "model", "gpus", "engine", "family")
                                      if k in body}},
                                  timeout=10)
             except Exception as e:  # noqa: BLE001
