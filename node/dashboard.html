@@ -1670,7 +1670,7 @@ function renderHosts(s) {
       : pr ? `<div class="progress"><i style="width:${pr.total_mb ? 100 * pr.done_mb / pr.total_mb : 0}%"></i></div>
       <div class="note">${esc(pr.name)}${pr.files > 1 ? ` (${pr.files} Dateien)` : ""}: ${gb(pr.done_mb)} von ${gb(pr.total_mb)}${etaText}</div>`
       : `<div class="note">Sucht die Dateien auf Hugging Face …</div>`;
-    const now = x.model ? `<div><b>${esc(x.model)}</b>${x.ctx ? `, Kontext ${x.ctx.toLocaleString("de-DE")}` : ""}${x.estimate_tps ? `, geschätzt ${nf(x.estimate_tps, 1)} Token/s` : ""}${x.busy ? `, ${x.busy} Anfrage(n) in Arbeit` : ""}</div>` : "";
+    const now = x.model ? `<div><b>${esc(x.model)}</b>${x.ctx ? `, Kontext ${x.ctx.toLocaleString("de-DE")}` : ""}${x.estimate_tps ? `, geschätzt ${nf(x.estimate_tps, 1)} Token/s` : ""}${x.busy ? `, ${x.busy} Anfrage(n) in Arbeit` : ""}${x.waiting ? `, ${x.waiting} warten` : ""}${x.assignment && x.assignment.parallel ? ` · ${x.assignment.parallel} gleichzeitig` : ""}</div>` : "";
     const role = e.role ?? a.role ?? "big";
     const nGpus = (x.gpus || []).length;
     const layoutRow = x.layout_owner && nGpus >= 2 && !x.asleep
@@ -1736,6 +1736,7 @@ function renderHosts(s) {
           : `<label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>`}
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
         <label>Rolle<select name="role">${["big", "fast", "extra"].map((r) => `<option value="${r}"${r === role ? " selected" : ""}>${ROLE_TEXT[r]}</option>`).join("")}</select></label>
+        <label title="Wie viele Anfragen das Modell gleichzeitig bearbeitet; weitere warten. Mehr gleichzeitig: jede Antwort etwas langsamer, zusammen mehr Token. llama.cpp teilt sich dabei den Kontext (ein langer Chat allein bekommt ihn ganz), Strata braucht je Platz etwas VRAM. Ändern lädt das Modell neu.">Gleichzeitige Anfragen<select name="parallel">${[["", engine === "strata" ? "Standard (1)" : "Standard (4)"], ...[1, 2, 3, 4, 5, 6, 7, 8].map((n) => [String(n), String(n)])].map(([v, t]) => `<option value="${v}"${v === String(e.parallel ?? a.parallel ?? "") ? " selected" : ""}>${t}</option>`).join("")}</select></label>
         ${engine === "strata" ? "" : `<label>Kontext<input name="ctx" inputmode="numeric" value="${val("ctx")}" placeholder="automatisch"></label>
         <label>KV-Cache<select name="kv">${KV_OPTS.map(([v, t]) => `<option value="${v}"${v === (e.kv ?? a.kv ?? "f16") ? " selected" : ""}>${t}</option>`).join("")}</select></label>
         <label title="Bild-Teil des Modells (mmproj), wenn es einen hat. Aus: mehr VRAM für Text.">Bilder<select name="vision">${[["auto", "an (GPU, wenn Platz)"], ["cpu", "an, im RAM"], ["off", "aus"]].map(([v, t]) => `<option value="${v}"${v === (e.vision ?? a.vision ?? "auto") ? " selected" : ""}>${t}</option>`).join("")}</select></label>
@@ -1776,7 +1777,7 @@ $("hosts").addEventListener("submit", (ev) => {
   const card = ev.target.closest(".host"), f = new FormData(ev.target);
   delete hostEdits[card.dataset.id];
   document.activeElement.blur();
-  hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx"), kv: f.get("kv"), vision: f.get("vision"), engine: f.get("engine") || "llama", strata_gpus: f.getAll("strata_gpu").join(","), spec: f.get("spec") || "off" });
+  hostAction({ host: card.dataset.id, model: f.get("model"), name: f.get("name"), role: f.get("role"), ctx: f.get("ctx"), kv: f.get("kv"), vision: f.get("vision"), engine: f.get("engine") || "llama", strata_gpus: f.getAll("strata_gpu").join(","), spec: f.get("spec") || "off", parallel: f.get("parallel") || "" });
 });
 $("hosts").addEventListener("toggle", (ev) => {
   if (!ev.target.matches) return;
@@ -2307,7 +2308,8 @@ function renderRig(s) {
       const engine = a.engine === "strata" ? "Strata" : "";
       const tags = [engine && `<span class="tag acc">${engine}</span>`, a.role && `<span class="tag">${esc(ROLE_TEXT[a.role] || a.role)}</span>`, e.slot != null && `<span class="tag">${esc(String(e.name || "").split(" · ")[1] || "")}</span>`].filter(Boolean).join("");
       const memPct = g.mem_total_mb ? 100 * g.mem_used_mb / g.mem_total_mb : 0;
-      const sub = st === "ready" ? (inflight ? (inflight > 1 ? `${inflight} Anfragen laufen` : "1 Anfrage läuft") : (a.name ? `Name: ${esc(a.name)}` : "bereit")) : esc(e.error || "");
+      const running = e.busy != null ? Math.min(e.busy, inflight || e.busy) : inflight, waiting = e.waiting || Math.max(0, inflight - running);
+      const sub = st === "ready" ? (inflight || running ? `${running > 1 ? `${running} Anfragen laufen` : running ? "1 Anfrage läuft" : "wartet auf das Modell"}${waiting ? ` · ${waiting} ${waiting > 1 ? "warten" : "wartet"}` : ""}${a.parallel ? ` (${a.parallel} gleichzeitig)` : ""}` : (a.name ? `Name: ${esc(a.name)}` : "bereit")) : esc(e.error || "");
       const card = String(g.name || "").replace(/^NVIDIA\s+/i, "").replace(/^(AMD|Intel)\s+/i, "");
       return `<div class="rcard ${cls}" title="${esc(g.name)}${pcieText(g).replace(/<[^>]+>/g, "")}"><div class="rc-head"><b>GPU ${idx}</b><span class="rc-card">${esc(card)}</span>${tags}<span class="dot ${st === "ready" ? (busy ? "busy" : "ok") : st === "error" ? "bad" : st === "idle" ? "" : "warn"}"></span></div>
         <div class="rc-model">${esc(model)}</div><div class="rc-sub">${sub}</div>

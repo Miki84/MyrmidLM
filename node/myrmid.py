@@ -5464,7 +5464,7 @@ STRATA_GPU_RE = re.compile(r"^\d{1,2}(,\d{1,2}){0,15}$")  # nvidia-smi numbers: 
 # configuration's own "gpu" counts. The clone itself or its terminal/ folder (Strata 0.2.16): both work.
 STRATA_EXEC = ("ExecStart=/bin/sh -c '[ -f terminal/serve/server.py ] && cd terminal; exec .venv/bin/python "
                "serve/server.py --engine strata --config \"$$STRATA_CONFIG\" --port \"$$STRATA_PORT\" --host 127.0.0.1"
-               " $${STRATA_GPU:+--gpu \"$$STRATA_GPU\"}'")
+               " $${STRATA_GPU:+--gpu \"$$STRATA_GPU\"} $${STRATA_PARALLEL:+--parallel \"$$STRATA_PARALLEL\"}'")
 
 
 def strata_conf() -> dict:
@@ -5623,9 +5623,9 @@ class StrataProc:
         self.asked = 0.0 if adopted else time.time()
         self.stopped = False
 
-    def start(self, config: str, key: str, gpus: str = "") -> None:
+    def start(self, config: str, key: str, gpus: str = "", parallel: int = 0) -> None:
         self.log_from = strata_log_size()
-        self.asked = strata_request("start", config=config, port=self.port, key=key, gpus=gpus)
+        self.asked = strata_request("start", config=config, port=self.port, key=key, gpus=gpus, parallel=parallel)
 
     def poll(self) -> Optional[int]:
         if self.stopped:
@@ -5676,6 +5676,18 @@ def has_nvidia() -> bool:
                 ok = False
         _HAS_NVIDIA.append(ok)
     return _HAS_NVIDIA[0]
+
+
+PARALLEL_MAX = 8  # requests one model serves at once (llama-server slots, Strata's batch slots)
+
+
+def parse_parallel(v) -> int:
+    """Parallel requests asked for: 1..8, 0 = the engine's own default (llama.cpp 4 slots, Strata one at a time)."""
+    try:
+        n = int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if 1 <= n <= PARALLEL_MAX else 0
 
 
 _NV_INDEX_CACHE: dict = {}
@@ -5789,8 +5801,9 @@ def _strata_write_info(conf: dict, result: Optional[dict] = None) -> None:
     os.replace(tmp, STRATA_INFO)
 
 
-def _strata_env_text(config: str, port: int, key: str, gpus: str = "") -> str:
-    return f"STRATA_CONFIG={config}\nSTRATA_PORT={port}\nSTRATA_API_KEY={key}\nSTRATA_GPU={gpus}\n"
+def _strata_env_text(config: str, port: int, key: str, gpus: str = "", parallel: int = 0) -> str:
+    return (f"STRATA_CONFIG={config}\nSTRATA_PORT={port}\nSTRATA_API_KEY={key}\nSTRATA_GPU={gpus}\n"
+            f"STRATA_PARALLEL={parse_parallel(parallel) or ''}\n")
 
 
 def _strata_config_gpus(d: Path) -> dict:
@@ -5867,7 +5880,8 @@ def strata_apply_request() -> None:
             if gpus and not STRATA_GPU_RE.match(gpus):
                 raise UpdateError(f"ungültige GPU-Auswahl {gpus!r}")
             _strata_unit_current()
-            want = _strata_env_text(cfg, port, key, gpus)
+            par = parse_parallel(req.get("parallel"))
+            want = _strata_env_text(cfg, port, key, gpus, par)
             try:
                 same = STRATA_ENV.read_text() == want
             except OSError:
@@ -5880,7 +5894,8 @@ def strata_apply_request() -> None:
                 with os.fdopen(fd, "w") as f:
                     f.write(want)
                 STRATA_LOG.parent.mkdir(parents=True, exist_ok=True)
-                log(f"Strata: starting with {cfg} on 127.0.0.1:{port}" + (f", GPUs {gpus}" if gpus else ""))
+                log(f"Strata: starting with {cfg} on 127.0.0.1:{port}" + (f", GPUs {gpus}" if gpus else "")
+                    + (f", {par} requests at once" if par else ""))
                 r = _systemctl("restart", STRATA_UNIT)
                 res["running"] = {"port": port, "gpus": gpus, "config": cfg}
                 if r.returncode:
@@ -6578,6 +6593,8 @@ class HostAgent:
              "vision": body.get("vision") if body.get("vision") in ("auto", "cpu", "off") else "auto"}
         if body.get("spec") in ("mtp", "draft"):
             a["spec"] = body["spec"]
+        if parse_parallel(body.get("parallel")):
+            a["parallel"] = parse_parallel(body.get("parallel"))
         if body.get("engine") == "strata":  # model = one of Strata's strata-*.json; it brings its own settings
             if not STRATA_CFG_RE.match(model):
                 return {"error": "Strata: Konfiguration strata-<name>.json wählen"}
@@ -6730,7 +6747,7 @@ class HostAgent:
                 return
             self._set("loading")
             proc = StrataProc(self.api_port)
-            proc.start(a["model"], self.key, gpus)
+            proc.start(a["model"], self.key, gpus, a.get("parallel") or 0)
             with self.lock:
                 self.proc, self.model_path, self.ctx, self.tail, self.cmd = proc, Path(a["model"]), None, [], []
                 self.estimate_tps, self.download, self.note = None, None, ""
@@ -6983,6 +7000,8 @@ class HostAgent:
                                 only_devices=[g.name for g in self.group] or None,
                                 tune_slot=self.path, no_tune=no_tune, mmproj=a.get("vision") or "auto")
         self._spec(ns, path, a.get("spec") or "off")
+        if a.get("parallel"):  # one context for all slots: a long chat still gets all of it while it is alone
+            ns.extra = ns.extra + ["-np", str(a["parallel"]), "--kv-unified"]
         return ns
 
     def _spec(self, ns: argparse.Namespace, path: Path, spec: str) -> None:
@@ -10117,7 +10136,8 @@ class HostManager:
                 and (have.get("vision") or "auto") == (want.get("vision") or "auto") \
                 and (have.get("engine") or "llama") == (want.get("engine") or "llama") \
                 and (have.get("strata_gpus") or "") == (want.get("strata_gpus") or "") \
-                and (have.get("spec") or "off") == (want.get("spec") or "off"):  # older hosts: no such fields
+                and (have.get("spec") or "off") == (want.get("spec") or "off") \
+                and (have.get("parallel") or 0) == (want.get("parallel") or 0):  # older hosts: no such fields
             return
         last = self.pushed.get(hid)
         if last and last[0] == json.dumps(want, sort_keys=True) and time.time() - last[1] < 60:
@@ -10389,8 +10409,8 @@ class HostManager:
                 new_first = {"split": pc, "groups": f"{pc}-grp0"}.get(body["layout"], f"{pc}-gpu0")
                 if want:
                     self.assign[new_first] = {k: want.get(k) for k in ("model", "role", "name", "ctx", "kv", "engine",
-                                                                              "strata_gpus", "spec")
-                                              if want.get(k) is not None or k not in ("engine", "strata_gpus", "spec")}
+                                                                              "strata_gpus", "spec", "parallel")
+                                              if want.get(k) is not None or k not in ("engine", "strata_gpus", "spec", "parallel")}
                     self.pushed.pop(new_first, None)
             self.save()
             self.rescan, self.last_scan = True, 0
@@ -10436,6 +10456,8 @@ class HostManager:
                                 "vision": body.get("vision") if body.get("vision") in ("auto", "cpu", "off") else "auto"}
             if body.get("spec") in ("mtp", "draft") and body.get("engine") != "strata":
                 self.assign[hid]["spec"] = body["spec"]
+            if parse_parallel(body.get("parallel")):
+                self.assign[hid]["parallel"] = parse_parallel(body.get("parallel"))
             if body.get("engine") == "strata":  # Strata's strata-*.json brings context and the rest
                 gpus = str(body.get("strata_gpus") or "").replace(" ", "")
                 self.assign[hid].update(engine="strata", ctx=None, kv="f16", vision="auto",
@@ -10473,7 +10495,8 @@ class HostManager:
                                                        "gpus", "layout_owner", "slot", "gpu", "switching", "tune_job", "tuned", "groups", "group", "nv_index",
                                                        "note", "snapshots", "rollback", "engine", "strata", "strata_install", "spec_info",
                                                        "embed", "image")},
-                              "busy": (st.get("metrics") or {}).get("requests_processing")})
+                              "busy": (st.get("metrics") or {}).get("requests_processing"),
+                              "waiting": (st.get("metrics") or {}).get("requests_deferred")})
                 if h.get("error"):
                     hosts[-1]["state"], hosts[-1]["error"] = "unreachable", h["error"]
                 elif h.get("asleep"):
