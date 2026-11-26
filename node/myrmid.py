@@ -4216,7 +4216,8 @@ class Dashboard:
         page = html_path.read_bytes() if html_path else b"<p>dashboard.html missing</p>"
         handler = _json_handler({"/": lambda: (page, "text/html; charset=utf-8"),
                                  "/api/status": self.status,
-                                 "/api/monitor": lambda: self.router.monitor() if self.router else {"requests": []}},
+                                 "/api/monitor": lambda: self.router.monitor() if self.router else {"requests": []},
+                                 "/api/keys": lambda: self.router.keys_list() if self.router else {"keys": []}},
                                 {"/api/bench": lambda body: self.run_bench(),
                                  "/api/router": self.set_router,
                                  "/api/rebalance": self.sup.api,
@@ -4227,7 +4228,8 @@ class Dashboard:
                                  "/api/master": self.sup.master_api,
                                  "/api/update": lambda b: self.updater.api(b) if self.updater else {"ok": False},
                                  "/api/wake": lambda b: {"ok": self.sup.known.wake(str(b.get("id") or ""), force=True)},
-                                 "/api/hosts": self.hosts.api if self.hosts else (lambda b: {"error": "no hosts"})},
+                                 "/api/hosts": self.hosts.api if self.hosts else (lambda b: {"error": "no hosts"}),
+                                 "/api/keys": lambda b: self.router.keys_api(b) if self.router else {"error": "kein Router"}},
                                 key=self.sp.key, public=("/",), streams={"/api/chat": self.chat})
         if not _start_http(self.args.host, self.args.dashboard_port, handler):
             return None
@@ -9022,6 +9024,8 @@ ROLE_WORDS = {"fast": ("fast", "schnell", "small"), "big": ("big", "large", "gro
 ROUTER_EXAMPLES = CONFIG_DIR / "router-examples.json"
 ROUTER_EXTERNAL = CONFIG_DIR / "external.json"  # other OpenAI servers in the router (Strata, vLLM, ...)
 ROUTER_SUBJECTS = CONFIG_DIR / "router-subjects.json"  # subjects (programming, reports ...) -> a model by name
+API_KEYS = CONFIG_DIR / "api-keys.json"  # the router's keys beside the master's own: name, hash, use (0600)
+API_KEY_DAYS = 400  # how many days of use per key are kept (a year and a bit, for "30 Tage" and the year)
 # Subjects: a request whose text has the subject's words goes to its model (by name). Off until switched on, and a
 # subject without a target does nothing.
 DEFAULT_SUBJECTS = {
@@ -9189,6 +9193,153 @@ class Router:
         self.embedder: Optional[Embedder] = None  # set by serve; started when mode is "examples"
         self.external: list[dict] = []  # other OpenAI servers (external.json)
         self.local_big: Optional[Backend] = backends[0] if backends else None
+        # API keys of their own (dashboard "Zugänge"): only a hash of each is kept; the master's key stays the admin's
+        self.keys: dict = {}
+        self.keys_dirty = 0.0
+        try:
+            saved = json.loads(API_KEYS.read_text())
+            if isinstance(saved, dict) and isinstance(saved.get("keys"), dict):
+                self.keys = saved["keys"]
+        except (OSError, ValueError):
+            pass
+        self.key_index = {k["hash"]: kid for kid, k in self.keys.items() if k.get("hash")}
+
+    # API keys ------------------------------------------------------------------
+
+    @staticmethod
+    def _hash_key(k: str) -> str:
+        import hashlib
+
+        return hashlib.sha256(k.encode()).hexdigest()
+
+    def key_of(self, auth: str) -> tuple[Optional[str], str]:
+        """Who an Authorization header is: ("admin", "") for the master's key, (id, "") for an own key that may ask,
+        (None, why) else."""
+        if not auth.startswith("Bearer "):
+            return None, "Invalid API Key"
+        tok = auth[7:].strip()
+        if self.key and secrets.compare_digest(tok.encode(), self.key.encode()):
+            return "admin", ""
+        kid = self.key_index.get(self._hash_key(tok))
+        k = self.keys.get(kid or "")
+        if not k:
+            return None, "Invalid API Key"
+        if k.get("disabled"):
+            return None, f"API-Key „{k.get('name')}“ ist gesperrt"
+        return kid, ""
+
+    def _save_keys(self, now: bool = False) -> None:
+        """Written at once after a change by the admin, at most every 30 s for the use counters."""
+        if not now and time.time() - self.keys_dirty < 30:
+            return
+        self.keys_dirty = time.time()
+        try:
+            API_KEYS.parent.mkdir(parents=True, exist_ok=True)
+            tmp = API_KEYS.with_suffix(".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"keys": self.keys}, f, ensure_ascii=False)
+            tmp.replace(API_KEYS)
+        except OSError as e:
+            log(f"API keys: not saved ({e})")
+
+    def note_key_use(self, kid: str, model: str, prompt: int, reused: int, out: int, secs: float, ok: bool,
+                     ip: str) -> None:
+        """Adds one request to its key's use: in total and per day and model."""
+        with self.lock:
+            k = self.keys.get(kid)
+            if not k:
+                return
+            day = time.strftime("%Y-%m-%d")
+            for bucket in (k.setdefault("total", {}), k.setdefault("days", {}).setdefault(day, {}).setdefault(model or "?", {})):
+                bucket["n"] = bucket.get("n", 0) + 1
+                bucket["prompt"] = bucket.get("prompt", 0) + prompt
+                bucket["reused"] = bucket.get("reused", 0) + reused
+                bucket["output"] = bucket.get("output", 0) + out
+                bucket["secs"] = round(bucket.get("secs", 0) + secs, 1)
+                bucket["errors"] = bucket.get("errors", 0) + (0 if ok else 1)
+            k["last_used"], k["last_ip"] = int(time.time()), ip
+            if len(k["days"]) > API_KEY_DAYS:
+                for d in sorted(k["days"])[:-API_KEY_DAYS]:
+                    k["days"].pop(d, None)
+            self._save_keys()
+
+    def keys_list(self) -> dict:
+        """The dashboard's list: no hashes; use summed for today, 7 and 30 days, by model for 30 days."""
+        today = time.strftime("%Y-%m-%d")
+        cut = {n: time.strftime("%Y-%m-%d", time.localtime(time.time() - (n - 1) * 86400)) for n in (7, 30)}
+
+        def add(acc: dict, b: dict) -> None:
+            for f in ("n", "prompt", "reused", "output", "secs", "errors"):
+                acc[f] = round(acc.get(f, 0) + b.get(f, 0), 1)
+
+        out = []
+        with self.lock:
+            for kid, k in self.keys.items():
+                days = k.get("days") or {}
+                use = {"today": {}, "d7": {}, "d30": {}, "total": dict(k.get("total") or {})}
+                models: dict = {}
+                for d, per in days.items():
+                    for m, b in per.items():
+                        if d == today:
+                            add(use["today"], b)
+                        if d >= cut[7]:
+                            add(use["d7"], b)
+                        if d >= cut[30]:
+                            add(use["d30"], b)
+                            add(models.setdefault(m, {}), b)
+                out.append({"id": kid, "name": k.get("name"), "note": k.get("note") or "", "prefix": k.get("prefix"),
+                            "created": k.get("created"), "disabled": bool(k.get("disabled")),
+                            "last_used": k.get("last_used"), "last_ip": k.get("last_ip") or "",
+                            "last_host": client_host(k.get("last_ip") or "") if k.get("last_ip") else "",
+                            "use": use, "models": models})
+        out.sort(key=lambda k: (k["disabled"], -(k["last_used"] or 0), k["name"] or ""))
+        return {"keys": out, "admin": {"prefix": (self.key or "")[:6]}}
+
+    def keys_api(self, body: dict) -> dict:
+        """The dashboard: create (the key is shown this once), rename, disable, enable, rotate, delete."""
+        act, kid = str(body.get("action") or ""), str(body.get("id") or "")
+        name = str(body.get("name") or "").strip()[:60]
+        note = str(body.get("note") or "").strip()[:200]
+        new_key, err = None, ""
+        with self.lock:
+            if act == "create":
+                if not name:
+                    err = "Namen angeben"
+                elif any((k.get("name") or "").lower() == name.lower() for k in self.keys.values()):
+                    err = f"Einen Key „{name}“ gibt es schon"
+                else:
+                    kid = secrets.token_hex(6)
+                    new_key = "myr-" + secrets.token_urlsafe(32)
+                    self.keys[kid] = {"name": name, "note": note, "hash": self._hash_key(new_key),
+                                      "prefix": new_key[:10], "created": int(time.time()), "disabled": False,
+                                      "total": {}, "days": {}}
+            elif kid not in self.keys:
+                err = "Diesen Key gibt es nicht (mehr)"
+            elif act in ("disable", "enable"):
+                self.keys[kid]["disabled"] = act == "disable"
+            elif act == "rename":
+                if not name:
+                    err = "Namen angeben"
+                else:
+                    self.keys[kid].update(name=name, note=note)
+            elif act == "rotate":  # a new key for the same name and use; the old one stops working at once
+                new_key = "myr-" + secrets.token_urlsafe(32)
+                self.keys[kid].update(hash=self._hash_key(new_key), prefix=new_key[:10], rotated=int(time.time()))
+            elif act == "delete":
+                self.keys.pop(kid)
+            else:
+                err = f"unbekannte Aktion {act!r}"
+            if not err:
+                self.key_index = {k["hash"]: i for i, k in self.keys.items() if k.get("hash")}
+                self._save_keys(now=True)
+                log(f"API keys: {act} {self.keys.get(kid, {}).get('name') or kid}")
+        if err:
+            return {**self.keys_list(), "error": err}
+        res = self.keys_list()
+        if new_key:
+            res["new_key"] = {"id": kid, "key": new_key}
+        return res
 
     @property
     def big(self) -> Backend:
@@ -9850,10 +10001,16 @@ class Router:
                 pass
 
             def _auth(self) -> bool:
+                self.key_id, self.key_why = "admin", ""
                 if not router.key or self.path.startswith("/health"):
                     return True
-                got = self.headers.get("Authorization", "")
-                return secrets.compare_digest(got.encode(), f"Bearer {router.key}".encode())
+                self.key_id, self.key_why = router.key_of(self.headers.get("Authorization", ""))
+                return self.key_id is not None
+
+            def _denied(self):
+                why = getattr(self, "key_why", "") or "Invalid API Key"
+                return self._json(403 if "gesperrt" in why else 401,
+                                  {"error": {"message": why, "type": "authentication_error"}})
 
             def _json(self, code: int, obj: dict) -> None:
                 body = json.dumps(obj).encode()
@@ -9936,7 +10093,7 @@ class Router:
                 if self._is_comfy():
                     return self._comfy("GET")
                 if not self._auth():
-                    return self._json(401, {"error": {"message": "Invalid API Key", "type": "authentication_error"}})
+                    return self._denied()
                 path = self.path.split("?", 1)[0]
                 if path in ("/v1/images/workflow", "/images/workflow"):
                     e = router.pick_comfy() or router.pick_imager()
@@ -9982,7 +10139,7 @@ class Router:
                 if self._is_comfy():
                     return self._comfy("POST")
                 if not self._auth():
-                    return self._json(401, {"error": {"message": "Invalid API Key", "type": "authentication_error"}})
+                    return self._denied()
                 decide_ms = 0  # how long the router took to choose (monitor)
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n) if n else b""
@@ -10197,7 +10354,8 @@ class Router:
                         try:
                             router.note_request(backend, status, tail, raw, reason, started, alone,
                                                 decide_ms=getattr(self, "decide_ms", 0),
-                                                client=self.headers.get("User-Agent") or "", ip=client_ip(self))
+                                                client=self.headers.get("User-Agent") or "", ip=client_ip(self),
+                                                key_id=getattr(self, "key_id", "") or "")
                         except Exception as e:  # noqa: BLE001 - the monitor must never break serving
                             log(f"Monitor: {e}")
                     found = re.findall(rb'"timings"\s*:\s*(\{[^{}]*\})', tail) if alone and tail else []
@@ -10215,7 +10373,8 @@ class Router:
         return H
 
     def note_request(self, b: Backend, status: int, tail: bytes, raw: Optional[bytes], reason: str,
-                     started: float, alone: bool, decide_ms: int = 0, client: str = "", ip: str = "") -> None:
+                     started: float, alone: bool, decide_ms: int = 0, client: str = "", ip: str = "",
+                     key_id: str = "") -> None:
         """One line for the monitor: from llama-server's "timings" (tokens
         read, reused from the cache, written, and the speeds), else from the
         OpenAI "usage" an external server sends."""
@@ -10239,6 +10398,7 @@ class Router:
              "image": bool(raw and (b'"image_url"' in raw or b'"input_image"' in raw)),
              "decide_ms": decide_ms, "temp": round(b.temp) if b.temp else None,
              "client": client_name(client), "ip": ip,
+             "key": "Admin" if key_id == "admin" else (self.keys.get(key_id) or {}).get("name") or "",
              # speculative decoding (MTP or a draft model): share of the guessed tokens the model kept
              "spec": round(int(t.get("draft_n_accepted") or 0) / int(t["draft_n"]), 2) if t.get("draft_n") else None}
         with self.lock:
@@ -10250,6 +10410,8 @@ class Router:
             tot["output"] += out
             tot["pp_ms"] += float(t.get("prompt_ms") or 0)
             tot["tg_ms"] += float(t.get("predicted_ms") or 0)
+        if key_id and key_id != "admin":
+            self.note_key_use(key_id, e["model"], prompt, reused, out, e["secs"], status < 400, ip)
 
     def monitor(self) -> dict:
         with self.lock:

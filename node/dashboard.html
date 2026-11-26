@@ -177,6 +177,22 @@
   #app.rig > :not(header):not(#rig):not(#offline) { display: none !important; }
   #app:not(.rig) > #rig { display: none; }
   #app.help > :not(header):not(#help) { display: none !important; }
+  #app.keys > :not(header):not(#keys):not(#offline) { display: none !important; }
+  #app:not(.keys) > #keys { display: none; }
+  .keys-tab td { vertical-align: top; }
+  .keys-tab td:first-child { white-space: normal; min-width: 210px; }
+  .keys-tab tr.off td { opacity: .55; }
+  .keys-tab tr.k-row { cursor: pointer; }
+  .keys-tab .k-acts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; opacity: .9; }
+  .keys-tab .k-acts .btn { white-space: nowrap; }
+  .keys-tab tr.off .k-acts { opacity: 1; }
+  .keys-tab td.num { font-size: 12px; white-space: nowrap; }
+  #k-new { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  #k-new label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  #k-new input { font: inherit; font-size: 14px; padding: 8px 10px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface); color: var(--text); min-width: 240px; }
+  #k-new label.wide input { min-width: 320px; }
+  .k-new-key { margin-top: 12px; padding: 12px 14px; border: 1px solid var(--good); border-radius: 10px; }
+  .k-new-key code { font-size: 14px; word-break: break-all; user-select: all; }
   #app:not(.help) > #help { display: none; }
   .help-top { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin: 6px 0 16px; }
   .help-top input { font: inherit; padding: 8px 12px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface); color: var(--text); min-width: min(100%, 320px); }
@@ -432,6 +448,7 @@ table.req tr.bg-task td { opacity: .72; }
   .strata-inst .si-form { align-items: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
   .strata-inst .si-form input { width: 110px; }
   .bad-text { color: var(--bad); }
+  .good-text { color: var(--good); }
   .warn-text { color: var(--warn); }
 </style>
 </head>
@@ -480,7 +497,7 @@ table.req tr.bg-task td { opacity: .72; }
 <div class="wrap" id="app">
   <header class="top">
     <div>
-      <div class="title-row"><svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="34" height="34" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0f1e28"/><defs><polygon id="hlogo" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/></defs><g stroke="#0f1e28" stroke-width="22"><use href="#hlogo" x="512" y="512" fill="#f0b54a"/><use href="#hlogo" x="512" y="282" fill="#4fc3b4"/><use href="#hlogo" x="512" y="742" fill="#4fc3b4" opacity=".75"/><use href="#hlogo" x="313" y="397" fill="#4fc3b4" opacity=".9"/><use href="#hlogo" x="711" y="397" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="313" y="627" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="711" y="627" fill="#4fc3b4" opacity=".9"/></g><g stroke="#0f1e28" stroke-width="18" stroke-linecap="round"><path d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/></g><g fill="#0f1e28"><circle cx="512" cy="512" r="40"/></g><g fill="#0f1e28"><circle cx="512" cy="282" r="26"/><circle cx="512" cy="742" r="26"/><circle cx="313" cy="397" r="26"/><circle cx="711" cy="397" r="26"/><circle cx="313" cy="627" r="26"/><circle cx="711" cy="627" r="26"/></g></svg><h1>MyrmidLM-Cluster</h1><span class="tabs" role="tablist"><button type="button" role="tab" id="tab-main" aria-selected="true">Übersicht</button><button type="button" role="tab" id="tab-mon" aria-selected="false">Monitor</button><button type="button" role="tab" id="tab-rig" aria-selected="false">Rig live</button><button type="button" role="tab" id="tab-help" aria-selected="false">Hilfe</button></span><button class="theme-btn" id="theme-btn" type="button" title="Design: automatisch (wie das System)">◐</button><a class="ver-badge" id="ver-badge" href="#update-panel" hidden></a><button class="btn quiet small chat-btn" id="chat-open" type="button">Chat testen</button></div>
+      <div class="title-row"><svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="34" height="34" aria-hidden="true"><rect width="1024" height="1024" rx="224" fill="#0f1e28"/><defs><polygon id="hlogo" points="0,-118 102,-59 102,59 0,118 -102,59 -102,-59"/></defs><g stroke="#0f1e28" stroke-width="22"><use href="#hlogo" x="512" y="512" fill="#f0b54a"/><use href="#hlogo" x="512" y="282" fill="#4fc3b4"/><use href="#hlogo" x="512" y="742" fill="#4fc3b4" opacity=".75"/><use href="#hlogo" x="313" y="397" fill="#4fc3b4" opacity=".9"/><use href="#hlogo" x="711" y="397" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="313" y="627" fill="#4fc3b4" opacity=".6"/><use href="#hlogo" x="711" y="627" fill="#4fc3b4" opacity=".9"/></g><g stroke="#0f1e28" stroke-width="18" stroke-linecap="round"><path d="M512 512 L512 282 M512 512 L512 742 M512 512 L313 397 M512 512 L711 397 M512 512 L313 627 M512 512 L711 627"/></g><g fill="#0f1e28"><circle cx="512" cy="512" r="40"/></g><g fill="#0f1e28"><circle cx="512" cy="282" r="26"/><circle cx="512" cy="742" r="26"/><circle cx="313" cy="397" r="26"/><circle cx="711" cy="397" r="26"/><circle cx="313" cy="627" r="26"/><circle cx="711" cy="627" r="26"/></g></svg><h1>MyrmidLM-Cluster</h1><span class="tabs" role="tablist"><button type="button" role="tab" id="tab-main" aria-selected="true">Übersicht</button><button type="button" role="tab" id="tab-mon" aria-selected="false">Monitor</button><button type="button" role="tab" id="tab-rig" aria-selected="false">Rig live</button><button type="button" role="tab" id="tab-keys" aria-selected="false">Zugänge</button><button type="button" role="tab" id="tab-help" aria-selected="false">Hilfe</button></span><button class="theme-btn" id="theme-btn" type="button" title="Design: automatisch (wie das System)">◐</button><a class="ver-badge" id="ver-badge" href="#update-panel" hidden></a><button class="btn quiet small chat-btn" id="chat-open" type="button">Chat testen</button></div>
       <div class="model" id="model">Verbinde mit dem Master …</div>
       <details class="model-switch" id="model-switch">
         <summary>Modell und Kontext</summary>
@@ -793,6 +810,15 @@ sudo timedatectl set-timezone Europe/Berlin</pre>
         <p><b>401 / invalid api key:</b> Key mit <code>sudo myrmid key</code> neu kopieren (Verwechslung 0/O, l/I). <b>503 / kein Modell:</b> Host schläft, ist in Wartung oder lädt noch: Host-Karte ansehen. <b>Speicherfehler beim Laden:</b> der Host versucht von selbst kleinere Stufen (weniger Cache, kleineres -ub, weniger Kontext) und zeigt es in der Karte; KV-Cache <code>q8_0</code> oder weniger Kontext hilft.</p>
       </details>
     </div>
+  </section>
+  <section id="keys" aria-label="Zugänge: API-Keys und ihr Verbrauch">
+    <div class="help-top"><div><h2 style="margin:0">Zugänge</h2><div class="muted" style="font-size:13px">Eigene API-Keys für Clients und Personen: Verbrauch je Key, sperren, löschen. Der Key des Masters bleibt der Admin-Key (<code id="k-admin">…</code>) und gilt weiter.</div></div></div>
+    <div class="panel">
+      <form id="k-new" class="kv" autocomplete="off"><label>Name<input name="name" maxlength="60" placeholder="z. B. Hermes, Open WebUI, Kollege X" required></label><label class="wide">Notiz<input name="note" maxlength="200" placeholder="optional"></label><button class="btn" type="submit">Key erzeugen</button></form>
+      <div id="k-shown"></div>
+    </div>
+    <div class="panel" style="margin-top:14px"><div style="overflow-x:auto"><table class="req keys-tab"><thead><tr><th>Name</th><th>Key</th><th>Status</th><th>Zuletzt</th><th class="num">Heute</th><th class="num">7 Tage</th><th class="num">30 Tage</th><th class="num">Gesamt</th></tr></thead><tbody id="k-list"><tr><td colspan="8" class="muted">lädt …</td></tr></tbody></table></div>
+      <div class="muted" style="font-size:12px;margin-top:8px">Je Zeitraum: Anfragen, darunter gelesene / geschriebene Token (Maus darüber: mit Cache-Anteil und Rechenzeit). Ein Klick auf eine Zeile zeigt die Modelle der letzten 30 Tage. Anfragen mit dem Admin-Key zählen hier nicht; im Monitor steht bei jeder Anfrage, mit welchem Key sie kam.</div></div>
   </section>
   <section id="rig" aria-label="Rig live: alle GPUs">
     <div class="rig-top"><div><div class="rig-title">Cluster <em>live</em></div><div class="muted" style="font-size:12px" id="rig-stand">–</div></div>
@@ -2246,6 +2272,7 @@ function render(s) {
   if (location.hash === "#monitor" && !render.monOpened) { render.monOpened = true; monShow(true); }
   if (location.hash === "#rig" && !render.rigOpened) { render.rigOpened = true; showTab("rig"); }
   if (location.hash === "#hilfe" && !render.helpOpened) { render.helpOpened = true; showTab("help"); }
+  if (location.hash === "#zugaenge" && !render.keysOpened) { render.keysOpened = true; showTab("keys"); }
   rigCollect(s);
   renderRig(s);
 }
@@ -2262,7 +2289,10 @@ function showTab(tab) {
   $("tab-rig").setAttribute("aria-selected", String(tab === "rig"));
   $("app").classList.toggle("help", tab === "help");
   $("tab-help").setAttribute("aria-selected", String(tab === "help"));
-  const hash = { mon: "#monitor", rig: "#rig", help: "#hilfe" }[tab] || "";
+  $("app").classList.toggle("keys", tab === "keys");
+  $("tab-keys").setAttribute("aria-selected", String(tab === "keys"));
+  if (tab === "keys") keysFetch();
+  const hash = { mon: "#monitor", rig: "#rig", help: "#hilfe", keys: "#zugaenge" }[tab] || "";
   if (tab === "help") helpPrepare();
   if (location.hash !== hash) history.replaceState(null, "", hash || location.pathname);
   if (tab === "mon") monFetch();
@@ -2273,6 +2303,72 @@ $("tab-main").addEventListener("click", () => showTab("main"));
 $("tab-mon").addEventListener("click", () => showTab("mon"));
 $("tab-rig").addEventListener("click", () => showTab("rig"));
 $("tab-help").addEventListener("click", () => showTab("help"));
+$("tab-keys").addEventListener("click", () => showTab("keys"));
+
+// Zugänge: own API keys and their use
+const keysState = { data: null, open: {}, busy: false };
+async function keysFetch() {
+  if (keysState.busy) return;
+  keysState.busy = true;
+  try { keysState.data = await api("/api/keys"); keysRender(); } catch (e) { if (e.auth) $("login").hidden = false; }
+  keysState.busy = false;
+}
+function keysUse(u) {
+  if (!u || !u.n) return '<span class="muted">–</span>';
+  const t = (v) => v >= 1e6 ? nf(v / 1e6, 1) + " Mio." : v >= 1e4 ? nf(v / 1e3, 0) + " Tsd." : nf(v, 0);
+  return `<span title="${nf(u.n, 0)} Anfragen · ${nf(u.prompt, 0)} Token gelesen, davon ${nf(u.reused || 0, 0)} aus dem Cache · ${nf(u.output, 0)} geschrieben · ${nf((u.secs || 0) / 60, 1)} Min. Rechenzeit"><b>${nf(u.n, 0)}</b> <span class="muted">Anfr.</span><br>${t(u.prompt)} / ${t(u.output)}${u.errors ? `<br><span class="bad-text">${nf(u.errors, 0)} Fehler</span>` : ""}</span>`;
+}
+function keysRender() {
+  const d = keysState.data; if (!d) return;
+  $("k-admin").textContent = (d.admin && d.admin.prefix ? d.admin.prefix + "…" : "–");
+  const ago = (t) => { if (!t) return "nie"; const m = Math.round((Date.now() / 1000 - t) / 60); return m < 1 ? "gerade eben" : m < 60 ? `vor ${m} Min.` : m < 1440 ? `vor ${Math.round(m / 60)} Std.` : new Date(t * 1000).toLocaleDateString("de-DE"); };
+  $("k-list").innerHTML = (d.keys || []).map((k) => {
+    const models = Object.entries(k.models || {}).sort((a, b) => (b[1].output || 0) - (a[1].output || 0));
+    return `<tr class="k-row${k.disabled ? " off" : ""}" data-kid="${esc(k.id)}"><td><b>${esc(k.name)}</b>${k.note ? `<br><span class="muted">${esc(k.note)}</span>` : ""}<br><span class="muted">seit ${new Date(k.created * 1000).toLocaleDateString("de-DE")}</span>
+        <div class="k-acts"><button class="btn quiet small" type="button" data-kact="${k.disabled ? "enable" : "disable"}">${k.disabled ? "Entsperren" : "Sperren"}</button><button class="btn quiet small" type="button" data-kact="rotate" title="Neuen Key erzeugen; der alte gilt sofort nicht mehr. Name und Verbrauch bleiben.">Neu erzeugen</button><button class="btn quiet small" type="button" data-kact="rename">Umbenennen</button><button class="btn quiet small" type="button" data-kact="delete">Löschen</button></div></td>
+      <td><code>${esc(k.prefix || "")}…</code></td>
+      <td>${k.disabled ? '<span class="bad-text">gesperrt</span>' : '<span class="good-text">aktiv</span>'}</td>
+      <td>${ago(k.last_used)}${k.last_ip ? `<br><span class="muted">${esc(k.last_host || k.last_ip)}</span>` : ""}</td>
+      <td class="num">${keysUse(k.use.today)}</td><td class="num">${keysUse(k.use.d7)}</td><td class="num">${keysUse(k.use.d30)}</td><td class="num">${keysUse(k.use.total)}</td></tr>
+      ${keysState.open[k.id] ? `<tr class="k-models"><td></td><td colspan="7">${models.length ? `<table class="req"><thead><tr><th>Modell (30 Tage)</th><th class="num">Anfragen</th><th class="num">gelesen</th><th class="num">davon Cache</th><th class="num">geschrieben</th><th class="num">Rechenzeit</th></tr></thead><tbody>${models.map(([m, u]) => `<tr><td>${esc(m)}</td><td class="num">${nf(u.n, 0)}</td><td class="num">${nf(u.prompt, 0)}</td><td class="num">${nf(u.reused, 0)}</td><td class="num">${nf(u.output, 0)}</td><td class="num">${nf((u.secs || 0) / 60, 1)} Min.</td></tr>`).join("")}</tbody></table>` : '<span class="muted">In den letzten 30 Tagen keine Anfragen.</span>'}</td></tr>` : ""}`;
+  }).join("") || '<tr><td colspan="8" class="muted">Noch keine eigenen Keys. Oben einen erzeugen.</td></tr>';
+}
+function keysShowNew(name, k) {
+  $("k-shown").innerHTML = `<div class="k-new-key"><b>Neuer Key für „${esc(name)}“</b> – nur jetzt sichtbar, bitte gleich kopieren:<div style="margin:8px 0"><code id="k-new-val">${esc(k)}</code></div><button class="btn small" type="button" id="k-copy">Kopieren</button> <button class="btn quiet small" type="button" id="k-hide">Ausblenden</button><div class="muted" style="font-size:12px;margin-top:6px">Im Client als API-Key eintragen; die Adresse ist dieselbe wie bisher (…/v1).</div></div>`;
+  $("k-copy").onclick = () => { navigator.clipboard && navigator.clipboard.writeText(k); $("k-copy").textContent = "Kopiert"; };
+  $("k-hide").onclick = () => { $("k-shown").innerHTML = ""; };
+}
+async function keysPost(body) {
+  try {
+    const r = await api("/api/keys", { method: "POST", body: JSON.stringify(body) });
+    if (r.error) alert(r.error);
+    keysState.data = r; keysRender();
+    return r;
+  } catch (e) { alert("Fehler: " + e.message); return null; }
+}
+$("k-new").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = new FormData(ev.target);
+  const r = await keysPost({ action: "create", name: f.get("name"), note: f.get("note") });
+  if (r && r.new_key) { keysShowNew(f.get("name"), r.new_key.key); ev.target.reset(); }
+});
+$("k-list").addEventListener("click", async (ev) => {
+  const row = ev.target.closest("tr.k-row"); if (!row) return;
+  const id = row.dataset.kid, k = (keysState.data.keys || []).find((x) => x.id === id); if (!k) return;
+  const act = ev.target.dataset && ev.target.dataset.kact;
+  if (!act) { keysState.open[id] = !keysState.open[id]; keysRender(); return; }
+  if (act === "delete" && !confirm(`Key „${k.name}“ löschen? Clients mit diesem Key kommen danach nicht mehr herein, und sein Verbrauch ist weg.`)) return;
+  if (act === "rotate" && !confirm(`Für „${k.name}“ einen neuen Key erzeugen? Der bisherige gilt sofort nicht mehr.`)) return;
+  if (act === "disable" && !confirm(`Key „${k.name}“ sperren? Anfragen damit bekommen sofort „gesperrt“ (403).`)) return;
+  let body = { action: act, id };
+  if (act === "rename") {
+    const name = prompt("Neuer Name:", k.name); if (name === null) return;
+    const note = prompt("Notiz:", k.note || ""); if (note === null) return;
+    body = { ...body, name, note };
+  }
+  const r = await keysPost(body);
+  if (r && r.new_key) keysShowNew(k.name, r.new_key.key);
+});
 
 function helpPrepare() {
   // the master's address into the examples, and a copy button on every command block (once)
@@ -2543,7 +2639,7 @@ function monRender(s) {
   const tot = (mon.data || {}).totals || {}, ra = tot.prompt ? 100 * tot.reused / tot.prompt : 0;
   $("m-reuse-all").style.width = ra + "%"; $("m-reuse-all-t").textContent = tot.prompt ? `${nf(ra, 0)} %` : "–";
   const when = (t) => new Date(t * 1000).toLocaleTimeString("de-DE");
-  $("m-req").innerHTML = reqs.slice(0, mon.all ? 200 : 12).map((r) => `<tr${String(r.reason || "").startsWith("Hintergrundauftrag") ? ' class="bg-task"' : ""}><td>${when(r.t)}</td><td title="${esc([r.host, r.ip].filter(Boolean).join(" · "))}">${esc(r.client || "–")}${r.ip ? `<span class="note from">${esc(r.host || r.ip)}</span>` : ""}</td><td class="mname" title="${esc(r.model + " @" + r.where + (r.temp ? " · " + r.temp + " °C" : ""))}">${esc(String(r.model || "").replace(/-\d{5}-of-\d{5}$/, ""))}${r.image ? " 🖼" : ""}<span class="note"> @${esc(r.where)}</span></td><td class="why">${esc(r.reason || "–")}</td><td class="num">${r.decide_ms != null && r.reason ? (r.decide_ms ? nf(r.decide_ms, 0) + " ms" : "<1 ms") : "–"}</td><td class="num">${r.spec != null ? nf(r.spec * 100, 0) + " %" : "–"}</td><td><span class="st${r.status && r.status !== 200 ? " bad" : ""}">${r.status === 200 ? "fertig" : r.status === 499 ? "abgebrochen" : r.status || "?"}</span></td><td class="num">${nf(r.prompt, 0)}</td><td class="num">${nf(r.reused, 0)}</td><td class="num">${nf(r.output, 0)}</td><td class="num">${r.pp ? nf(r.pp, 0) : "–"}</td><td class="num">${r.tg ? nf(r.tg, 1) : "–"}</td><td class="num">${nf(r.secs, 1)} s</td></tr>`).join("") || `<tr><td colspan="13" class="note">Noch keine Anfragen seit dem Start des Masters.</td></tr>`;
+  $("m-req").innerHTML = reqs.slice(0, mon.all ? 200 : 12).map((r) => `<tr${String(r.reason || "").startsWith("Hintergrundauftrag") ? ' class="bg-task"' : ""}><td>${when(r.t)}</td><td title="${esc([r.host, r.ip].filter(Boolean).join(" · "))}">${esc(r.client || "–")}${r.ip ? `<span class="note from">${esc(r.host || r.ip)}</span>` : ""}${r.key ? `<span class="note from">Key: ${esc(r.key)}</span>` : ""}</td><td class="mname" title="${esc(r.model + " @" + r.where + (r.temp ? " · " + r.temp + " °C" : ""))}">${esc(String(r.model || "").replace(/-\d{5}-of-\d{5}$/, ""))}${r.image ? " 🖼" : ""}<span class="note"> @${esc(r.where)}</span></td><td class="why">${esc(r.reason || "–")}</td><td class="num">${r.decide_ms != null && r.reason ? (r.decide_ms ? nf(r.decide_ms, 0) + " ms" : "<1 ms") : "–"}</td><td class="num">${r.spec != null ? nf(r.spec * 100, 0) + " %" : "–"}</td><td><span class="st${r.status && r.status !== 200 ? " bad" : ""}">${r.status === 200 ? "fertig" : r.status === 499 ? "abgebrochen" : r.status || "?"}</span></td><td class="num">${nf(r.prompt, 0)}</td><td class="num">${nf(r.reused, 0)}</td><td class="num">${nf(r.output, 0)}</td><td class="num">${r.pp ? nf(r.pp, 0) : "–"}</td><td class="num">${r.tg ? nf(r.tg, 1) : "–"}</td><td class="num">${nf(r.secs, 1)} s</td></tr>`).join("") || `<tr><td colspan="13" class="note">Noch keine Anfragen seit dem Start des Masters.</td></tr>`;
   $("m-sum").textContent = tot.n ? `Seit ${new Date(tot.since * 1000).toLocaleString("de-DE", { dateStyle: "short", timeStyle: "short" })}: ${nf(tot.n, 0)} Anfragen · ${nf(tot.prompt, 0)} Prompt-Token (${nf(ra, 0)} % aus dem Cache) · gelesen mit ${tot.pp_ms ? nf((tot.prompt - tot.reused) / (tot.pp_ms / 1000), 0) : "–"} t/s · ${nf(tot.output, 0)} Token geschrieben mit ${tot.tg_ms ? nf(tot.output / (tot.tg_ms / 1000), 1) : "–"} t/s (Mittel, ohne externe Server)` : "";
 }
 
@@ -2558,6 +2654,7 @@ async function tick() {
     $("logout").hidden = !key;
     render(s);
     if ($("app").classList.contains("mon")) monFetch();
+    if ($("app").classList.contains("keys") && Date.now() - (keysState.at || 0) > 15000) { keysState.at = Date.now(); keysFetch(); }
   } catch (e) {
     if (e.auth) { $("login").hidden = false; $("key").focus(); return; }
     $("offline").hidden = false;
