@@ -185,6 +185,11 @@
   .keys-tab tr.k-row { cursor: pointer; }
   .keys-tab .k-acts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; opacity: .9; }
   .keys-tab .k-acts .btn { white-space: nowrap; }
+  .k-lim { white-space: normal; }
+  .k-lim fieldset { border: 1px solid var(--line); border-radius: 9px; padding: 6px 10px 8px; margin: 0 0 8px; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .k-lim-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+  .k-lim-row label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+  .k-lim-row input { font: inherit; font-size: 13px; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--text); width: 130px; }
   .keys-tab tr.off .k-acts { opacity: 1; }
   .keys-tab td.num { font-size: 12px; white-space: nowrap; }
   #k-new { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
@@ -2306,7 +2311,26 @@ $("tab-help").addEventListener("click", () => showTab("help"));
 $("tab-keys").addEventListener("click", () => showTab("keys"));
 
 // Zugänge: own API keys and their use
-const keysState = { data: null, open: {}, busy: false };
+const keysState = { data: null, open: {}, lim: {}, busy: false };
+const expired = (k) => { const e = (k.limits || {}).expires; return e && new Date().toISOString().slice(0, 10) > e; };
+function limText(l) {
+  if (!l) return "";
+  const t = (v) => v >= 1e6 ? nf(v / 1e6, 1).replace(/,0$/, "") + " Mio." : v >= 1e3 ? nf(v / 1e3, 0) + " Tsd." : nf(v, 0);
+  return [l.models && l.models.length ? "nur " + l.models.map(esc).join(", ") : "",
+    l.day_tokens ? t(l.day_tokens) + " Token/Tag" : "", l.month_tokens ? t(l.month_tokens) + " Token/Monat" : "",
+    l.parallel ? l.parallel + " gleichzeitig" : "", l.expires ? "bis " + new Date(l.expires).toLocaleDateString("de-DE") : ""].filter(Boolean).join(" · ");
+}
+function limForm(k, names) {
+  const l = k.limits || {}, sel = new Set((l.models || []).map((m) => m.toLowerCase()));
+  const all = [...new Set([...names, ...(l.models || [])])];
+  return `<form class="k-lim" data-kid="${esc(k.id)}"><div class="muted" style="margin-bottom:6px">Grenzen für „${esc(k.name)}“ (leer = keine Grenze). Gezählt werden gelesene + geschriebene Token; ist ein Kontingent aufgebraucht, antwortet der Router mit 429.</div>
+    <fieldset><legend>Erlaubte Modelle <span class="muted">(keins angehakt: alle; „fast“/„big“ = die Rolle)</span></legend>${all.map((m) => `<label class="chk"><input type="checkbox" name="model" value="${esc(m)}"${sel.has(m.toLowerCase()) ? " checked" : ""}> ${esc(m)}</label>`).join("")}</fieldset>
+    <div class="k-lim-row"><label>Token pro Tag<input name="day_tokens" inputmode="numeric" value="${l.day_tokens || ""}" placeholder="unbegrenzt"></label>
+    <label>Token pro Monat<input name="month_tokens" inputmode="numeric" value="${l.month_tokens || ""}" placeholder="unbegrenzt"></label>
+    <label>Gleichzeitig<input name="parallel" inputmode="numeric" value="${l.parallel || ""}" placeholder="unbegrenzt"></label>
+    <label>Gültig bis<input name="expires" type="date" value="${esc(l.expires || "")}"></label>
+    <button class="btn small" type="submit">Speichern</button><button class="btn quiet small" type="button" data-lim-close>Schließen</button></div></form>`;
+}
 async function keysFetch() {
   if (keysState.busy) return;
   keysState.busy = true;
@@ -2325,11 +2349,12 @@ function keysRender() {
   $("k-list").innerHTML = (d.keys || []).map((k) => {
     const models = Object.entries(k.models || {}).sort((a, b) => (b[1].output || 0) - (a[1].output || 0));
     return `<tr class="k-row${k.disabled ? " off" : ""}" data-kid="${esc(k.id)}"><td><b>${esc(k.name)}</b>${k.note ? `<br><span class="muted">${esc(k.note)}</span>` : ""}<br><span class="muted">seit ${new Date(k.created * 1000).toLocaleDateString("de-DE")}</span>
-        <div class="k-acts"><button class="btn quiet small" type="button" data-kact="${k.disabled ? "enable" : "disable"}">${k.disabled ? "Entsperren" : "Sperren"}</button><button class="btn quiet small" type="button" data-kact="rotate" title="Neuen Key erzeugen; der alte gilt sofort nicht mehr. Name und Verbrauch bleiben.">Neu erzeugen</button><button class="btn quiet small" type="button" data-kact="rename">Umbenennen</button><button class="btn quiet small" type="button" data-kact="delete">Löschen</button></div></td>
+        <div class="k-acts"><button class="btn quiet small" type="button" data-kact="${k.disabled ? "enable" : "disable"}">${k.disabled ? "Entsperren" : "Sperren"}</button><button class="btn quiet small" type="button" data-kact="rotate" title="Neuen Key erzeugen; der alte gilt sofort nicht mehr. Name und Verbrauch bleiben.">Neu erzeugen</button><button class="btn quiet small" type="button" data-kact="rename">Umbenennen</button><button class="btn quiet small" type="button" data-kact="limits">Grenzen</button><button class="btn quiet small" type="button" data-kact="delete">Löschen</button></div></td>
       <td><code>${esc(k.prefix || "")}…</code></td>
-      <td>${k.disabled ? '<span class="bad-text">gesperrt</span>' : '<span class="good-text">aktiv</span>'}</td>
+      <td style="white-space:normal;max-width:220px">${k.disabled ? '<span class="bad-text">gesperrt</span>' : expired(k) ? '<span class="bad-text">abgelaufen</span>' : '<span class="good-text">aktiv</span>'}${k.running ? ` <span class="muted">· ${k.running} läuft</span>` : ""}${limText(k.limits) ? `<br><span class="muted">${limText(k.limits)}</span>` : ""}</td>
       <td>${ago(k.last_used)}${k.last_ip ? `<br><span class="muted">${esc(k.last_host || k.last_ip)}</span>` : ""}</td>
       <td class="num">${keysUse(k.use.today)}</td><td class="num">${keysUse(k.use.d7)}</td><td class="num">${keysUse(k.use.d30)}</td><td class="num">${keysUse(k.use.total)}</td></tr>
+      ${keysState.lim[k.id] ? `<tr class="k-models"><td></td><td colspan="7">${limForm(k, d.model_names || [])}</td></tr>` : ""}
       ${keysState.open[k.id] ? `<tr class="k-models"><td></td><td colspan="7">${models.length ? `<table class="req"><thead><tr><th>Modell (30 Tage)</th><th class="num">Anfragen</th><th class="num">gelesen</th><th class="num">davon Cache</th><th class="num">geschrieben</th><th class="num">Rechenzeit</th></tr></thead><tbody>${models.map(([m, u]) => `<tr><td>${esc(m)}</td><td class="num">${nf(u.n, 0)}</td><td class="num">${nf(u.prompt, 0)}</td><td class="num">${nf(u.reused, 0)}</td><td class="num">${nf(u.output, 0)}</td><td class="num">${nf((u.secs || 0) / 60, 1)} Min.</td></tr>`).join("")}</tbody></table>` : '<span class="muted">In den letzten 30 Tagen keine Anfragen.</span>'}</td></tr>` : ""}`;
   }).join("") || '<tr><td colspan="8" class="muted">Noch keine eigenen Keys. Oben einen erzeugen.</td></tr>';
 }
@@ -2346,6 +2371,16 @@ async function keysPost(body) {
     return r;
   } catch (e) { alert("Fehler: " + e.message); return null; }
 }
+$("k-list").addEventListener("submit", async (ev) => {
+  const f = ev.target.closest("form.k-lim"); if (!f) return;
+  ev.preventDefault();
+  const fd = new FormData(f), id = f.dataset.kid;
+  const r = await keysPost({ action: "limits", id, limits: { models: fd.getAll("model"), day_tokens: fd.get("day_tokens"), month_tokens: fd.get("month_tokens"), parallel: fd.get("parallel"), expires: fd.get("expires") } });
+  if (r && !r.error) { keysState.lim[id] = false; keysRender(); }
+});
+$("k-list").addEventListener("click", (ev) => {
+  if (ev.target.matches("[data-lim-close]")) { const f = ev.target.closest("form.k-lim"); keysState.lim[f.dataset.kid] = false; keysRender(); }
+}, true);
 $("k-new").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const f = new FormData(ev.target);
@@ -2356,6 +2391,7 @@ $("k-list").addEventListener("click", async (ev) => {
   const row = ev.target.closest("tr.k-row"); if (!row) return;
   const id = row.dataset.kid, k = (keysState.data.keys || []).find((x) => x.id === id); if (!k) return;
   const act = ev.target.dataset && ev.target.dataset.kact;
+  if (act === "limits") { keysState.lim[id] = !keysState.lim[id]; keysRender(); return; }
   if (!act) { keysState.open[id] = !keysState.open[id]; keysRender(); return; }
   if (act === "delete" && !confirm(`Key „${k.name}“ löschen? Clients mit diesem Key kommen danach nicht mehr herein, und sein Verbrauch ist weg.`)) return;
   if (act === "rotate" && !confirm(`Für „${k.name}“ einen neuen Key erzeugen? Der bisherige gilt sofort nicht mehr.`)) return;
@@ -2654,7 +2690,7 @@ async function tick() {
     $("logout").hidden = !key;
     render(s);
     if ($("app").classList.contains("mon")) monFetch();
-    if ($("app").classList.contains("keys") && Date.now() - (keysState.at || 0) > 15000) { keysState.at = Date.now(); keysFetch(); }
+    if ($("app").classList.contains("keys") && Date.now() - (keysState.at || 0) > 15000 && !Object.values(keysState.lim).some(Boolean)) { keysState.at = Date.now(); keysFetch(); }
   } catch (e) {
     if (e.auth) { $("login").hidden = false; $("key").focus(); return; }
     $("offline").hidden = false;

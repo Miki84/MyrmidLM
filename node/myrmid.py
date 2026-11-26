@@ -9203,6 +9203,7 @@ class Router:
         except (OSError, ValueError):
             pass
         self.key_index = {k["hash"]: kid for kid, k in self.keys.items() if k.get("hash")}
+        self.key_inflight: dict[str, int] = {}  # running requests per own key (its "parallel" limit)
 
     # API keys ------------------------------------------------------------------
 
@@ -9226,7 +9227,55 @@ class Router:
             return None, "Invalid API Key"
         if k.get("disabled"):
             return None, f"API-Key „{k.get('name')}“ ist gesperrt"
+        exp = (k.get("limits") or {}).get("expires") or ""
+        if exp and time.strftime("%Y-%m-%d") > exp:
+            return None, f"API-Key „{k.get('name')}“ ist abgelaufen (gültig bis {exp}), also gesperrt"
         return kid, ""
+
+    def key_models_ok(self, kid: str, b: Backend) -> bool:
+        allowed = {m.lower() for m in ((self.keys.get(kid) or {}).get("limits") or {}).get("models") or []}
+        return not allowed or bool({x.lower() for x in (b.group, b.label, b.name) if x} & allowed)
+
+    def key_gate(self, kid: str, b: Backend, body: Optional[dict]) -> tuple[Optional[Backend], int, str]:
+        """A key's limits for one request: (backend to use, 0, "") or (None, http code, why). A model the key may
+        not use is swapped for one it may (same rules), unless the request named that model itself."""
+        if not kid or kid == "admin" or kid not in self.keys:
+            return b, 0, ""
+        k = self.keys[kid]
+        lim = k.get("limits") or {}
+        if not self.key_models_ok(kid, b):
+            asked = str((body or {}).get("model") or "").lower()
+            named = asked and asked not in (self.public_name.lower(), "big", "fast", "auto", "")
+            cands = [x for x in self.backends if x.healthy and self.key_models_ok(kid, x)]
+            if named or not cands:
+                allowed = ", ".join(lim.get("models") or [])
+                return None, 403, f"API-Key „{k.get('name')}“ darf dieses Modell nicht nutzen (erlaubt: {allowed})"
+            b = self.choose(cands) or cands[0]
+        with self.lock:
+            today, month = time.strftime("%Y-%m-%d"), time.strftime("%Y-%m")
+            used_d = used_m = 0
+            for d, per in (k.get("days") or {}).items():
+                if d.startswith(month):
+                    n = sum(int(x.get("prompt", 0)) + int(x.get("output", 0)) for x in per.values())
+                    used_m += n
+                    used_d += n if d == today else 0
+            de = lambda n: f"{n:,}".replace(",", ".")  # noqa: E731
+            if lim.get("day_tokens") and used_d >= lim["day_tokens"]:
+                return None, 429, (f"API-Key „{k.get('name')}“: Tageskontingent von {de(lim['day_tokens'])} Token "
+                                   "verbraucht, morgen wieder")
+            if lim.get("month_tokens") and used_m >= lim["month_tokens"]:
+                return None, 429, (f"API-Key „{k.get('name')}“: Monatskontingent von {de(lim['month_tokens'])} Token "
+                                   "verbraucht")
+            if lim.get("parallel") and self.key_inflight.get(kid, 0) >= lim["parallel"]:
+                return None, 429, (f"API-Key „{k.get('name')}“: höchstens {lim['parallel']} Anfrage(n) gleichzeitig; "
+                                   "bitte kurz warten")
+            self.key_inflight[kid] = self.key_inflight.get(kid, 0) + 1
+        return b, 0, ""
+
+    def key_done(self, kid: str) -> None:
+        with self.lock:
+            if self.key_inflight.get(kid):
+                self.key_inflight[kid] -= 1
 
     def _save_keys(self, now: bool = False) -> None:
         """Written at once after a change by the admin, at most every 30 s for the use counters."""
@@ -9292,9 +9341,12 @@ class Router:
                             "created": k.get("created"), "disabled": bool(k.get("disabled")),
                             "last_used": k.get("last_used"), "last_ip": k.get("last_ip") or "",
                             "last_host": client_host(k.get("last_ip") or "") if k.get("last_ip") else "",
-                            "use": use, "models": models})
+                            "use": use, "models": models, "limits": k.get("limits") or {},
+                            "running": self.key_inflight.get(kid, 0)})
+            names = sorted({b.group or b.label for b in self.backends if b.group or b.label})
         out.sort(key=lambda k: (k["disabled"], -(k["last_used"] or 0), k["name"] or ""))
-        return {"keys": out, "admin": {"prefix": (self.key or "")[:6]}}
+        return {"keys": out, "admin": {"prefix": (self.key or "")[:6]},
+                "model_names": ["fast", "big"] + [n for n in names if n.lower() not in ("fast", "big")]}
 
     def keys_api(self, body: dict) -> dict:
         """The dashboard: create (the key is shown this once), rename, disable, enable, rotate, delete."""
@@ -9323,6 +9375,28 @@ class Router:
                     err = "Namen angeben"
                 else:
                     self.keys[kid].update(name=name, note=note)
+            elif act == "limits":
+                lim, raw = {}, body.get("limits") or {}
+                models = [str(m).strip()[:80] for m in (raw.get("models") or []) if str(m).strip()]
+                if models:
+                    lim["models"] = models[:50]
+                for f in ("day_tokens", "month_tokens", "parallel"):
+                    try:
+                        v = int(str(raw.get(f) or "0").replace(".", "").replace(" ", ""))
+                    except ValueError:
+                        v = -1
+                    if v < 0 or (f == "parallel" and v > 64):
+                        err = f"ungültiger Wert für {f}"
+                    elif v:
+                        lim[f] = v
+                exp = str(raw.get("expires") or "").strip()
+                if exp:
+                    if re.match(r"^\d{4}-\d{2}-\d{2}$", exp):
+                        lim["expires"] = exp
+                    else:
+                        err = "Ablaufdatum als JJJJ-MM-TT"
+                if not err:
+                    self.keys[kid]["limits"] = lim
             elif act == "rotate":  # a new key for the same name and use; the old one stops working at once
                 new_key = "myr-" + secrets.token_urlsafe(32)
                 self.keys[kid].update(hash=self._hash_key(new_key), prefix=new_key[:10], rotated=int(time.time()))
@@ -10129,6 +10203,10 @@ class Router:
                         data.append({"id": g, "object": "model", "owned_by": "myrmid", "created": now,
                                      **ctx_of([x for x in router.backends if (x.group or x.label) == g]),
                                      "meta": {"model": b.label, "hosts": where}})
+                    kid = getattr(self, "key_id", "") or ""
+                    allowed = {m.lower() for m in ((router.keys.get(kid) or {}).get("limits") or {}).get("models") or []}
+                    if allowed:  # a key with a model list sees only those
+                        data = [d for d in data if d["id"].lower() in allowed]
                     return self._json(200, {"object": "list", "data": data})
                 if path == "/health":
                     ok = any(b.healthy for b in router.backends)
@@ -10193,7 +10271,18 @@ class Router:
                         woke = alt
                     backend = woke
                 self.decide_ms = decide_ms
-                self._forward(backend, "POST", raw, reason)
+                kid = getattr(self, "key_id", "") or ""
+                gated, code, why = router.key_gate(kid, backend, body if isinstance(body, dict) else None)
+                if gated is None:
+                    return self._json(code, {"error": {"message": why, "type": "rate_limit_error" if code == 429
+                                                       else "permission_error", "code": "myrmid_key_limit"}})
+                if gated is not backend:
+                    reason += f", Key erlaubt {backend.group or backend.label} nicht"
+                try:
+                    self._forward(gated, "POST", raw, reason)
+                finally:
+                    if kid and kid != "admin":
+                        router.key_done(kid)
 
             def _image(self, raw: bytes, sub: str) -> None:
                 """/v1/images/...: to a host's image model (sd-server), round robin."""
