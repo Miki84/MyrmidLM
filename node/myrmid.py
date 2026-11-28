@@ -7040,6 +7040,11 @@ class HostAgent:
             self._set("preparing")
             self.stop_server()
             gpus = a.get("strata_gpus") or ""
+            own = ((strata_info(x).get("config_gpus") or {}).get(a.get("model") or "") or "")
+            if gpus and own and sorted(gpus.split(",")) == sorted(own.split(",")):
+                # the configuration's own cards: no --gpu, or Strata takes it for a hand edit and ignores the
+                # roles its setup gave the cards (Main, Helper; "gpu was edited by hand, gpu_roles ignored")
+                gpus = ""
             if self.slot is not None:  # one GPU of several: exactly this one, and one such engine per PC
                 idx = self._strata_fixed()
                 if idx is None:

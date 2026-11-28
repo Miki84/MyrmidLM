@@ -1737,6 +1737,9 @@ function renderHosts(s) {
     }).join("");
     const pickedSet = strataFixed ? new Set(String(xe.fixed_gpu || "").split(",")) : sSet;
     const oldPicked = xe ? (xe.old_gpus || []).filter((i) => pickedSet.has(String(i))) : [];
+    const sameGpus = !sDefault || !sSet.size || [...sSet].sort().join(",") === String(sDefault).split(",").sort().join(",");
+    const gpuRoleNote = xe && !strataFixed && engine !== "maya" && !sameGpus
+      ? `<div class="wide note">Andere GPUs als in der Konfiguration (GPU ${esc(sDefault)}): ${M.label} startet damit, nutzt dann aber nicht die Rollen (Main, Helper), die sein Setup festgelegt hat. Besser unter „${M.label}-Einstellungen“ auf <b>Übernehmen</b> klicken: richtet die Konfiguration mit diesen GPUs neu ein.</div>` : "";
     const strataOldWarn = (engine === "strata" || engine === "polystrata") && oldPicked.length && sSet0.cuda !== 12
       ? `<div class="wide note warn-text">GPU ${oldPicked.join(", ")} ist älter als RTX 20 (z. B. Tesla V100): Strata braucht dafür seine CUDA-12-Engine, die Konfiguration ${esc(sCfgName)} nutzt aber CUDA 13 und würde nicht laden („no kernel image“). Unter „${M.label}-Einstellungen“ auf <b>Übernehmen</b> klicken: richtet sie mit den angehakten GPUs und CUDA 12 neu ein.</div>` : "";
     const addModel = (k) => {
@@ -1836,7 +1839,7 @@ function renderHosts(s) {
       <form>
         ${exts.length ? `<label title="llama.cpp: MyrmidLM plant und startet llama-server. Strata, Maya: die auf diesem PC installierte Engine mit ihrer eigenen Konfiguration (je PC läuft nur eine davon).">Engine<select name="engine">${[["llama", "llama.cpp"], ...exts.map((k) => [k, EXT_META[k].label])].map(([v, t]) => `<option value="${v}"${v === engine ? " selected" : ""}>${t}</option>`).join("")}</select></label>` : ""}
         ${xe
-          ? `<label class="wide">${M.label}-Konfiguration<select name="model">${(xe.configs || []).map((c) => `<option value="${esc(c)}"${c === sCfgName ? " selected" : ""}>${esc(c.replace(new RegExp(`^${engine}-|\\.json$`, "g"), ""))}</option>`).join("") || `<option value="">keine ${engine}-*.json gefunden</option>`}</select></label>` + strataGpuRow + strataOldWarn + strataSettings
+          ? `<label class="wide">${M.label}-Konfiguration<select name="model">${(xe.configs || []).map((c) => `<option value="${esc(c)}"${c === sCfgName ? " selected" : ""}>${esc(c.replace(new RegExp(`^${engine}-|\\.json$`, "g"), ""))}</option>`).join("") || `<option value="">keine ${engine}-*.json gefunden</option>`}</select></label>` + strataGpuRow + strataOldWarn + gpuRoleNote + strataSettings
           : `<label class="wide">Modell (Katalogname, user/repo:QUANT oder Datei auf dem Host)<input name="model" list="model-list" value="${val("model")}" placeholder="z. B. qwen3-14b" required></label>`}
         <label>Name für Clients<input name="name" value="${val("name")}" placeholder="leer: Dateiname"></label>
         <label>Rolle<select name="role">${["big", "fast", "extra"].map((r) => `<option value="${r}"${r === role ? " selected" : ""}>${ROLE_TEXT[r]}</option>`).join("")}</select></label>
